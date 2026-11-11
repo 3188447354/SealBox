@@ -1,12 +1,12 @@
-name: LiveContainer UI / Extension Bug Report
-description: Report a bug when using LiveContainer's own UI or extension.
+name: SealBox UI / Extension Bug Report
+description: Report a bug when using SealBox's own UI or extension.
 title: "[BUG] "
 labels: ["bug"]
 body:
   - type: markdown
     attributes:
       value: |
-        Thanks for taking the time to fill out this bug report! Before you continue filling out the report, please **[read our FAQ](https://github.com/LiveContainer/LiveContainer/issues/265) and [search in GitHub Issues](https://github.com/LiveContainer/LiveContainer/issues) for the bug you are experiencing.**
+        Thanks for taking the time to fill out this bug report! Before you continue filling out the report, please **[search in GitHub Issues](https://github.com/3188447354/SealBox/issues) for the bug you are experiencing.**
 
   - type: textarea
     id: description
@@ -26,24 +26,24 @@ body:
   - type: input
     id: app-version
     attributes:
-      label: What version of LiveContainer and iOS are you using?
-      description: To retrieve LiveContainer version, go to LiveContainer settings, then scroll to the bottom of the page.
+      label: What version of SealBox and iOS are you using?
+      description: To retrieve SealBox version, go to SealBox settings, then scroll to the bottom of the page.
     validations:
       required: true
   - type: checkboxes
     attributes:
       label: Verify steps
       options:
-        - label: I downloaded LiveContainer from releases / actions section or LiveContainer's AltStore source.
-        - label: I have the latest LiveContainer.
-        - label: I installed LiveContainer through AltStore/SideStore/Impactor/iloader/TrollStore or I'm confident that I signed LiveContainer correctly with all required entitlements.
+        - label: I downloaded SealBox from releases / actions section or SealBox's AltStore source.
+        - label: I have the latest SealBox.
+        - label: I installed SealBox through AltStore/SideStore/Impactor/iloader/TrollStore or I'm confident that I signed SealBox correctly with all required entitlements.
     validations:
       required: true
   - type: textarea
     id: crash-log
     attributes:
       label: Crash Log
-      description: If a crash happened, please upload the crash log in iOS settings - Privacy Security - Analytics Improvements - Analytics Data - Search LiveContainer/LiveProcess. **Do not copy and paste.** Instead, please change .ips to .txt and upload it. If you are certain no crash report is produced, type "no crash report is produced".
+      description: If a crash happened, please upload the crash log in iOS settings - Privacy Security - Analytics Improvements - Analytics Data - Search SealBox/LiveProcess. **Do not copy and paste.** Instead, please change .ips to .txt and upload it. If you are certain no crash report is produced, type "no crash report is produced".
     validations:
       required: true
   - type: textarea
