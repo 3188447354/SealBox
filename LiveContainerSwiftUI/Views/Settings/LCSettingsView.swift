@@ -1193,9 +1193,15 @@ struct SBSealBoxLicenseView: View {
         .navigationTitle("lc.settings.sealbox.license".loc)
         .navigationBarTitleDisplayMode(.inline)
         .onAppear {
-            if licenseText == nil,
-               let url = Bundle.main.url(forResource: "LICENSE", withExtension: nil) {
-                licenseText = try? String(contentsOf: url)
+            if licenseText == nil {
+                // The bundled copy is Resources/LICENSE.txt (AGPL-3.0
+                // verbatim); an extensionless LICENSE is also accepted
+                // so an older/alternate bundle layout still works.
+                let url = Bundle.main.url(forResource: "LICENSE", withExtension: "txt")
+                    ?? Bundle.main.url(forResource: "LICENSE", withExtension: nil)
+                if let url {
+                    licenseText = try? String(contentsOf: url)
+                }
             }
         }
     }
