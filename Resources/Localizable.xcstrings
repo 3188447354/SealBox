@@ -25724,7 +25724,7 @@
         "es" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Arrastra los Live Containers para elegir cuál se intenta primero al lanzar apps compartidas."
+            "value" : "Arrastra los SealBoxes para elegir cuál se intenta primero al lanzar apps compartidas."
           }
         },
         "fr" : {
@@ -27895,7 +27895,7 @@
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "По умолчанию LiveContauner будет у вас спрашивать, как открыть данный URL. Включите это, чтобы автоматически открывать URL в текущем приложении."
+            "value" : "По умолчанию SealBox будет у вас спрашивать, как открыть данный URL. Включите это, чтобы автоматически открывать URL в текущем приложении."
           }
         },
         "sv" : {
