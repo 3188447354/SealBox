@@ -144,7 +144,7 @@ struct LCSettingsView: View {
     }
 
     /// Version straight from the bundle (CFBundleShortVersionString and
-    /// CFBundleVersion; both are 3.8.11). Not from LCVersionInfo, which
+    /// CFBundleVersion). Not from LCVersionInfo, which
     /// is not present in Info.plist.
     private var appVersionText: String {
         let info = Bundle.main.infoDictionary
