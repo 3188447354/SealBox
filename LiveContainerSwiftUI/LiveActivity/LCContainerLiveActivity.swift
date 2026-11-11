@@ -31,13 +31,15 @@
 //  keeps it visible for ~8 seconds, then ends it; ending at once makes
 //  the system pull the activity off the island immediately, so the user
 //  would never see the "done" state.
-//  iOS 16.1+ only; every call site is guarded with `if #available(iOS 16.1, *)`.
+//  iOS 16.2+ only: the ActivityContent request / update / end APIs
+//  used here were introduced in iOS 16.2 (the 16.1 forms took a bare
+//  ContentState). Every call site is guarded with `if #available(iOS 16.2, *)`.
 //
 
 import ActivityKit
 import Foundation
 
-@available(iOS 16.1, *)
+@available(iOS 16.2, *)
 public enum LCContainerLiveActivityManager {
     /// How long the finished state stays on the island before ending.
     private static let finishedVisibleDuration: Duration = .seconds(8)
