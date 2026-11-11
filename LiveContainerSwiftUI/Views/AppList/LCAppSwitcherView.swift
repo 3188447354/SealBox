@@ -27,8 +27,10 @@
 //  经典模式下客 App 运行时容器 UI 不存在，切换器看不到它——这是架构事实，
 //  不是本文件的缺口（见汇报）。卡片为空时显示中性空状态，不拼凑假卡片。
 //
-//  未编译、未真机验证（本机无 Xcode/Swift）：dismissWindow 的调用签名与
-//  场景销毁是否彻底，须在 Mac / CI 上先编后真机走查。
+//  未编译、未真机验证（本机无 Xcode/Swift）：dismissWindow 的 (id:value:)
+//  签名已按 WindowGroup(id: "appView", for: String.self) 对过，iOS 15
+//  部署目标的引用问题已用 @available(iOS 16.0, *) 修掉；场景销毁是否
+//  彻底，须在 Mac / CI 上先编后真机走查。
 //
 
 import SwiftUI
@@ -325,6 +327,14 @@ struct LCAppSwitcherView: View {
     /// and presents the page.
     var onOpenSystem: (LCSystemPage) -> Void
 
+    // dismissWindow is iOS 17.0+, but this target still deploys to
+    // iOS 15.0 (LiveContainerSwiftUI: IPHONEOS_DEPLOYMENT_TARGET =
+    // 15.0). The @available on the property keeps the reference
+    // compiling; the only use is inside `if #available(iOS 17.0, *)`
+    // in finishClose. The (id:value:) signature matches
+    // WindowGroup(id: "appView", for: String.self) in
+    // LiveContainerSwiftUIApp.swift:112.
+    @available(iOS 17.0, *)
     @Environment(\.dismissWindow) private var dismissWindow
     @StateObject private var dragState = LCAppSwitcherDragState()
 
@@ -464,7 +474,7 @@ struct LCAppSwitcherView: View {
                         dragBaseFocus = focusPosition
                         dragState.begin()
                     }
-                    dragState.record(value.translation)
+                    dragState.record(CGPoint(x: value.translation.width, y: value.translation.height))
                 }
                 .onEnded { value in
                     endDrag(value: value, layout: layout)
@@ -684,7 +694,7 @@ struct LCAppSwitcherView: View {
         }
         // Snap to the nearest card with a velocity-aware spring, one
         // card at a time (§10.2: soft spring, frame-rate independent).
-        let predicted = dragBaseFocus - value.predictedEndTranslation.x / layout.stride
+        let predicted = dragBaseFocus - value.predictedEndTranslation.width / layout.stride
         let target = clampedFocus(predicted, count: store.cards.count).rounded()
         let clampedTarget = max(0, min(CGFloat(store.cards.count - 1), target))
         withAnimation(Self.settleSpring) {
@@ -722,7 +732,7 @@ struct LCAppSwitcherView: View {
             // Ask the system to dismiss the WindowGroup scene. The
             // scene may need its own terminate to fully die — verify
             // on a real device (see the file header).
-            if #available(iOS 16.0, *) {
+            if #available(iOS 17.0, *) {
                 dismissWindow(id: "appView", value: guest.dataUUID)
             }
         case .system:

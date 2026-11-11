@@ -253,6 +253,34 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
                 }
             }
         }
+        // SealBox shell (§11 / §13): the whole desktop window shrinks
+        // with the home-bar gesture (scaleEffect on the desktop content
+        // only — the trigger and lock button below are overlays attached
+        // after it, so they stay put and keep receiving gestures).
+        // The frame pins the overlay anchors to the full content area
+        // above the Dock.
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .scaleEffect(homeBarState.windowScale)
+        .overlay(alignment: .topTrailing) {
+            // Control-centre trigger: the top 44pt strip at the
+            // trailing edge (§13). It sits over the status-bar area,
+            // clear of the lock button and the edit-mode capsules,
+            // which both live below the safe area.
+            LCSealBoxControlCenterTrigger {
+                showControlCenter = true
+            }
+        }
+        .overlay(alignment: .topTrailing) {
+            // Floating lock button: always on the desktop, hidden while
+            // editing (§11; the edit-mode capsules own the corners
+            // then). Kept below the 44pt trigger strip:
+            // max(safeArea, 44) + 12 from the top.
+            if !isEditing {
+                LCSealBoxLockButton(lockStore: lockStore)
+                    .padding(.top, max(geometry.safeAreaInsets.top, 44) + 12)
+                    .padding(.trailing, 20)
+            }
+        }
         }
         .coordinateSpace(name: "scroll")
         .onAppear {
@@ -290,10 +318,60 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
             // stale dragged icon behind.
             if phase != .active {
                 desktopDrag.endDrag()
+                // A home-bar gesture interrupted by the system (call,
+                // backgrounding) must not leave a half-shrunk window
+                // behind. resetToPreGesture is the hook the state
+                // machine documents for scenePhase / disappear hooks
+                // (it is cancelGesture under that name); only called
+                // while a gesture is actually in flight, so an idle
+                // backgrounding never fires a spurious spring-back.
+                if homeBarState.isGestureActive {
+                    homeBarState.resetToPreGesture()
+                }
+            }
+        }
+        .onChange(of: homeBarState.pendingAction) { action in
+            // Home-bar actions are posted once by LCSealBoxHomeBarState
+            // and cleared here (§11). Clear first, so the state
+            // machine can post the next action while this one runs.
+            guard let action else { return }
+            homeBarState.pendingAction = nil
+            switch action {
+            case .goDesktop:
+                // Back to the desktop: drop the switcher and any open
+                // system page. The window scale is already restored by
+                // the state machine (restoreWindow in endGesture /
+                // fireSwitcher) before it posts the action, so there is
+                // nothing to un-shrink here.
+                showSwitcher = false
+                systemPage = nil
+            case .openSwitcher:
+                // Refresh from the real open-window registries first,
+                // then show. The system-page cover (if any) must go
+                // away too: the switcher is an overlay on the desktop,
+                // so it would stay hidden behind the cover otherwise.
+                switcherStore.refresh(
+                    apps: sharedModel.apps + sharedModel.hiddenApps,
+                    tweakNames: sharedModel.tweakFolderNames,
+                    openSystemPage: systemPage,
+                    darkModeIcon: darkModeIcon
+                )
+                systemPage = nil
+                showSwitcher = true
             }
         }
         .hideDesktopTabBar()
         .preferredColorScheme(desktopTheme.colorScheme)
+        // SealBox home bar (§11): its own 36pt strip directly above
+        // the Dock. This inset is applied before the Dock's, so it sits
+        // between the desktop content and the Dock — never overlapping
+        // the page dots — and the pill is always drawn. Only while
+        // locked does the strip take over the gestures; unlocked it
+        // does not hit-test at all (see LCSealBoxHomeIndicatorView),
+        // so Dock taps and the real system's Home gesture are untouched.
+        .safeAreaInset(edge: .bottom) {
+            LCSealBoxHomeIndicatorView(state: homeBarState, isLocked: lockStore.isLocked)
+        }
         // The Dock is pinned to the bottom of the phone screen with
         // safeAreaInset: paging, dragging, searching and the keyboard
         // can never push it down, shrink it or hide it. Its height and
@@ -539,6 +617,14 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
                         }
                     }
                 }
+                // The home bar works on system pages too (§11): the
+                // same 36pt strip, bottom-anchored over the page. It
+                // floats above the page content like a real home
+                // indicator; unlocked it does not hit-test, so the
+                // page's own scrolling and taps are untouched.
+                .overlay(alignment: .bottom) {
+                    LCSealBoxHomeIndicatorView(state: homeBarState, isLocked: lockStore.isLocked)
+                }
         }
         .alert("lc.appBanner.confirmUninstallTitle".loc, isPresented: $showDeleteConfirm) {
             Button(role: .destructive) {
@@ -552,6 +638,41 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
             }
         } message: {
             Text("lc.appBanner.confirmUninstallMsg %@".localizeWithFormat(deleteConfirmName))
+        }
+        // SealBox shell overlays (§10.2 / §13). Both are overlays on
+        // the desktop — not fullScreenCovers — so they never fight the
+        // system-page cover for presentation: opening a system page
+        // from the switcher (or Settings from the control centre) is
+        // just two state flips in the same transaction, with no
+        // dismiss-then-present race. They sit last, so they cover the
+        // desktop, the home-bar strip and the Dock while open.
+        .overlay {
+            if showSwitcher {
+                LCAppSwitcherView(
+                    store: switcherStore,
+                    darkModeIcon: darkModeIcon,
+                    onDismiss: {
+                        showSwitcher = false
+                    },
+                    onOpenSystem: { page in
+                        showSwitcher = false
+                        systemPage = page
+                    }
+                )
+            }
+        }
+        .overlay {
+            if showControlCenter {
+                LCSealBoxControlCenterView(
+                    onDismiss: {
+                        showControlCenter = false
+                    },
+                    onOpenSettings: {
+                        showControlCenter = false
+                        systemPage = .settings
+                    }
+                )
+            }
         }
 
     }
@@ -701,7 +822,7 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
             errorInfo = error.localizedDescription
             errorShow = true
             self.installprogressVisible = false
-            if #available(iOS 16.1, *) {
+            if #available(iOS 16.2, *) {
                 Task { await LCContainerLiveActivityManager.endNow() }
             }
         }
@@ -715,7 +836,7 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
         let fm = FileManager()
 
         // Container's own Live Activity: IPA install progress.
-        if #available(iOS 16.1, *) {
+        if #available(iOS 16.2, *) {
             LCContainerLiveActivityManager.startInstall(appName: url.deletingPathExtension().lastPathComponent)
         }
         
@@ -724,7 +845,7 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
         self.installObserver = installProgress.observe(\.fractionCompleted) { p, v in
             DispatchQueue.main.async {
                 self.installProgressPercentage = Float(p.fractionCompleted)
-                if #available(iOS 16.1, *) {
+                if #available(iOS 16.2, *) {
                     LCContainerLiveActivityManager.updateProgress(Double(p.fractionCompleted), statusText: "lc.appList.installation".loc)
                 }
             }
@@ -908,7 +1029,7 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
             }
 
             self.installprogressVisible = false
-            if #available(iOS 16.1, *) {
+            if #available(iOS 16.2, *) {
                 LCContainerLiveActivityManager.finish(statusText: "lc.common.done".loc)
             }
         }
@@ -1495,7 +1616,8 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
         Group {
             if desktopDrag.isDragging {
                 Color.clear
-                    .frame(width: 28, maxHeight: .infinity)
+                    .frame(width: 28)
+                    .frame(maxHeight: .infinity)
                     .contentShape(Rectangle())
                     .onDrop(
                         of: [.text],
@@ -1571,14 +1693,14 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
     func launchDesktopApp(_ app: LCAppModel) {
         let id = LCDesktopIcon.appID(for: app)
         LCDesktopLaunchCountStore.recordLaunch(id: id)
-        if #available(iOS 16.1, *) {
+        if #available(iOS 16.2, *) {
             LCContainerLiveActivityManager.startLaunching(appName: app.displayName)
         }
         Task {
             if app.appInfo.isLocked && !sharedModel.isHiddenAppUnlocked {
                 do {
                     if !(try await LCUtils.authenticateUser()) {
-                        if #available(iOS 16.1, *) {
+                        if #available(iOS 16.2, *) {
                             await LCContainerLiveActivityManager.endNow()
                         }
                         return
@@ -1586,7 +1708,7 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
                 } catch {
                     errorInfo = error.localizedDescription
                     errorShow = true
-                    if #available(iOS 16.1, *) {
+                    if #available(iOS 16.2, *) {
                         await LCContainerLiveActivityManager.endNow()
                     }
                     return
@@ -1598,7 +1720,7 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
                 errorInfo = error.localizedDescription
                 errorShow = true
             }
-            if #available(iOS 16.1, *) {
+            if #available(iOS 16.2, *) {
                 LCContainerLiveActivityManager.finish(statusText: "lc.common.done".loc)
             }
             await MainActor.run {
@@ -1796,7 +1918,7 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
         }
 
         LCDesktopLaunchCountStore.recordLaunch(id: LCDesktopIcon.appID(for: appFound))
-        if #available(iOS 16.1, *) {
+        if #available(iOS 16.2, *) {
             LCContainerLiveActivityManager.startLaunching(appName: appFound.displayName)
         }
         do {
@@ -1805,7 +1927,7 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
             errorInfo = error.localizedDescription
             errorShow = true
         }
-        if #available(iOS 16.1, *) {
+        if #available(iOS 16.2, *) {
             LCContainerLiveActivityManager.finish(statusText: "lc.common.done".loc)
         }
         

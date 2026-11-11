@@ -169,8 +169,8 @@ final class LCSealBoxHomeBarState: ObservableObject {
             restoreWindow()
             return
         }
-        let up = -translation.height
-        let predictedUp = -predictedEndTranslation.height
+        let up = -translation.y
+        let predictedUp = -predictedEndTranslation.y
         if up > Self.goDesktopMinUpward || predictedUp > Self.goDesktopMinPredictedUpward {
             restoreWindow()
             requestAction(.goDesktop)
@@ -208,7 +208,7 @@ final class LCSealBoxHomeBarState: ObservableObject {
         }
         // Swipe up: the whole window shrinks proportionally (not a move).
         // Swipe down: no stretch, scale stays 1.
-        let up = max(0, -translation.height)
+        let up = max(0, -translation.y)
         let progress = min(1, up / Self.fullShrinkUpward)
         windowScale = 1 - (1 - Self.minWindowScale) * progress
 
@@ -289,12 +289,12 @@ struct LCSealBoxHomeIndicatorView: View {
                 if !state.isGestureActive {
                     state.beginGesture()
                 }
-                state.recordTranslation(value.translation)
+                state.recordTranslation(CGPoint(x: value.translation.width, y: value.translation.height))
             }
             .onEnded { value in
                 state.endGesture(
-                    translation: value.translation,
-                    predictedEndTranslation: value.predictedEndTranslation
+                    translation: CGPoint(x: value.translation.width, y: value.translation.height),
+                    predictedEndTranslation: CGPoint(x: value.predictedEndTranslation.width, y: value.predictedEndTranslation.height)
                 )
             }
     }
