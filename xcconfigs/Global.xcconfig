@@ -1,0 +1,15 @@
+//
+//  Global.xcconfig
+//  LiveContainer
+//
+//  Created by Duy Tran on 2025/5/24.
+//
+
+DEVELOPMENT_TEAM[config=Debug] = AAAAA11111
+DEVELOPMENT_TEAM[config=Release] = AAAAA11111
+
+DEVELOPMENT_TEAM_SUFFIX[config=Debug] = .$(DEVELOPMENT_TEAM)
+DEVELOPMENT_TEAM_SUFFIX[config=Release] =
+
+APP_GROUP_SEALBOX = group.com.mjorb.sealbox$(DEVELOPMENT_TEAM_SUFFIX)
+LIVECONTAINER_BUNDLE_IDENTIFIER = com.mjorb.sealbox$(DEVELOPMENT_TEAM_SUFFIX)

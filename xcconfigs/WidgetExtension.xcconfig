@@ -1,0 +1,10 @@
+//
+//  WidgetExtension.xcconfig
+//  LiveContainer
+//
+//  Created for SealBox Live Activity (Widget Extension).
+//
+
+#include "Global.xcconfig"
+
+PRODUCT_BUNDLE_IDENTIFIER = $(LIVECONTAINER_BUNDLE_IDENTIFIER).WidgetExtension
