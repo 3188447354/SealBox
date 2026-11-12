@@ -21,6 +21,20 @@
                ReferencedContainer = "container:LiveContainer.xcodeproj">
             </BuildableReference>
          </BuildActionEntry>
+         <BuildActionEntry
+            buildForTesting = "YES"
+            buildForRunning = "YES"
+            buildForProfiling = "YES"
+            buildForArchiving = "YES"
+            buildForAnalyzing = "YES">
+            <BuildableReference
+               BuildableIdentifier = "primary"
+               BlueprintIdentifier = "6B2FA8003AE9CA98C6A520AA"
+               BuildableName = "SealBoxWidgetExtension.appex"
+               BlueprintName = "SealBoxWidgetExtension"
+               ReferencedContainer = "container:LiveContainer.xcodeproj">
+            </BuildableReference>
+         </BuildActionEntry>
       </BuildActionEntries>
    </BuildAction>
    <TestAction
