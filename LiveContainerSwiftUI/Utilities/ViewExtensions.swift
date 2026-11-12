@@ -36,15 +36,22 @@ extension View {
         self.modifier(TextFieldAlertModifier(isPresented: isPresented, title: title, text: text, placeholder: placeholder, action: action, actionCancel: actionCancel))
     }
 
+    /// `confirmTitle` is `String? = nil`, not `String = "lc.common.ok".loc`:
+    /// a public function's default argument value must be usable from
+    /// outside the module, and `.loc` (Shared.swift) is internal — the
+    /// compiler rejects it ("property 'loc' is internal and cannot be
+    /// referenced from a default argument value", run #52). The
+    /// localisation is resolved inside the body instead (module context),
+    /// so callers that omit confirmTitle still get the localized OK.
     public func yesNoAlert(
         isPresented: Binding<Bool>,
         title: String,
         message: String,
-        confirmTitle: String = "lc.common.ok".loc,
+        confirmTitle: String? = nil,
         confirmStyle: UIAlertAction.Style = .default,
         onResult: @escaping (Bool) -> Void
     ) -> some View {
-        self.modifier(YesNoAlertModifier(isPresented: isPresented, title: title, message: message, confirmTitle: confirmTitle, confirmStyle: confirmStyle, onResult: onResult))
+        self.modifier(YesNoAlertModifier(isPresented: isPresented, title: title, message: message, confirmTitle: confirmTitle ?? "lc.common.ok".loc, confirmStyle: confirmStyle, onResult: onResult))
     }
 
     public func messageAlert(
