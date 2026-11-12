@@ -488,9 +488,9 @@ struct LCAppListView : View, LCAppModelDelegate {
         // The operation / confirmation / selection alerts that used
         // to live here are bottom sheets now (demo §11.1, P2-25):
         // install-replace choice, run-when-multitasking, delete
-        // confirm, Dock-remove confirm, restore wallpaper and JIT
-        // modal. Their overlays are attached in `body` next to the
-        // switcher / Control Center.
+        // confirm, Dock-remove confirm and JIT modal. Their overlays
+        // are attached in `body` next to the switcher / Control Center.
+        // (Restore-default-wallpaper lives in Settings now, not here.)
         // Left as system alerts on purpose: the error alert (error
         // display, not a choice) and the text-field alerts (the
         // UIKit alert handles the keyboard; a bottom-sheet text
@@ -541,9 +541,6 @@ struct LCAppListView : View, LCAppModelDelegate {
                 wallpaperStore.apply(image: image)
             }
         }
-        // Restore-default-wallpaper confirmation: bottom sheet now
-        // (P2-25); the overlay in `body` asks before deleting the
-        // stored custom wallpaper.
         .onAppear() {
             if !isViewAppeared {
                 if let webpageUrlStr = UserDefaults.standard.string(forKey: "webPageToOpen") {
@@ -636,17 +633,15 @@ struct LCAppListView : View, LCAppModelDelegate {
         // private var below; the .animation next to it drives the
         // sheet's 0.58 s spring-sheet entry/exit.
         .overlay { deleteConfirmSheetOverlay }
-        .animation(LCBottomSheet.spring, value: showDeleteConfirm)
+        .animation(LCBottomSheetMotion.spring, value: showDeleteConfirm)
         .overlay { dockRemoveSheetOverlay }
-        .animation(LCBottomSheet.spring, value: showDockRemoveConfirm)
+        .animation(LCBottomSheetMotion.spring, value: showDockRemoveConfirm)
         .overlay { installReplaceSheetOverlay }
-        .animation(LCBottomSheet.spring, value: installReplaceAlert.show)
+        .animation(LCBottomSheetMotion.spring, value: installReplaceAlert.show)
         .overlay { runWhenMultitaskSheetOverlay }
-        .animation(LCBottomSheet.spring, value: runWhenMultitaskAlert.show)
-        .overlay { restoreWallpaperSheetOverlay }
-        .animation(LCBottomSheet.spring, value: showRestoreWallpaperDialog)
+        .animation(LCBottomSheetMotion.spring, value: runWhenMultitaskAlert.show)
         .overlay { jitSheetOverlay }
-        .animation(LCBottomSheet.spring, value: jitAlert.show)
+        .animation(LCBottomSheetMotion.spring, value: jitAlert.show)
         // SealBox shell overlays (§10.2 / §13). Both are overlays on
         // the desktop — not fullScreenCovers — so they never fight the
         // system-page overlay for presentation: opening a system page
@@ -860,7 +855,7 @@ struct LCAppListView : View, LCAppModelDelegate {
                         }
                     }
                 }
-                .transition(LCBottomSheet.transition)
+                .transition(LCBottomSheetMotion.transition)
             } else {
                 EmptyView()
             }
@@ -897,7 +892,7 @@ struct LCAppListView : View, LCAppModelDelegate {
                         }
                     }
                 }
-                .transition(LCBottomSheet.transition)
+                .transition(LCBottomSheetMotion.transition)
             } else {
                 EmptyView()
             }
@@ -937,7 +932,7 @@ struct LCAppListView : View, LCAppModelDelegate {
                         }
                     }
                 }
-                .transition(LCBottomSheet.transition)
+                .transition(LCBottomSheetMotion.transition)
             } else {
                 EmptyView()
             }
@@ -970,40 +965,7 @@ struct LCAppListView : View, LCAppModelDelegate {
                         }
                     }
                 }
-                .transition(LCBottomSheet.transition)
-            } else {
-                EmptyView()
-            }
-        }
-    }
-
-    /// Restore-default-wallpaper confirmation as a bottom sheet.
-    /// Same copy as the old confirmationDialog.
-    private var restoreWallpaperSheetOverlay: some View {
-        Group {
-            if showRestoreWallpaperDialog {
-                LCBottomSheet(onDismiss: {
-                    showRestoreWallpaperDialog = false
-                }) {
-                    VStack(spacing: 12) {
-                        Text("恢复默认壁纸")
-                            .font(.headline)
-                            .multilineTextAlignment(.center)
-                        Text("将删除自定义壁纸，恢复默认背景。")
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
-                            .multilineTextAlignment(.center)
-                        Divider()
-                        LCBottomSheetActionRow(title: "恢复默认壁纸", role: .destructive) {
-                            wallpaperStore.resetToDefault()
-                            showRestoreWallpaperDialog = false
-                        }
-                        LCBottomSheetActionRow(title: "取消", role: .cancel) {
-                            showRestoreWallpaperDialog = false
-                        }
-                    }
-                }
-                .transition(LCBottomSheet.transition)
+                .transition(LCBottomSheetMotion.transition)
             } else {
                 EmptyView()
             }
@@ -1022,7 +984,7 @@ struct LCAppListView : View, LCAppModelDelegate {
                 }) {
                     JITEnablingModal
                 }
-                .transition(LCBottomSheet.transition)
+                .transition(LCBottomSheetMotion.transition)
             } else {
                 EmptyView()
             }

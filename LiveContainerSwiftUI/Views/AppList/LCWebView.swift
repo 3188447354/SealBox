@@ -153,12 +153,12 @@ struct LCWebView: View {
                         }
                     }
                 }
-                .transition(LCBottomSheet.transition)
+                .transition(LCBottomSheetMotion.transition)
             } else {
                 EmptyView()
             }
         }
-        .animation(LCBottomSheet.spring, value: runAppAlert.show)
+        .animation(LCBottomSheetMotion.spring, value: runAppAlert.show)
         .overlay {
             if installAppAlert.show {
                 LCBottomSheet(onDismiss: {
@@ -181,12 +181,12 @@ struct LCWebView: View {
                         }
                     }
                 }
-                .transition(LCBottomSheet.transition)
+                .transition(LCBottomSheetMotion.transition)
             } else {
                 EmptyView()
             }
         }
-        .animation(LCBottomSheet.spring, value: installAppAlert.show)
+        .animation(LCBottomSheetMotion.spring, value: installAppAlert.show)
 
         .alert("lc.common.error".loc, isPresented: $errorShow) {
             Button("lc.common.ok".loc, action: {

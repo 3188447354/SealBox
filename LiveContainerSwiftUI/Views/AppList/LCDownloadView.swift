@@ -138,12 +138,12 @@ public struct DownloadAlertModifier: ViewModifier {
                     }) {
                         DownloadAlert(helper: helper)
                     }
-                    .transition(LCBottomSheet.transition)
+                    .transition(LCBottomSheetMotion.transition)
                 } else {
                     EmptyView()
                 }
             }
-            .animation(LCBottomSheet.spring, value: show)
+            .animation(LCBottomSheetMotion.spring, value: show)
             .onChange(of: helper.isDownloading) { newVal in
                 show = newVal
             }

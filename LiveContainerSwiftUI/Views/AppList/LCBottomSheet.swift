@@ -8,8 +8,8 @@
 //
 //  Spec (demo §11.1):
 //  - Slides up from below the screen in 0.58 s spring-sheet; the
-//    parent drives the entry/exit with `LCBottomSheet.transition`
-//    + `.animation(LCBottomSheet.spring, value: flag)` (same pattern
+//    parent drives the entry/exit with `LCBottomSheetMotion.transition`
+//    + `.animation(LCBottomSheetMotion.spring, value: flag)` (same pattern
 //    as the Control Center overlay in LCAppListView).
 //  - Corner radius 30, bottom 10, side margins 10, max height 78%.
 //  - Scrim rgba(8,10,20,.28); tap scrim closes.
@@ -30,10 +30,13 @@
 
 import SwiftUI
 
-/// Bottom sheet container (demo §11.1). `onDismiss` only hides the
-/// sheet; callers that must resolve an async helper (AlertHelper /
-/// YesNoHelper) do so inside their `onDismiss` / button actions.
-struct LCBottomSheet<Content: View>: View {
+/// Shared bottom-sheet motion (demo §11.1). Kept on a non-generic
+/// namespace on purpose: `LCBottomSheet` is generic over its
+/// `Content`, and a generic type's static members cannot be
+/// referenced through the bare type name (`LCBottomSheet.spring`
+/// fails with "generic parameter 'Content' could not be inferred").
+/// Callers use `LCBottomSheetMotion.spring` / `.transition`.
+enum LCBottomSheetMotion {
     /// Shared sheet motion: 0.58 s spring-sheet (demo §11.1).
     static let spring = Animation.spring(response: 0.58, dampingFraction: 0.8)
     /// Shared sheet transition: slide from the bottom + fade.
@@ -41,7 +44,12 @@ struct LCBottomSheet<Content: View>: View {
         insertion: .move(edge: .bottom).combined(with: .opacity),
         removal: .move(edge: .bottom).combined(with: .opacity)
     )
+}
 
+/// Bottom sheet container (demo §11.1). `onDismiss` only hides the
+/// sheet; callers that must resolve an async helper (AlertHelper /
+/// YesNoHelper) do so inside their `onDismiss` / button actions.
+struct LCBottomSheet<Content: View>: View {
     var onDismiss: () -> Void
     @ViewBuilder var content: () -> Content
 
@@ -88,7 +96,7 @@ struct LCBottomSheet<Content: View>: View {
                                 if dy > 90 || (dy > 24 && v > 0.45) {
                                     onDismiss()
                                 } else {
-                                    withAnimation(Self.spring) {
+                                    withAnimation(LCBottomSheetMotion.spring) {
                                         dragOffset = 0
                                         scrimOpacity = 1
                                     }
