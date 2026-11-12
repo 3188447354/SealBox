@@ -70,6 +70,11 @@ struct LCTweakFolderView : View {
     var body: some View {
         List {
             Section {
+                if tweakItems.isEmpty {
+                    // Neutral empty state: no mock tweaks, no filler rows.
+                    Text("lc.settings.sealbox.noTweaks".loc)
+                        .foregroundStyle(.secondary)
+                }
                 ForEach(tweakItems, id:\.self) { tweakItem in
                     HStack {
                         Group {

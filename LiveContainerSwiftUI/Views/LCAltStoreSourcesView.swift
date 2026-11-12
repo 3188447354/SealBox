@@ -612,7 +612,7 @@ struct LCSourcesView: View {
         .onAppear {
             expandedSources = []
             if !isViewAppeared {
-                guard sharedModel.selectedTab == .sources, let link = sharedModel.deepLink else { return }
+                guard sharedModel.requestedSystemPage == .sources, let link = sharedModel.deepLink else { return }
                 sharedModel.deepLink = nil
                 handleURL(url: link)
                 isViewAppeared = true
@@ -623,7 +623,7 @@ struct LCSourcesView: View {
             expandedSources = expandedSources.intersection(newSet)
         }
         .onChange(of: sharedModel.deepLink) { link in
-            guard sharedModel.selectedTab == .sources, let link else { return }
+            guard sharedModel.requestedSystemPage == .sources, let link else { return }
             sharedModel.deepLink = nil
             handleURL(url: link)
         }
@@ -682,7 +682,7 @@ struct LCSourcesView: View {
             return
         }
         withAnimation {
-            DataManager.shared.model.selectedTab = .apps
+            DataManager.shared.model.requestedSystemPage = nil
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
             NotificationCenter.default.post(name: NSNotification.InstallAppNotification, object: ["url": downloadURL])
@@ -711,7 +711,7 @@ struct LCSourcesView: View {
                     }
                 }
                 if let sourceUrl {
-                    DataManager.shared.model.selectedTab = .sources
+                    DataManager.shared.model.requestedSystemPage = .sources
                     Task { await handleAddSource(sourceUrl) }
                 }
             }
