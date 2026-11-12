@@ -282,7 +282,7 @@
 				LCStatusBarManager.h,
 				LCStatusBarManager.m,
 				MultitaskAppWindow.swift,
-				MultitaskDockView.swift,
+				MultitaskWindowRegistry.swift,
 				MultitaskManager.swift,
 				PiPManager.h,
 				PiPManager.m,
