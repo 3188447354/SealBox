@@ -589,51 +589,23 @@ struct LCSettingsView: View {
             .listStyle(.insetGrouped)
             .navigationTitle("lc.tabView.settings".loc)
             .searchable(text: $searchText, prompt: "lc.settings.sealbox.searchPrompt".loc)
-            .alert("lc.common.error".loc, isPresented: $errorShow){
-            } message: {
-                Text(errorInfo)
+            // NOTE: these must NOT be SwiftUI `.alert`s. SwiftUI honours
+            // only one `.alert` per view (the last in the chain wins), and
+            // this List used to chain five of them, so the import/remove
+            // confirmations and the error/success feedback could never
+            // appear and `importCertificate()` hung forever in `open()`.
+            // They are UIKit alerts presented from the topmost controller
+            // instead (see YesNoAlertModifier / MessageAlertModifier).
+            .messageAlert(isPresented: $errorShow, title: "lc.common.error".loc, message: errorInfo)
+            .messageAlert(isPresented: $successShow, title: "lc.common.success".loc, message: successInfo)
+            .yesNoAlert(isPresented: $certificateImportAlert.show, title: "lc.settings.importCertificate".loc, message: "lc.settings.importCertificateDesc".loc) { result in
+                certificateImportAlert.close(result: result)
             }
-            .alert("lc.common.success".loc, isPresented: $successShow){
-            } message: {
-                Text(successInfo)
+            .yesNoAlert(isPresented: $certificateRemoveAlert.show, title: "lc.settings.removeCertificate".loc, message: "lc.settings.removeCertificateDesc".loc, confirmStyle: .destructive) { result in
+                certificateRemoveAlert.close(result: result)
             }
-            .alert("lc.settings.importCertificate".loc, isPresented: $certificateImportAlert.show) {
-                Button {
-                    certificateImportAlert.close(result: true)
-                } label: {
-                    Text("lc.common.ok".loc)
-                }
-
-                Button("lc.common.cancel".loc, role: .cancel) {
-                    certificateImportAlert.close(result: false)
-                }
-            } message: {
-                Text("lc.settings.importCertificateDesc".loc)
-            }
-            .alert("lc.settings.removeCertificate".loc, isPresented: $certificateRemoveAlert.show) {
-                Button(role: .destructive) {
-                    certificateRemoveAlert.close(result: true)
-                } label: {
-                    Text("lc.common.ok".loc)
-                }
-
-                Button("lc.common.cancel".loc, role: .cancel) {
-                    certificateRemoveAlert.close(result: false)
-                }
-            } message: {
-                Text("lc.settings.removeCertificateDesc".loc)
-            }
-            .alert("lc.settings.importCertFromBuiltinSideStore".loc, isPresented: $certificateImportFromBuiltInSideStoreAlert.show) {
-                Button {
-                    certificateImportFromBuiltInSideStoreAlert.close(result: true)
-                } label: {
-                    Text("lc.common.ok".loc)
-                }
-                Button("lc.common.cancel".loc, role: .cancel) {
-                    certificateImportFromBuiltInSideStoreAlert.close(result: false)
-                }
-            } message: {
-                Text("lc.settings.importCertFromBuiltinSideStoreDesc".loc)
+            .yesNoAlert(isPresented: $certificateImportFromBuiltInSideStoreAlert.show, title: "lc.settings.importCertFromBuiltinSideStore".loc, message: "lc.settings.importCertFromBuiltinSideStoreDesc".loc) { result in
+                certificateImportFromBuiltInSideStoreAlert.close(result: result)
             }
             .betterFileImporter(isPresented: $certificateImportFileAlert.show, types: [.p12], multiple: false, callback: { fileUrls in
                 certificateImportFileAlert.close(result: fileUrls[0])
