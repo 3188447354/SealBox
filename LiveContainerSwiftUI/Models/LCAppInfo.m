@@ -88,7 +88,13 @@
             }
             NSMutableArray *schemes = nowUrlType[@"CFBundleURLSchemes"];
             for(int j = 0; j < [schemes count]; ++j) {
-                [urlSchemes insertObject:[schemes objectAtIndex:j] atIndex:nowSchemeCount];
+                // The plist may contain non-string entries: only NSString
+                // values may go into the NSString-typed result array.
+                id scheme = [schemes objectAtIndex:j];
+                if (![scheme isKindOfClass:[NSString class]]) {
+                    continue;
+                }
+                [urlSchemes insertObject:scheme atIndex:nowSchemeCount];
                 ++nowSchemeCount;
             }
         }
