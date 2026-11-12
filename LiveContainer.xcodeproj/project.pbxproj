@@ -507,7 +507,6 @@
 				173545A82E2C7913001B3B4C /* SideStoreSupport.framework */,
 				17CAE6172F230449008B1977 /* LaunchAppExtension.appex */,
 				17E23DDF2F443A9300C55733 /* ShareExtension.appex */,
-				17E23DDF2F443A9300C55733 /* ShareExtension.appex */,
 				CA534478B366528A1200B9D1 /* SealBoxWidgetExtension.appex */,
 			);
 			name = Products;
@@ -748,7 +747,6 @@
 			productReference = 17E23DDF2F443A9300C55733 /* ShareExtension.appex */;
 			productType = "com.apple.product-type.app-extension";
 		};
-		E1292AE42DCA3A660065E12D /* LiveProcess */ = {
 		6B2FA8003AE9CA98C6A520AA /* SealBoxWidgetExtension */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = 5DD10967615B301340033439 /* Build configuration list for PBXNativeTarget "SealBoxWidgetExtension" */;
@@ -771,6 +769,7 @@
 			productReference = CA534478B366528A1200B9D1 /* SealBoxWidgetExtension.appex */;
 			productType = "com.apple.product-type.app-extension";
 		};
+		E1292AE42DCA3A660065E12D /* LiveProcess */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = E1292AF42DCA3A660065E12D /* Build configuration list for PBXNativeTarget "LiveProcess" */;
 			buildPhases = (
