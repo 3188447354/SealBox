@@ -299,6 +299,8 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
                 LCSealBoxLockButton(lockStore: lockStore)
                     .padding(.top, max(geometry.safeAreaInsets.top, 44) + 12)
                     .padding(.trailing, 20)
+            } else {
+                EmptyView()
             }
         }
         }
@@ -751,6 +753,8 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
                 // Entry/exit fade (demo §7.1/§7.4: the scrim fades
                 // 0.42 s; the cards stagger in inside the switcher).
                 .transition(.opacity)
+            } else {
+                EmptyView()
             }
         }
         .animation(.easeOut(duration: 0.42), value: showSwitcher)
@@ -771,6 +775,8 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
                     insertion: .move(edge: .top).combined(with: .opacity),
                     removal: .move(edge: .top).combined(with: .opacity)
                 ))
+            } else {
+                EmptyView()
             }
         }
         .animation(.spring(response: 0.58, dampingFraction: 0.8), value: showControlCenter)
