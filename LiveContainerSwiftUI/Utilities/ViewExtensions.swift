@@ -35,7 +35,26 @@ extension View {
     ) -> some View {
         self.modifier(TextFieldAlertModifier(isPresented: isPresented, title: title, text: text, placeholder: placeholder, action: action, actionCancel: actionCancel))
     }
-    
+
+    public func yesNoAlert(
+        isPresented: Binding<Bool>,
+        title: String,
+        message: String,
+        confirmTitle: String = "lc.common.ok".loc,
+        confirmStyle: UIAlertAction.Style = .default,
+        onResult: @escaping (Bool) -> Void
+    ) -> some View {
+        self.modifier(YesNoAlertModifier(isPresented: isPresented, title: title, message: message, confirmTitle: confirmTitle, confirmStyle: confirmStyle, onResult: onResult))
+    }
+
+    public func messageAlert(
+        isPresented: Binding<Bool>,
+        title: String,
+        message: String
+    ) -> some View {
+        self.modifier(MessageAlertModifier(isPresented: isPresented, title: title, message: message))
+    }
+
     public func betterFileImporter(
         isPresented: Binding<Bool>,
         types : [UTType],
@@ -201,6 +220,102 @@ public struct TextFieldAlertModifier: ViewModifier {
         alertController = nil
     }
 
+}
+
+/// UIKit Yes/No alert, presented from the topmost view controller.
+///
+/// SwiftUI honours only ONE `.alert` modifier per view — the last one
+/// in the chain wins and the earlier ones are silently ignored.
+/// LCSettingsView chained five `.alert`s on the same List (error,
+/// success, import-certificate, remove-certificate, import-from-store),
+/// so only the last (import-from-store) could ever appear: tapping
+/// "Import Certificate" set `certificateImportAlert.show = true` and
+/// `AlertHelper.open()` then awaited a callback that never came, and
+/// the import looked dead. The same fate hit remove-certificate and the
+/// error/success feedback. Present these confirmations through UIKit
+/// instead, exactly like the password prompt below, with the same
+/// `presentFromTopmost` retry while a transition is in flight.
+public struct YesNoAlertModifier: ViewModifier {
+    @EnvironmentObject var sceneDelegate: SceneDelegate
+    @State private var alertController: UIAlertController?
+
+    @Binding var isPresented: Bool
+
+    let title: String
+    let message: String
+    let confirmTitle: String
+    let confirmStyle: UIAlertAction.Style
+    let onResult: (Bool) -> Void
+
+    public func body(content: Content) -> some View {
+        content.onChange(of: isPresented) { isPresented in
+            if isPresented, alertController == nil {
+                let alertController = makeAlertController()
+                self.alertController = alertController
+                presentFromTopmost(alertController, in: sceneDelegate.window) { self.isPresented }
+            } else if !isPresented, let alertController = alertController {
+                alertController.dismiss(animated: true)
+                self.alertController = nil
+            }
+        }
+    }
+
+    private func makeAlertController() -> UIAlertController {
+        let controller = UIAlertController(title: title, message: message, preferredStyle: .alert)
+        controller.addAction(UIAlertAction(title: confirmTitle, style: confirmStyle) { _ in
+            self.onResult(true)
+            shutdown()
+        })
+        controller.addAction(UIAlertAction(title: "lc.common.cancel".loc, style: .cancel) { _ in
+            self.onResult(false)
+            shutdown()
+        })
+        return controller
+    }
+
+    private func shutdown() {
+        isPresented = false
+        alertController = nil
+    }
+}
+
+/// UIKit single-button (OK) message alert, presented the same way as
+/// `YesNoAlertModifier`. Used for the error/success feedback, which
+/// were two more dead `.alert`s in the same five-deep chain.
+public struct MessageAlertModifier: ViewModifier {
+    @EnvironmentObject var sceneDelegate: SceneDelegate
+    @State private var alertController: UIAlertController?
+
+    @Binding var isPresented: Bool
+
+    let title: String
+    let message: String
+
+    public func body(content: Content) -> some View {
+        content.onChange(of: isPresented) { isPresented in
+            if isPresented, alertController == nil {
+                let alertController = makeAlertController()
+                self.alertController = alertController
+                presentFromTopmost(alertController, in: sceneDelegate.window) { self.isPresented }
+            } else if !isPresented, let alertController = alertController {
+                alertController.dismiss(animated: true)
+                self.alertController = nil
+            }
+        }
+    }
+
+    private func makeAlertController() -> UIAlertController {
+        let controller = UIAlertController(title: title, message: message, preferredStyle: .alert)
+        controller.addAction(UIAlertAction(title: "lc.common.ok".loc, style: .default) { _ in
+            shutdown()
+        })
+        return controller
+    }
+
+    private func shutdown() {
+        isPresented = false
+        alertController = nil
+    }
 }
 
 struct BasicButtonStyle: ButtonStyle {
