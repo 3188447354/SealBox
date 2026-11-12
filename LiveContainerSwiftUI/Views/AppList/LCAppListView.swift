@@ -60,6 +60,11 @@ struct LCAppListView : View, LCAppModelDelegate {
     
     @State private var jitLog = ""
     @StateObject private var jitAlert = YesNoHelper()
+
+    /// Missing-certificate prompt (pre-launch gate + JITLess launch
+    /// failure): a Yes/No bottom sheet, not a SwiftUI .alert — the
+    /// Settings page already proved .alert only honours the last one.
+    @StateObject private var certificateAlert = YesNoHelper()
     
     @StateObject private var runWhenMultitaskAlert = YesNoHelper()
     
@@ -171,7 +176,7 @@ struct LCAppListView : View, LCAppModelDelegate {
         } else {
             return apps.filter { app in
                 app.appInfo.displayName().localizedCaseInsensitiveContains(searchContext.debouncedQuery) ||
-                app.appInfo.bundleIdentifier()!.localizedCaseInsensitiveContains(searchContext.debouncedQuery)
+                (app.appInfo.bundleIdentifier()?.localizedCaseInsensitiveContains(searchContext.debouncedQuery) ?? false)
             }
         }
     }
@@ -666,6 +671,8 @@ struct LCAppListView : View, LCAppModelDelegate {
         .animation(LCBottomSheetMotion.spring, value: installReplaceAlert.show)
         .overlay { runWhenMultitaskSheetOverlay }
         .animation(LCBottomSheetMotion.spring, value: runWhenMultitaskAlert.show)
+        .overlay { certificateSheetOverlay }
+        .animation(LCBottomSheetMotion.spring, value: certificateAlert.show)
         .overlay { jitSheetOverlay }
         .animation(LCBottomSheetMotion.spring, value: jitAlert.show)
         // SealBox shell overlays (§10.2 / §13). Both are overlays on
@@ -998,6 +1005,48 @@ struct LCAppListView : View, LCAppModelDelegate {
         }
     }
 
+    /// Missing-certificate prompt as a bottom sheet (demo §11.1,
+    /// P2-25 — same pattern as runWhenMultitaskSheetOverlay, no new
+    /// SwiftUI .alert). Shown before launch when no certificate is
+    /// imported, and when a launch fails with the bootstrap JITLess
+    /// no-certificate error. "Import Certificate" resolves the
+    /// awaiting open() with true and the caller opens Settings
+    /// (its first section is the certificate group); Cancel / scrim
+    /// dismiss resolves false and the launch is abandoned.
+    /// Copy reuses existing localized keys only, so no new strings
+    /// are needed: the title is the Settings certificate group,
+    /// the message is the Settings import explanation (it already
+    /// ends in "Continue?"), the action is the Settings import row.
+    private var certificateSheetOverlay: some View {
+        Group {
+            if certificateAlert.show {
+                LCBottomSheet(onDismiss: {
+                    certificateAlert.close(result: false)
+                }) {
+                    VStack(spacing: 12) {
+                        Text("lc.settings.sealbox.certificate".loc)
+                            .font(.headline)
+                            .multilineTextAlignment(.center)
+                        Text("lc.settings.importCertificateDesc".loc)
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                        Divider()
+                        LCBottomSheetActionRow(title: "lc.settings.importCertificate".loc) {
+                            certificateAlert.close(result: true)
+                        }
+                        LCBottomSheetActionRow(title: "lc.common.cancel".loc, role: .cancel) {
+                            certificateAlert.close(result: false)
+                        }
+                    }
+                }
+                .transition(LCBottomSheetMotion.transition)
+            } else {
+                EmptyView()
+            }
+        }
+    }
+
     /// JIT modal as a bottom sheet (was a .sheet). The modal's own
     /// Cancel / Launch-Now buttons resolve jitAlert exactly as
     /// before; scrim / grabber dismiss resolves false, mirroring
@@ -1161,7 +1210,14 @@ struct LCAppListView : View, LCAppModelDelegate {
         do {
             self.installprogressVisible = true
             try await installIpaFile(fileUrl)
-            try FileManager.default.removeItem(at: fileUrl)
+            // The install already succeeded: removing the source file is
+            // best-effort. A failure here must not surface as an install
+            // error.
+            do {
+                try FileManager.default.removeItem(at: fileUrl)
+            } catch {
+                NSLog("[LC] startInstallApp: failed to remove source file \(fileUrl.path): \(error)")
+            }
         } catch {
             errorInfo = error.localizedDescription
             errorShow = true
@@ -1224,16 +1280,20 @@ struct LCAppListView : View, LCAppModelDelegate {
             throw "lc.appList.infoPlistCannotReadError".loc
         }
 
-        var appRelativePath = "\(newAppInfo.bundleIdentifier()!.sanitizeNonACSII()).app"
+        guard let newBundleId = newAppInfo.bundleIdentifier() else {
+            throw "lc.appList.infoPlistCannotReadError".loc
+        }
+
+        var appRelativePath = "\(newBundleId.sanitizeNonACSII()).app"
         var outputFolder = LCPath.bundlePath.appendingPathComponent(appRelativePath)
         var appToReplace : LCAppModel? = nil
         // Folder exist! show alert for user to choose which bundle to replace
         let sameBundleIdApp = sharedModel.apps.filter { app in
-            return app.appInfo.bundleIdentifier()! == newAppInfo.bundleIdentifier()
+            return app.appInfo.bundleIdentifier() == newBundleId
         }
         
         if fm.fileExists(atPath: outputFolder.path) || sameBundleIdApp.count > 0 {
-            appRelativePath = "\(newAppInfo.bundleIdentifier()!)_\(Int(CFAbsoluteTimeGetCurrent())).app"
+            appRelativePath = "\(newBundleId)_\(Int(CFAbsoluteTimeGetCurrent())).app"
             
             self.installOptions = [AppReplaceOption(isReplace: false, nameOfFolderToInstall: appRelativePath)]
             
@@ -1576,7 +1636,14 @@ struct LCAppListView : View, LCAppModelDelegate {
         if isSearching {
             return filteredApps.map { LCDesktopIcon.app($0) }
         }
-        let byID = Dictionary(uniqueKeysWithValues: sharedModel.apps.map { (LCDesktopIcon.appID(for: $0), LCDesktopIcon.app($0)) })
+        // Same bundleId:relativePath can appear twice (private + shared
+        // copy): uniquingKeysWith dedupes instead of trapping, keeping
+        // the private copy. LCDesktopIcon has no isShared of its own —
+        // the flag lives on LCAppModel.uiIsShared (LCAppInfo.isShared).
+        let byID = Dictionary(sharedModel.apps.map { (LCDesktopIcon.appID(for: $0), LCDesktopIcon.app($0)) }, uniquingKeysWith: { first, second in
+            if second.appModel?.uiIsShared == false { return second }
+            return first
+        })
         let dockIDs = Set(desktopDock.dockIDs)
         var slots: [LCDesktopIcon?] = desktopOrder.order.map { id in
             id.isEmpty ? nil : byID[id]
@@ -1597,7 +1664,12 @@ struct LCAppListView : View, LCAppModelDelegate {
     /// dropped here (and purged from the store on launch); it stays
     /// in the fixed system row.
     var dockDisplayIcons: [LCDesktopIcon] {
-        let byID = Dictionary(uniqueKeysWithValues: sharedModel.apps.map { (LCDesktopIcon.appID(for: $0), LCDesktopIcon.app($0)) })
+        // Same dedupe as desktopVisibleSlots: a private + shared copy
+        // sharing one bundleId:relativePath must not trap.
+        let byID = Dictionary(sharedModel.apps.map { (LCDesktopIcon.appID(for: $0), LCDesktopIcon.app($0)) }, uniquingKeysWith: { first, second in
+            if second.appModel?.uiIsShared == false { return second }
+            return first
+        })
         return desktopDock.dockIDs.compactMap { byID[$0] }.filter { !$0.isSystem }
     }
 
@@ -1788,6 +1860,11 @@ struct LCAppListView : View, LCAppModelDelegate {
     /// searching, like the old grid's system icons were. In edit mode
     /// they do not jiggle and cannot be dragged: tapping one does
     /// nothing, exactly like tapping a grid icon in edit mode.
+    /// The row's 4th column is otherwise always blank: it holds the
+    /// normal-mode import entry (importIPACell, option B below), so
+    /// the desktop has a visible "导入 IPA" entry without entering
+    /// edit mode. It is hidden in edit mode — the edit-mode top bar's
+    /// "+" is the import entry there — so edit mode is unchanged.
     private var desktopSystemIconsRow: some View {
         Group {
             if !isSearching {
@@ -1799,11 +1876,57 @@ struct LCAppListView : View, LCAppModelDelegate {
                             systemIconCell(page)
                         }
                     }
+                    if !isEditing {
+                        importIPACell
+                    }
                 }
                 .padding(.horizontal, 20)
                 .padding(.top, 4)
             }
         }
+    }
+
+    /// Normal-mode import entry (option B): a "+" tile in the system
+    /// icons row's always-empty 4th column, labelled "导入 IPA".
+    /// Same 60 pt tile + 12 pt label as the system cells beside it,
+    /// so it reads as part of the row, not a floating button. Tapping
+    /// it sets choosingIPA, i.e. the exact same .ipa/.tipa importer
+    /// the edit-mode "+" opens — the import chain itself is untouched.
+    /// Hidden in edit mode (see desktopSystemIconsRow): the top bar's
+    /// "+" already covers import there, and the tap guard below keeps
+    /// it inert even if it is ever shown while editing.
+    private var importIPACell: some View {
+        VStack(spacing: 4) {
+            RoundedRectangle(cornerRadius: 60 * 0.2667)
+                .fill(Color.green)
+                .overlay {
+                    Image(systemName: "plus")
+                        .font(.system(size: 60 * 0.43, weight: .semibold))
+                        .foregroundStyle(.white)
+                }
+                .frame(width: 60, height: 60)
+            Text("导入 IPA")
+                .font(.system(size: 12))
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .minimumScaleFactor(0.7)
+                .foregroundStyle(desktopTheme.nameColor)
+                .shadow(color: .black.opacity(0.55), radius: 2, x: 0, y: 1)
+                .frame(maxWidth: 76)
+        }
+        .frame(maxWidth: .infinity)
+        // High-priority tap, like a system cell: in edit mode the tap
+        // is claimed and does nothing (it must not exit edit mode, and
+        // it must not open the importer); outside edit mode it opens
+        // the .ipa importer.
+        .highPriorityGesture(
+            TapGesture().onEnded {
+                guard !isEditing else {
+                    return
+                }
+                choosingIPA = true
+            }
+        )
     }
 
     private func systemIconCell(_ page: LCSystemPage) -> some View {
@@ -2192,7 +2315,52 @@ struct LCAppListView : View, LCAppModelDelegate {
     /// before runApp opens the scene (P2-28). Classic launches and
     /// launches without a tapped icon (search rows have no frame)
     /// keep the existing launch path untouched.
+    /// Pre-launch certificate gate (LCBootstrap.m:256): without an
+    /// imported certificate the bootstrap refuses the guest on iOS
+    /// 26+ — and JITLess signing cannot work without one on any
+    /// version — so a launch would die silently inside runApp. Check
+    /// the same value the bootstrap checks
+    /// (`LCSharedUtils.certificatePassword()`, i.e. the
+    /// "LCCertificatePassword" app-group key the Settings import
+    /// writes) here, before the Live Activity / lock auth / icon
+    /// zoom, and prompt instead of launching. The bootstrap's
+    /// SideStore exemption needs no mirror here: it only applies
+    /// when the launched app IS the built-in SideStore, which never
+    /// goes through launchDesktopApp (it runs via
+    /// LCUtilsExtensions.openSideStore with bundleIdOverride
+    /// "builtinSideStore"). The check itself is version-independent;
+    /// only the wording (iOS 26+ JITLess) follows the bootstrap.
+    /// Shows the missing-certificate sheet; on "Import Certificate"
+    /// opens Settings — the existing deep-link wiring
+    /// (sharedModel.requestedSystemPage, consumed by this view's
+    /// .onChange into the system-page overlay), whose first section
+    /// is the certificate group — and returns without launching.
+    private func showMissingCertificatePrompt() async {
+        guard let goImport = await certificateAlert.open(), goImport else { return }
+        await MainActor.run {
+            sharedModel.requestedSystemPage = .settings
+        }
+    }
+
+    /// Whether a launch failure is the bootstrap's no-certificate
+    /// JITLess refusal (LCBootstrap.m:256-259). Matched on
+    /// substrings, not equality: runApp rethrows the bootstrap
+    /// string verbatim, but its exact wording is bootstrap-owned
+    /// and may gain a prefix/suffix. The two fragments are the
+    /// stable core of that string ("JITLess mode is required since
+    /// iOS 26. … tap \"Import Certificate from SideStore\" /
+    /// \"Import Certificate\"").
+    private func isMissingCertificateError(_ error: Error) -> Bool {
+        let message = error.localizedDescription
+        return message.contains("JITLess mode is required")
+            || message.contains("Import Certificate")
+    }
+
     func launchDesktopApp(_ app: LCAppModel, zoomFrom icon: LCDesktopIcon? = nil) {
+        guard LCSharedUtils.certificatePassword() != nil else {
+            Task { await showMissingCertificatePrompt() }
+            return
+        }
         if #available(iOS 16.2, *) {
             LCContainerLiveActivityManager.startLaunching(appName: app.displayName)
         }
@@ -2228,8 +2396,19 @@ struct LCAppListView : View, LCAppModelDelegate {
             do {
                 try await app.runApp()
             } catch {
-                errorInfo = error.localizedDescription
-                errorShow = true
+                // A launch that still fails with the bootstrap
+                // JITLess no-certificate error (e.g. the certificate
+                // was removed after the pre-check) gets the same
+                // guided prompt immediately, instead of only the
+                // raw string via next-launch checkLastLaunchError
+                // (LCSealBoxRootView, untouched). Other errors keep
+                // the existing errorInfo/errorShow path.
+                if isMissingCertificateError(error) {
+                    await showMissingCertificatePrompt()
+                } else {
+                    errorInfo = error.localizedDescription
+                    errorShow = true
+                }
             }
             await MainActor.run {
                 endGuestZoom()
