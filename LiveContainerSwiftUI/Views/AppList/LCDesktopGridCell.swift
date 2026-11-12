@@ -49,6 +49,16 @@ struct LCDesktopGridCell: View {
     /// theme on a dark wallpaper stays readable.
     let theme: LCDesktopTheme
 
+    /// Drag state (reference type): the tap handler reads
+    /// `isDragging` / `isLanding` from it AT TAP TIME, so a tap
+    /// that fires on the same lift-off as a drag release stands down
+    /// (demo §1.7 suppressClick). A plain Bool captured at body time
+    /// would be stale here — the drag state flips between touch-down
+    /// and lift-off. Passed as a plain `let`, not @ObservedObject:
+    /// the cell must not re-render on drag-state changes, the parent
+    /// already re-renders it with the drag flags it needs.
+    let dragState: LCDesktopDragState
+
     var onTap: () -> Void
     var onDelete: (() -> Void)?
 
@@ -233,11 +243,22 @@ struct LCDesktopGridCell: View {
         // touch-up as the badge button, and by the next runloop the
         // button has set badgeJustTapped, so the badge tap stands
         // down here and never opens the app.
+        // Drag-release suppression (demo §1.7): a drag that moved
+        // only just past the 7 pt drag threshold can still pass the
+        // tap recogniser's own movement tolerance, so the release
+        // would fire BOTH the drop and this tap. The drag state is
+        // read live here: at lift-off it is either still dragging
+        // (this tap fires first) or already landing (the drag's
+        // onEnded fired first), so one of the two flags is always
+        // set for a real drag release and the tap stands down.
         .highPriorityGesture(
             TapGesture().onEnded {
                 DispatchQueue.main.async {
                     if badgeJustTapped {
                         badgeJustTapped = false
+                        return
+                    }
+                    if dragState.isDragging || dragState.isLanding {
                         return
                     }
                     onTap()

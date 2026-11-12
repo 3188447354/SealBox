@@ -20,8 +20,10 @@
 //  with that app (it returns to the dragged app's original grid cell);
 //  a drop on empty Dock space appends (evicting the last Dock icon if
 //  full). Dragging a Dock icon onto another Dock slot is a no-change
-//  drop in the demo (it flies back). The dragged Dock icon's slot is
-//  drawn as an empty dashed slot while the ghost floats above it.
+//  drop in the demo (it flies back). The dragged Dock icon's slot
+//  stays invisible while the ghost floats above it (no outline —
+//  an empty slot is just empty, demo §4); its frame is
+//  still reported for the drag hit-test.
 //  Slot + bar frames are reported for the drag hit-test.
 //
 //  Edit mode (demo §2.2): Dock icons jiggle identically to grid icons
@@ -32,8 +34,9 @@
 import SwiftUI
 
 /// The Dock. `dockIcons` are the icons currently in the Dock, in Dock
-/// order; empty slots are rendered as transparent spacers (dashed outline
-/// in edit mode) and are never auto-filled after a manual drag-out.
+/// order; empty slots are invisible transparent placeholders (never any
+/// outline, in any mode) that still report their frame for the
+/// drag hit-test, and are never auto-filled after a manual drag-out.
 struct LCDesktopDockView: View {
     let dockIcons: [LCDesktopIcon]
     let isEditing: Bool
@@ -144,17 +147,11 @@ struct LCDesktopDockView: View {
         let angles = jiggleAngles(for: icon)
         ZStack(alignment: .topLeading) {
             LCDesktopIconTile(icon: icon, darkModeIcon: darkModeIcon, size: Self.iconSize)
-                // The dragged icon's slot is an empty dashed slot
-                // (the ghost is the dragged tile); the hovered slot
-                // keeps its icon and gets the demo's 2 pt outline.
+                // The dragged icon's slot stays invisible (no outline
+                // — the ghost is the dragged tile); the hovered
+                // slot keeps its icon and gets the demo's 2 pt outline.
                 .opacity(isDragged ? 0.0 : 1.0)
                 .overlay {
-                    if isDragged {
-                        RoundedRectangle(cornerRadius: Self.iconSize * 0.2667)
-                            .strokeBorder(style: StrokeStyle(lineWidth: 1.5, dash: [4, 4]))
-                            .foregroundStyle(.secondary)
-                            .frame(width: Self.iconSize, height: Self.iconSize)
-                    }
                     if isDropTarget {
                         RoundedRectangle(cornerRadius: Self.iconSize * 0.2667)
                             .strokeBorder(Color.white.opacity(0.85), lineWidth: 2)
@@ -239,14 +236,22 @@ struct LCDesktopDockView: View {
     }
 
     private func emptySlot(slot: Int) -> some View {
+        // Invisible placeholder (demo §4): an empty Dock is just an
+        // empty glass pill — no outline in any mode, including
+        // edit mode and drag-over. The only visible state is the solid
+        // 2 pt drop-target outline (demo §1.4 drop-hover) while a drag
+        // hovers this slot. The frame is still reported below so the
+        // drag hit-test can land on this slot (append / swap / evict).
         let isDropTarget = dropTargetSlot == slot
-        return RoundedRectangle(cornerRadius: Self.iconSize * 0.2667)
-            .strokeBorder(
-                style: StrokeStyle(lineWidth: isDropTarget ? 2 : 1.5, dash: isDropTarget ? [] : [4, 4])
-            )
-            .foregroundStyle(isDropTarget ? Color.white.opacity(0.85) : .secondary)
+        return Color.clear
             .frame(width: Self.iconSize, height: Self.iconSize)
-            .opacity(isEditing || isDragOver || isDropTarget ? 1.0 : 0.0)
+            .overlay {
+                if isDropTarget {
+                    RoundedRectangle(cornerRadius: Self.iconSize * 0.2667)
+                        .strokeBorder(Color.white.opacity(0.85), lineWidth: 2)
+                        .padding(-2)
+                }
+            }
             .animation(.easeInOut(duration: 0.15), value: isDropTarget)
             // Slot frame for the drag hit-test.
             .background(

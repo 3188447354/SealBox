@@ -129,10 +129,18 @@ struct LCDesktopDockFramePreferenceKey: PreferenceKey {
 
 final class LCDesktopDragState: ObservableObject {
     /// Long-press that enters edit mode (demo §1.3): 450 ms, cancelled
-    /// by > 9 pt of movement. In edit mode the long-press is instant
-    /// (duration 0) so an icon can be grabbed without a second hold.
+    /// by > 9 pt of movement. The duration is ALWAYS 0.45 s, in edit
+    /// mode too — see LCDesktopIconDragGesture below for why it must
+    /// never be 0 in edit mode.
     static let longPressDuration: TimeInterval = 0.45
     static let longPressMaxMovement: CGFloat = 9
+    /// Whether edit mode is on, mirrored here (reference type) so a
+    /// gesture handler running mid-touch reads the CURRENT value.
+    /// A gesture closure that reads the view's @State `isEditing`
+    /// instead sees the value captured when the body was last
+    /// evaluated — stale for the touch that just flipped it.
+    /// Written only by enterEditMode() / exitEditMode().
+    var isEditingForDrag = false
     /// Drag starts once the finger has moved this far after the
     /// long-press fired (demo §1.4). This is also the drag gesture's
     /// minimumDistance, so a tap (< 7 pt) never arms a drag and the
@@ -264,12 +272,37 @@ final class LCDesktopDragState: ObservableObject {
 
 // MARK: - The icon drag gesture
 
-/// One gesture per icon: long-press (0.45 s, or instant in edit mode)
-/// sequenced into a drag (minimumDistance 7 pt), so the finger that
-/// long-pressed into edit mode can keep moving and drag immediately —
-/// no lift-and-re-press (demo §1.4). The drag listeners attach on
-/// pointerdown regardless of edit mode; a quick horizontal swipe fails
-/// the long-press (> 9 pt) and goes to the pager instead.
+/// One gesture per icon: long-press (0.45 s) sequenced into a drag
+/// (minimumDistance 7 pt), so the finger that long-pressed into edit
+/// mode can keep moving and drag immediately — no lift-and-re-press
+/// (demo §1.4). The drag listeners attach on pointerdown regardless
+/// of edit mode; a quick horizontal swipe fails the long-press
+/// (> 9 pt) and goes to the pager instead.
+///
+/// THE LONG-PRESS DURATION IS CONSTANT (0.45 s) AND MUST NEVER DEPEND
+/// ON `isEditing` — the old `isEditing ? 0 : 0.45` broke both tap and
+/// drag (Q2 + Q5, run #49):
+/// - Tap: with duration 0 in edit mode the long-press succeeds the
+///   instant the finger lands, claiming the touch and failing the
+///   cell's TapGesture before the finger can lift — every edit-mode
+///   tap on an icon was dead, while a non-edit tap (0.45 s not yet
+///   fired at lift-off) worked. A constant 0.45 s restores the tap
+///   in both states: the finger lifts before it fires.
+/// - Same-finger drag: the long-press itself flips `isEditing`
+///   (enterEditMode), which re-renders the view and rebuilds this
+///   gesture with a different minimumDuration. SwiftUI replaces the
+///   in-flight gesture, the new one never saw the touch-down, and
+///   the drag phase never starts — `beginDrag` is never reached.
+///   With a constant duration the gesture struct is identical before
+///   and after the edit flip, so the in-flight sequence survives it
+///   and the same finger keeps dragging. `isEditing` is kept as a
+///   parameter only so existing call sites do not change; it is
+///   deliberately NOT read here.
+/// Instant grab in edit mode (move > 7 pt, no hold, demo §1.4) is
+/// provided separately by the plain DragGesture in LCAppListView
+/// (desktopIconEditDragGesture), which is stable by construction —
+/// it carries no edit-dependent parameter at all and gates on
+/// LCDesktopDragState.isEditingForDrag at event time.
 ///
 /// The gesture is type-erased so both the grid cell and the Dock icon
 /// can attach the same gesture from LCAppListView. The drag gesture's
@@ -283,8 +316,9 @@ func LCDesktopIconDragGesture(
     onDragChanged: @escaping (LCDesktopIcon, Bool, DragGesture.Value) -> Void,
     onDragEnded: @escaping (LCDesktopIcon, Bool, DragGesture.Value) -> Void
 ) -> AnyGesture<SequenceGesture<LongPressGesture, DragGesture>.Value> {
+    _ = isEditing // Deliberately unused: see the doc comment above.
     let longPress = LongPressGesture(
-        minimumDuration: isEditing ? 0 : LCDesktopDragState.longPressDuration,
+        minimumDuration: LCDesktopDragState.longPressDuration,
         maximumDistance: LCDesktopDragState.longPressMaxMovement
     )
     let drag = DragGesture(minimumDistance: LCDesktopDragState.dragStartDistance, coordinateSpace: .named("desktop"))

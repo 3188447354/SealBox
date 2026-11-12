@@ -198,20 +198,19 @@ struct LCAppListView : View, LCAppModelDelegate {
             desktopBackgroundView
 
             VStack(spacing: 0) {
-                // Top strip: edit-mode capsules, the floating search
-                // field, the install progress pill. Empty in normal
-                // mode — the desktop shows nothing but icons.
-                // Edit-mode chrome (demo §2.3): fades/slides in with a
-                // 0.34 s spring-pop when edit mode is entered. The
-                // animation lives on this Group alone so it never
-                // leaks into the grid cells' own animations.
-                Group {
-                    if isEditing {
-                        editModeTopBar
-                            .transition(.scale(scale: 0.9).combined(with: .opacity))
-                    }
-                }
-                .animation(.spring(response: 0.34, dampingFraction: 0.6), value: isEditing)
+                // Top strip: the floating search field, the install
+                // progress pill. Empty in normal mode — the desktop
+                // shows nothing but icons. The edit-mode chrome bar
+                // is NOT here: it is an absolute overlay at the very
+                // top of the ZStack (see below, demo §2.3). It used
+                // to be this VStack's first in-flow child, under a
+                // `.padding(.top, safeAreaInsets.top)` — with the
+                // status bar hidden in edit mode that put the bar at
+                // ~10% of screen height, floating just above the
+                // first row of icons instead of in the status-bar
+                // slot it replaces. The grid's top is unchanged by
+                // the move (safe-area top + 12 pt, demo §1.1's 58 pt
+                // home padding); only the bar moves, to y = 0.
                 if showSearchBar {
                     searchFieldView
                 }
@@ -237,6 +236,32 @@ struct LCAppListView : View, LCAppModelDelegate {
             .onLongPressGesture(minimumDuration: 0.45) {
                 enterEditMode()
             }
+
+            // Edit-mode chrome (demo §2.3): absolute, top 0, height
+            // 52 pt — it occupies the status-bar slot (hidden in edit
+            // mode), "+" at the time position, "•••" at the signal
+            // position, NOT pushed down by the safe area. It is a
+            // ZStack child, not a VStack child, so the VStack's
+            // `.padding(.top, safeAreaInsets.top)` never applies to
+            // it and the grid below is not pushed down by it either.
+            // Fades/slides in with a 0.34 s spring-pop on entry; the
+            // animation lives on this Group alone so it never leaks
+            // into the grid cells' own animations. It sits above the
+            // grid (tappable) and below the drag ghost. It is outside
+            // the VStack, so the VStack's tap-to-exit-edit gesture
+            // can never fire from a tap on "+" / "•••".
+            Group {
+                if isEditing {
+                    editModeTopBar
+                        .transition(.scale(scale: 0.9).combined(with: .opacity))
+                        // Pin to the very top of the ZStack (y = 0):
+                        // the bar's own height is 52 pt; the outer
+                        // frame takes the ZStack's full size and the
+                        // bar aligns to its top edge.
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                }
+            }
+            .animation(.spring(response: 0.34, dampingFraction: 0.6), value: isEditing)
 
             // The drag ghost: the icon being dragged, floating above
             // the grid and following the finger 1:1 (demo §1.4). It is
@@ -291,11 +316,12 @@ struct LCAppListView : View, LCAppModelDelegate {
         }
         .overlay(alignment: .topTrailing) {
             // The edit-mode "•••" menu (demo §2.4): 218 pt wide, top
-            // 58 pt (just below the 52 pt chrome bar), right 30 pt
+            // 58 pt (just below the 52 pt chrome bar, which now sits
+            // at y = 0 — no safe-area offset anymore), right 30 pt
             // (aligned with the "•••" button's right edge).
             if isEditing, showEditMenu {
                 editMenuPopover
-                    .padding(.top, geometry.safeAreaInsets.top + 58)
+                    .padding(.top, 58)
                     .padding(.trailing, 30)
                     .transition(.asymmetric(
                         insertion: .scale(scale: 0.82, anchor: .topTrailing)
@@ -1684,6 +1710,7 @@ struct LCAppListView : View, LCAppModelDelegate {
                             isDropTarget: desktopDrag.dropTarget == .cell(id: icon.id),
                             darkModeIcon: darkModeIcon,
                             theme: desktopTheme,
+                            dragState: desktopDrag,
                             onTap: {
                                 desktopIconTapped(icon)
                             },
@@ -1707,7 +1734,14 @@ struct LCAppListView : View, LCAppModelDelegate {
                             if isSearching {
                                 cell
                             } else {
-                                cell.gesture(desktopIconDragGesture(for: icon, isInDock: false))
+                                cell
+                                    .gesture(desktopIconDragGesture(for: icon, isInDock: false))
+                                    // Edit-mode instant drag (demo
+                                    // §1.4, Q5): the plain drag that
+                                    // lets an icon be grabbed in edit
+                                    // mode by moving > 7 pt, with no
+                                    // hold — see desktopIconEditDragGesture.
+                                    .simultaneousGesture(desktopIconEditDragGesture(for: icon, isInDock: false))
                             }
                         }
                     } else {
@@ -1988,12 +2022,17 @@ struct LCAppListView : View, LCAppModelDelegate {
         guard !isEditing else { return }
         isEditing = true
         editingSince = Date()
+        // Mirror into the drag state (reference type): the
+        // edit-mode drag gesture reads it mid-touch (see
+        // desktopIconEditDragGesture).
+        desktopDrag.isEditingForDrag = true
     }
 
     /// Exits edit mode: stops jiggling and dragging, closes the "•••"
     /// menu, hides the search field and clears the query.
     private func exitEditMode() {
         isEditing = false
+        desktopDrag.isEditingForDrag = false
         desktopDrag.endDrag()
         showEditMenu = false
         showSearchBar = false
@@ -2251,6 +2290,10 @@ struct LCAppListView : View, LCAppModelDelegate {
     /// Long-press fires `enterEditMode()`; the drag itself starts on
     /// the first move past the 7 pt threshold, so the same finger
     /// that long-pressed keeps dragging without lifting (demo §1.2).
+    /// The long-press duration is a constant 0.45 s (see
+    /// LCDesktopIconDragGesture in LCDesktopDrag.swift): it must not
+    /// change when edit mode flips, or SwiftUI replaces the in-flight
+    /// gesture and the drag never starts.
     private func desktopIconDragGesture(for icon: LCDesktopIcon, isInDock: Bool) -> AnyGesture<SequenceGesture<LongPressGesture, DragGesture>.Value> {
         LCDesktopIconDragGesture(
             icon: icon,
@@ -2266,6 +2309,48 @@ struct LCAppListView : View, LCAppModelDelegate {
                 desktopIconDragEnded(icon: icon, isInDock: isInDock, value: value)
             }
         )
+    }
+
+    /// Edit-mode instant drag (demo §1.4, Q5): a plain DragGesture
+    /// (minimumDistance 7 pt, "desktop" space) attached with
+    /// `.simultaneousGesture` next to the long-press → drag sequence.
+    /// It exists because the sequence alone can never drag instantly
+    /// in edit mode: its drag phase only starts after its 0.45 s
+    /// long-press, and making that long-press instant in edit mode
+    /// is what broke tap and same-finger drag (see
+    /// LCDesktopIconDragGesture). This gesture carries NO
+    /// edit-dependent parameter, so SwiftUI never rebuilds it when
+    /// edit mode flips mid-touch — it survives the long-press entry
+    /// and the same finger keeps dragging. It gates on
+    /// `desktopDrag.isEditingForDrag`, read from the reference-type
+    /// drag state at event time (never on the view's @State, which a
+    /// mid-touch closure would read stale):
+    /// - edit mode already on at touch-down: a > 7 pt move starts
+    ///   the drag at once, no hold (demo §1.4).
+    /// - not editing: moves are ignored until the sequence's
+    ///   long-press fires enterEditMode (which sets the flag); the
+    ///   finger then keeps moving and the drag starts — the
+    ///   same-finger path, with no lift-and-re-press.
+    /// - a page swipe starting on an icon: the flag is still false
+    ///   (the long-press fails past 9 pt), so the moves are ignored
+    ///   and the TabView flips the page as before.
+    /// Both gestures call the same handlers, and both are safe to
+    /// fire for one touch: `beginDrag` refuses a second drag while
+    /// one is active, and `desktopIconDragEnded` refuses a second
+    /// landing while one is in flight. Attached to grid cells only:
+    /// the Dock's gestures live in LCDesktopDockView (out of scope
+    /// for this fix), where the now-constant 0.45 s sequence gives
+    /// hold-then-drag instead of instant grab.
+    private func desktopIconEditDragGesture(for icon: LCDesktopIcon, isInDock: Bool) -> some Gesture {
+        DragGesture(minimumDistance: LCDesktopDragState.dragStartDistance, coordinateSpace: .named("desktop"))
+            .onChanged { value in
+                guard desktopDrag.isEditingForDrag else { return }
+                desktopIconDragChanged(icon: icon, isInDock: isInDock, value: value)
+            }
+            .onEnded { value in
+                guard desktopDrag.isDragging else { return }
+                desktopIconDragEnded(icon: icon, isInDock: isInDock, value: value)
+            }
     }
 
     /// The Dock slot currently hovered as a drop target (swap), if any.
