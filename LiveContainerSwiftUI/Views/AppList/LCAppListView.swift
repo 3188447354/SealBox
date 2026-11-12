@@ -646,6 +646,27 @@ struct LCAppListView : View, LCAppModelDelegate {
         // icons). Read the real safe-area inset and pad the content
         // below the status bar by exactly that much; the wallpaper
         // still fills the whole screen behind everything.
+        desktopSheetsView
+        // SealBox shell overlays (§10.2 / §13). Both are overlays on
+        // the desktop — not fullScreenCovers — so they never fight the
+        // system-page overlay for presentation: opening a system page
+        // from the switcher (or Settings from the control centre) is
+        // just two state flips in the same transaction, with no
+        // dismiss-then-present race. They sit last, so they cover the
+        // desktop, the home-bar strip and the Dock while open.
+        .overlay { switcherOverlay }
+        .animation(.easeOut(duration: 0.42), value: showSwitcher)
+        .overlay { controlCenterOverlay }
+        .animation(.spring(response: 0.58, dampingFraction: 0.8), value: showControlCenter)
+    }
+
+    /// Desktop + system-page / guest-zoom overlays. Split out of
+    /// `body`: the whole overlay chain was a single expression and
+    /// the compiler could not type-check it in reasonable time
+    /// (run #56). Each stage here is its own computed property, so
+    /// the type checker only ever sees a short chain. No behaviour
+    /// change — same overlays, same order, same animations.
+    private var desktopBaseView: some View {
         desktopDialogsView
         // System page as an overlay window (demo §9, P2-28), not a
         // fullScreenCover: the cover's slide-up cannot zoom from the
@@ -660,6 +681,13 @@ struct LCAppListView : View, LCAppModelDelegate {
         // window shown for 0.46 s before a multitask guest scene
         // opens. See guestZoomOverlay.
         .overlay { guestZoomOverlay }
+    }
+
+    /// Bottom sheets, first half (delete / Dock-remove / install-
+    /// replace). Split out of `body` for the same type-check reason
+    /// as desktopBaseView (run #56).
+    private var desktopSheetsFirstHalf: some View {
+        desktopBaseView
         // Bottom sheets (demo §11.1, P2-25). Each overlay is a
         // private var below; the .animation next to it drives the
         // sheet's 0.58 s spring-sheet entry/exit.
@@ -669,20 +697,26 @@ struct LCAppListView : View, LCAppModelDelegate {
         .animation(LCBottomSheetMotion.spring, value: showDockRemoveConfirm)
         .overlay { installReplaceSheetOverlay }
         .animation(LCBottomSheetMotion.spring, value: installReplaceAlert.show)
+    }
+
+    /// Bottom sheets, second half (runWhenMultitask / certificate /
+    /// JIT). Split out of `body` for the same type-check reason as
+    /// desktopBaseView (run #56).
+    private var desktopSheetsView: some View {
+        desktopSheetsFirstHalf
         .overlay { runWhenMultitaskSheetOverlay }
         .animation(LCBottomSheetMotion.spring, value: runWhenMultitaskAlert.show)
         .overlay { certificateSheetOverlay }
         .animation(LCBottomSheetMotion.spring, value: certificateAlert.show)
         .overlay { jitSheetOverlay }
         .animation(LCBottomSheetMotion.spring, value: jitAlert.show)
-        // SealBox shell overlays (§10.2 / §13). Both are overlays on
-        // the desktop — not fullScreenCovers — so they never fight the
-        // system-page overlay for presentation: opening a system page
-        // from the switcher (or Settings from the control centre) is
-        // just two state flips in the same transaction, with no
-        // dismiss-then-present race. They sit last, so they cover the
-        // desktop, the home-bar strip and the Dock while open.
-        .overlay {
+    }
+
+    /// App switcher overlay (demo §7). Extracted from `body` into
+    /// its own computed property so the body expression stays small
+    /// (run #56 type-check timeout). Content is unchanged.
+    private var switcherOverlay: some View {
+        Group {
             if showSwitcher {
                 LCAppSwitcherView(
                     store: switcherStore,
@@ -705,8 +739,13 @@ struct LCAppListView : View, LCAppModelDelegate {
                 EmptyView()
             }
         }
-        .animation(.easeOut(duration: 0.42), value: showSwitcher)
-        .overlay {
+    }
+
+    /// Control Center overlay (demo §6). Extracted from `body` into
+    /// its own computed property so the body expression stays small
+    /// (run #56 type-check timeout). Content is unchanged.
+    private var controlCenterOverlay: some View {
+        Group {
             if showControlCenter {
                 LCSealBoxControlCenterView(
                     onDismiss: {
@@ -723,7 +762,6 @@ struct LCAppListView : View, LCAppModelDelegate {
                 EmptyView()
             }
         }
-        .animation(.spring(response: 0.58, dampingFraction: 0.8), value: showControlCenter)
     }
 
     // MARK: - System page overlay + bottom sheets (P2-25 / P2-28)
