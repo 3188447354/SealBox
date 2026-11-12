@@ -29,8 +29,9 @@
 //
 //  未编译、未真机验证（本机无 Xcode/Swift）：dismissWindow 的 (id:value:)
 //  签名已按 WindowGroup(id: "appView", for: String.self) 对过，iOS 15
-//  部署目标的引用问题已用 @available(iOS 16.0, *) 修掉；场景销毁是否
-//  彻底，须在 Mac / CI 上先编后真机走查。
+//  部署目标的引用问题靠调用点 `if #available(iOS 17.0, *)` 守卫
+//  （存储属性上不能加 @available）；场景销毁是否彻底，须在 Mac /
+//  CI 上先编后真机走查。
 //
 
 import SwiftUI
@@ -329,12 +330,12 @@ struct LCAppSwitcherView: View {
 
     // dismissWindow is iOS 17.0+, but this target still deploys to
     // iOS 15.0 (LiveContainerSwiftUI: IPHONEOS_DEPLOYMENT_TARGET =
-    // 15.0). The @available on the property keeps the reference
-    // compiling; the only use is inside `if #available(iOS 17.0, *)`
-    // in finishClose. The (id:value:) signature matches
+    // 15.0). A stored property cannot be marked potentially
+    // unavailable with @available, so the property carries none;
+    // the only use is inside `if #available(iOS 17.0, *)` in
+    // finishClose. The (id:value:) signature matches
     // WindowGroup(id: "appView", for: String.self) in
     // LiveContainerSwiftUIApp.swift:112.
-    @available(iOS 17.0, *)
     @Environment(\.dismissWindow) private var dismissWindow
     @StateObject private var dragState = LCAppSwitcherDragState()
 
