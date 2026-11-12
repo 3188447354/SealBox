@@ -206,6 +206,31 @@ final class LCDesktopOrderStore: ObservableObject {
         save()
     }
 
+    /// Swap two icons' positions (demo §1.5: a drop on an occupied cell
+    /// swaps with that one cell only; all other icons stay put).
+    func swap(id: String, withID otherID: String) {
+        guard id != otherID,
+              let i = order.firstIndex(of: id),
+              let j = order.firstIndex(of: otherID) else {
+            return
+        }
+        order.swapAt(i, j)
+        save()
+    }
+
+    /// Replace one id with another at the same position (Dock → grid:
+    /// the dragged icon takes the cell; the caller appends the
+    /// displaced id at the end, the first free slot).
+    func replace(id: String, with newID: String) {
+        guard let i = order.firstIndex(of: id) else {
+            return
+        }
+        var newOrder = order
+        newOrder[i] = newID
+        order = newOrder
+        save()
+    }
+
     /// Insert at a global index (used when dropping onto a page).
     func insert(id: String, at index: Int) {
         var newOrder = order.filter { $0 != id }
@@ -267,9 +292,11 @@ final class LCDesktopDockStore: ObservableObject {
         }
     }
 
-    /// Drop an icon into the Dock. If the Dock is full, the last Dock icon
-    /// is evicted and returned so the caller can put it back in the grid.
-    /// Returns the evicted id, if any.
+    /// Drop an icon into the Dock (demo §4: appends to the Dock; if the
+    /// Dock is full, the last Dock icon is evicted and returned so the
+    /// caller can put it back in the grid). Returns the evicted id, if
+    /// any. Dropping on an occupied Dock slot is a swap instead — see
+    /// replaceDockIcon(at:with:).
     @discardableResult
     func addToDock(id: String) -> String? {
         // System icons never enter the Dock: they live in the grid.
@@ -281,11 +308,27 @@ final class LCDesktopDockStore: ObservableObject {
         if newDock.count >= Self.maxDockItems {
             evicted = newDock.removeLast()
         }
-        newDock.insert(id, at: 0)
+        newDock.append(id)
         dockIDs = newDock
         manuallyEdited = true
         save()
         return evicted
+    }
+
+    /// Swap a Dock slot's icon (demo §4: dropping on a Dock app swaps —
+    /// that app returns to the dragged app's original grid cell; the
+    /// caller puts it back there). No eviction: the Dock keeps its size.
+    func replaceDockIcon(at index: Int, with id: String) {
+        guard dockIDs.indices.contains(index),
+              !LCDesktopIcon.isSystemID(id),
+              !dockIDs.contains(id) else {
+            return
+        }
+        var newDock = dockIDs
+        newDock[index] = id
+        dockIDs = newDock
+        manuallyEdited = true
+        save()
     }
 
     /// Drag an icon out of the Dock. Leaves an empty slot: nothing is
@@ -307,6 +350,36 @@ final class LCDesktopDockStore: ObservableObject {
         }
         dockIDs.removeAll { $0 == id }
         save()
+    }
+}
+
+// MARK: - Shared icon tile
+
+/// The icon tile shared by the grid cell, the Dock icon and the drag
+/// ghost: an imported app's icon, or a solid-tint rounded rect with an
+/// SF Symbol for a system page. Corner radius and glyph scale with the
+/// tile size (60 pt grid / 56 pt Dock), so all three stay identical.
+struct LCDesktopIconTile: View {
+    let icon: LCDesktopIcon
+    let darkModeIcon: Bool
+    let size: CGFloat
+
+    var body: some View {
+        Group {
+            switch icon {
+            case .app(let model):
+                IconImageView(icon: model.appInfo.iconIsDarkIcon(darkModeIcon))
+            case .system(let page):
+                RoundedRectangle(cornerRadius: size * 0.2667)
+                    .fill(page.tint)
+                    .overlay {
+                        Image(systemName: page.systemImage)
+                            .font(.system(size: size * 0.43, weight: .semibold))
+                            .foregroundStyle(.white)
+                    }
+            }
+        }
+        .frame(width: size, height: size)
     }
 }
 

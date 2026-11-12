@@ -66,6 +66,54 @@ final class LCFrameSampler: NSObject {
     }
 }
 
+// MARK: - Velocity tracker (shared gesture helper)
+
+/// Velocity from the last few gesture samples, in pt/ms. The home bar,
+/// the switcher and the Control Center all need the release velocity;
+/// SwiftUI's DragGesture gives predictedEndTranslation, not the actual
+/// velocity, so this tracker records the samples itself. The velocity
+/// is the most recent movement (last two samples), matching the demo's
+/// per-pointermove velocity.
+final class LCVelocityTracker {
+    private struct Sample {
+        var point: CGPoint
+        var time: CFTimeInterval
+    }
+
+    private var samples: [Sample] = []
+
+    /// Records a sample (the drag translation or location — the
+    /// derivative is the same for both). Keeps the last 6 samples.
+    func record(_ point: CGPoint, at time: CFTimeInterval = CACurrentMediaTime()) {
+        samples.append(Sample(point: point, time: time))
+        if samples.count > 6 {
+            samples.removeFirst(samples.count - 6)
+        }
+    }
+
+    /// The velocity over the most recent samples, in pt/ms. (0, 0)
+    /// when fewer than 2 samples or no time elapsed.
+    var velocity: CGVector {
+        guard samples.count >= 2 else {
+            return CGVector(dx: 0, dy: 0)
+        }
+        let first = samples[samples.count - 2]
+        let last = samples[samples.count - 1]
+        let dt = (last.time - first.time) * 1000
+        guard dt > 0 else {
+            return CGVector(dx: 0, dy: 0)
+        }
+        return CGVector(
+            dx: (last.point.x - first.point.x) / CGFloat(dt),
+            dy: (last.point.y - first.point.y) / CGFloat(dt)
+        )
+    }
+
+    func reset() {
+        samples.removeAll()
+    }
+}
+
 // MARK: - Lock store (single source of truth, App Group defaults)
 
 /// Whether SealBox owns the bottom home-indicator gestures. Persisted in
@@ -96,27 +144,44 @@ final class LCSealBoxHomeBarState: ObservableObject {
     static let hitZoneHeight: CGFloat = 36
     /// Press-and-hold on the bar to go straight to the switcher (§11: 约 0.42 秒).
     static let holdToSwitcherDuration: TimeInterval = 0.42
-    /// Stillness after a swipe-up that means "hold" (§11: 上滑并停顿进入切换器).
-    static let swipeHoldStillDuration: TimeInterval = 0.35
+    /// Press-and-hold movement allowance: the finger must stay within
+    /// 14pt while holding (demo §8.2).
+    static let holdMaxMovement: CGFloat = 14
+    /// Stillness after a swipe-up that means "hold": 60 ms (demo §8.2).
+    static let swipeHoldStillDuration: TimeInterval = 0.06
     /// Swipe-up distance that counts as "holding the shrunken window".
-    static let swipeHoldMinUpward: CGFloat = 60
-    /// Full shrink at 240pt of upward drag; smallest window scale.
-    static let fullShrinkUpward: CGFloat = 240
-    static let minWindowScale: CGFloat = 0.85
-    /// Release past this upward distance goes to the desktop.
-    static let goDesktopMinUpward: CGFloat = 140
-    /// …or a fast flick whose predicted end passes this distance.
-    static let goDesktopMinPredictedUpward: CGFloat = 200
+    static let swipeHoldMinUpward: CGFloat = 30
+    /// Full shrink at half the screen height; smallest window scale.
+    static let minWindowScale: CGFloat = 0.78
+    /// The switcher window: a release inside this upward range (and
+    /// not flicking down) opens the switcher (demo §8.2).
+    static let switcherMinUpward: CGFloat = 32
+    /// A release past this fraction of the screen height goes to the
+    /// desktop (demo §8.2: up > 22% H).
+    static let goDesktopMinUpwardFraction: CGFloat = 0.22
+    /// …or a fast upward flick that is still above 26pt (demo §8.2).
+    static let goDesktopFlickMinUpward: CGFloat = 26
 
+    /// Follow progress p (0 at rest, 1 at full shrink): the front
+    /// window's scale is 1 − p·0.22, and the Dock / desktop follow
+    /// formulas read p (demo §8.1 / §8.3).
+    @Published private(set) var followProgress: CGFloat = 0
+    /// The front window's vertical drift while following
+    /// (−up·0.1 + down·0.16, demo §8.3).
+    @Published private(set) var windowOffsetY: CGFloat = 0
+    /// The front window's corner radius in 3 discrete steps
+    /// (0 / 22 / 38 pt, demo §8.3).
+    @Published private(set) var windowCornerRadius: CGFloat = 0
     /// Window scale driven by the gesture (transform only, §14).
-    /// 1.0 at rest; shrinks towards minWindowScale while swiping up.
-    @Published private(set) var windowScale: CGFloat = 1.0
+    /// 1.0 at rest; shrinks towards 0.78 at full follow.
+    var windowScale: CGFloat { 1 - followProgress * 0.22 }
     @Published private(set) var isGestureActive = false
     /// Action the caller must take, once. The caller handles it via
     /// .onChange(of:) and clears it by setting it back to nil.
     @Published var pendingAction: LCSealBoxHomeBarAction?
 
     private let sampler = LCFrameSampler()
+    private let velocityTracker = LCVelocityTracker()
     private var gestureStartTime: CFTimeInterval = 0
     private var lastMoveTime: CFTimeInterval = 0
     private var lastRecordedTranslation = CGPoint.zero
@@ -124,6 +189,9 @@ final class LCSealBoxHomeBarState: ObservableObject {
     /// Set while a gesture was consumed by the switcher, so the same
     /// finger's continued movement cannot start a second gesture.
     private var gestureConsumed = false
+    /// The screen height at gesture start (the follow formulas are
+    /// fractions of it: full shrink at H·0.5, switcher window to H·0.65).
+    private var screenHeight: CGFloat = 800
 
     // MARK: Gesture lifecycle (called from the view's DragGesture)
 
@@ -136,6 +204,9 @@ final class LCSealBoxHomeBarState: ObservableObject {
         gestureStartTime = CACurrentMediaTime()
         lastMoveTime = gestureStartTime
         lastRecordedTranslation = .zero
+        screenHeight = UIScreen.main.bounds.height
+        velocityTracker.reset()
+        velocityTracker.record(.zero)
         sampler.record(.zero)
         sampler.onFrame = { [weak self] point in
             self?.applyFrame(point)
@@ -148,6 +219,7 @@ final class LCSealBoxHomeBarState: ObservableObject {
             return
         }
         let now = CACurrentMediaTime()
+        velocityTracker.record(translation, at: now)
         if abs(translation.x - lastRecordedTranslation.x) > 2
             || abs(translation.y - lastRecordedTranslation.y) > 2 {
             lastMoveTime = now
@@ -156,7 +228,7 @@ final class LCSealBoxHomeBarState: ObservableObject {
         sampler.record(translation)
     }
 
-    func endGesture(translation: CGPoint, predictedEndTranslation: CGPoint) {
+    func endGesture(translation: CGPoint) {
         guard isGestureActive else {
             gestureConsumed = false
             return
@@ -169,9 +241,14 @@ final class LCSealBoxHomeBarState: ObservableObject {
             restoreWindow()
             return
         }
+        // Release precedence (demo §8.2): the switcher check FIRST.
         let up = -translation.y
-        let predictedUp = -predictedEndTranslation.y
-        if up > Self.goDesktopMinUpward || predictedUp > Self.goDesktopMinPredictedUpward {
+        let vy = velocityTracker.velocity.dy
+        if up >= Self.switcherMinUpward, up <= screenHeight * 0.65, vy > -0.85 {
+            restoreWindow()
+            requestAction(.openSwitcher)
+        } else if up > screenHeight * Self.goDesktopMinUpwardFraction
+            || (vy < -0.55 && up > Self.goDesktopFlickMinUpward) {
             restoreWindow()
             requestAction(.goDesktop)
         } else {
@@ -184,6 +261,7 @@ final class LCSealBoxHomeBarState: ObservableObject {
     /// the window falls back to exactly its pre-gesture state (§11).
     func cancelGesture() {
         sampler.stop()
+        velocityTracker.reset()
         isGestureActive = false
         gestureConsumed = false
         switcherFired = false
@@ -200,6 +278,15 @@ final class LCSealBoxHomeBarState: ObservableObject {
         requestAction(.openSwitcher)
     }
 
+    /// Press-and-hold fired (from the strip's LongPressGesture, which
+    /// runs even when the finger never moves far enough to start the
+    /// drag): straight to the switcher (demo §8.2). Guarded so a
+    /// second fire (from the drag's own hold check) is a no-op.
+    func pressHoldFired() {
+        guard !switcherFired else { return }
+        fireSwitcher()
+    }
+
     // MARK: Frame application (§14: one style write per frame)
 
     private func applyFrame(_ translation: CGPoint) {
@@ -207,22 +294,33 @@ final class LCSealBoxHomeBarState: ObservableObject {
             return
         }
         // Swipe up: the whole window shrinks proportionally (not a move).
-        // Swipe down: no stretch, scale stays 1.
+        // Swipe down: no stretch, scale stays 1, but the window drifts
+        // down slightly (demo §8.3: offsetY = −up·0.1 + down·0.16).
+        // The corner radius steps 0 / 22 / 38 pt at p < 0.04 / < 0.5 / ≥ 0.5.
         let up = max(0, -translation.y)
-        let progress = min(1, up / Self.fullShrinkUpward)
-        windowScale = 1 - (1 - Self.minWindowScale) * progress
+        let down = max(0, translation.y)
+        let progress = min(1, up / (screenHeight * 0.5))
+        followProgress = progress
+        windowOffsetY = -up * 0.1 + down * 0.16
+        windowCornerRadius = progress < 0.04 ? 0 : progress < 0.5 ? 22 : 38
 
         guard !switcherFired else {
             return
         }
         let now = CACurrentMediaTime()
         let moved = hypot(translation.x, translation.y)
-        if moved < 12, now - gestureStartTime >= Self.holdToSwitcherDuration {
+        if moved < Self.holdMaxMovement, now - gestureStartTime >= Self.holdToSwitcherDuration {
             // Press-and-hold ~0.42 s: straight to the switcher.
             fireSwitcher()
-        } else if up > Self.swipeHoldMinUpward, now - lastMoveTime >= Self.swipeHoldStillDuration {
-            // Swiped up and held still: enter the switcher on the same stream.
-            fireSwitcher()
+        } else if up > Self.swipeHoldMinUpward, up < screenHeight * 0.62 {
+            if now - lastMoveTime >= Self.swipeHoldStillDuration {
+                // Swiped up and held still ≥ 60 ms: enter the switcher
+                // on the same stream.
+                fireSwitcher()
+            } else if abs(velocityTracker.velocity.dy) < 0.15, now - gestureStartTime >= Self.swipeHoldStillDuration {
+                // …or the finger is barely moving: same trigger.
+                fireSwitcher()
+            }
         }
     }
 
@@ -245,7 +343,9 @@ final class LCSealBoxHomeBarState: ObservableObject {
 
     private func restoreWindow() {
         withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
-            windowScale = 1.0
+            followProgress = 0
+            windowOffsetY = 0
+            windowCornerRadius = 0
         }
     }
 }
@@ -268,6 +368,21 @@ struct LCSealBoxHomeIndicatorView: View {
                 .contentShape(Rectangle())
                 .allowsHitTesting(isLocked)
                 .gesture(dragGesture, including: isLocked ? .all : .none)
+                // Press-and-hold (demo §8.2): the drag needs 6pt of
+                // movement to start, so a finger that presses and
+                // never moves would never fire the drag's own hold
+                // check. This LongPressGesture runs in parallel and
+                // fires at 0.42 s if the finger stays within 14pt —
+                // the same trigger, for the stationary press.
+                .simultaneousGesture(
+                    LongPressGesture(minimumDuration: LCSealBoxHomeBarState.holdToSwitcherDuration, maximumDistance: LCSealBoxHomeBarState.holdMaxMovement)
+                        .onEnded { _ in
+                            if isLocked {
+                                state.pressHoldFired()
+                            }
+                        },
+                    including: isLocked ? .all : .none
+                )
                 .onTapGesture(count: 2) {
                     if isLocked {
                         state.requestOpenSwitcher()
@@ -293,8 +408,7 @@ struct LCSealBoxHomeIndicatorView: View {
             }
             .onEnded { value in
                 state.endGesture(
-                    translation: CGPoint(x: value.translation.width, y: value.translation.height),
-                    predictedEndTranslation: CGPoint(x: value.predictedEndTranslation.width, y: value.predictedEndTranslation.height)
+                    translation: CGPoint(x: value.translation.width, y: value.translation.height)
                 )
             }
     }

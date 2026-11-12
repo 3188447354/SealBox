@@ -98,6 +98,10 @@ final class LCDesktopWallpaperStore: ObservableObject {
     /// True only when the user has picked a custom wallpaper (a stored
     /// file exists). False means the bundled default is showing.
     @Published private(set) var hasCustomWallpaper: Bool = false
+    /// Bumps on every wallpaper change (apply / reset). The desktop
+    /// keys the wallpaper view's identity on it so a change crossfades
+    /// (demo §5: opacity 0.4 s) instead of swapping instantly.
+    @Published private(set) var version = 0
 
     static let folderName = "SealBoxWallpaper"
     static let imageFileName = "wallpaper.jpg"
@@ -163,6 +167,7 @@ final class LCDesktopWallpaperStore: ObservableObject {
         try? data.write(to: dir.appendingPathComponent(Self.imageFileName), options: .atomic)
         self.image = image
         hasCustomWallpaper = true
+        version += 1
     }
 
     /// Restores the default wallpaper: deletes the stored custom file
@@ -172,6 +177,7 @@ final class LCDesktopWallpaperStore: ObservableObject {
         Self.resetStoredWallpaper()
         image = Self.bundledDefaultImage
         hasCustomWallpaper = false
+        version += 1
     }
 
     /// Downscales an image to at most `maxDimension` on the long edge

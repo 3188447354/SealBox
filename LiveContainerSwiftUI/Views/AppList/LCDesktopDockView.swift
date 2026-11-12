@@ -8,9 +8,18 @@
 //  and no badges. Icons are 56pt; the Dock is fixed at the bottom via
 //  safeAreaInset and does not flip with the pages.
 //
+//  Dragging (demo §4): Dock icons use the same long-press → drag gesture
+//  as the grid (see LCDesktopIconDragGesture in LCDesktopDrag.swift),
+//  passed in as `dragGestureFor`. A drop on an occupied Dock slot swaps
+//  with that app (it returns to the dragged app's original grid cell);
+//  a drop on empty Dock space appends (evicting the last Dock icon if
+//  full). Dragging a Dock icon onto another Dock slot is a no-change
+//  drop in the demo (it flies back). The dragged Dock icon's slot is
+//  drawn as an empty dashed slot while the ghost floats above it.
+//  Slot + bar frames are reported for the drag hit-test.
+//
 
 import SwiftUI
-import UniformTypeIdentifiers
 
 /// The Dock. `dockIcons` are the icons currently in the Dock, in Dock
 /// order; empty slots are rendered as transparent spacers (dashed outline
@@ -23,25 +32,22 @@ struct LCDesktopDockView: View {
 
     /// Dragged icon id while a drag is in progress, if any.
     let draggedID: String?
+    /// The Dock slot currently hovered as a drop target (swap), if any.
+    let dropTargetSlot: Int?
 
     var onTapIcon: (LCDesktopIcon) -> Void
     var onDeleteIcon: (LCDesktopIcon) -> Void
-    var onLongPressIcon: () -> Void
-    /// Called when a drag starts from a Dock icon (sets the shared drag
-    /// state; the DropDelegates read the dragged id from there).
-    var onDragStarted: (LCDesktopIcon) -> Void
-    /// Called by the Dock's DropDelegate when a drag starts over the Dock.
-    var onDragEntered: () -> Void
-    var onDragExited: () -> Void
-    var onDropOnDock: (String) -> Void
+    /// The long-press → drag gesture for a Dock icon (built by the
+    /// caller, same gesture as the grid cells).
+    var dragGestureFor: (LCDesktopIcon) -> AnyGesture<SequenceGesture<LongPressGesture, DragGesture>.Value>
 
     var body: some View {
         HStack(spacing: 16) {
             ForEach(0..<LCDesktopDockStore.maxDockItems, id: \.self) { slot in
                 if slot < dockIcons.count {
-                    dockIcon(dockIcons[slot])
+                    dockIcon(dockIcons[slot], slot: slot)
                 } else {
-                    emptySlot
+                    emptySlot(slot: slot)
                 }
             }
         }
@@ -63,67 +69,53 @@ struct LCDesktopDockView: View {
             RoundedRectangle(cornerRadius: 26)
                 .stroke(Color.white.opacity(0.25), lineWidth: 1)
         }
-        .overlay {
-            if isDragOver {
-                RoundedRectangle(cornerRadius: 26)
-                    .strokeBorder(.blue, lineWidth: 2)
-            }
-        }
         .padding(.horizontal, 16)
         .padding(.bottom, 8)
-        .onDrop(
-            of: [.text],
-            delegate: LCDesktopDockDropDelegate(
-                onDragEntered: onDragEntered,
-                onDragExited: onDragExited,
-                // The dragged id is read from the view's `draggedID`
-                // (kept in the shared drag state): DropInfo providers are
-                // async and cannot be awaited inside performDrop.
-                onDrop: { _ in
-                    if let draggedID {
-                        onDropOnDock(draggedID)
-                    }
-                }
-            )
+        // Frame reporting for the drag hit-test: the bar rect (empty
+        // Dock space = append) in the "desktop" coordinate space.
+        .background(
+            GeometryReader { proxy in
+                Color.clear.preference(
+                    key: LCDesktopDockFramePreferenceKey.self,
+                    value: LCDesktopDockFrames(bar: proxy.frame(in: .named("desktop")), slots: [:])
+                )
+            }
         )
     }
 
     @ViewBuilder
-    private func dockIcon(_ icon: LCDesktopIcon) -> some View {
+    private func dockIcon(_ icon: LCDesktopIcon, slot: Int) -> some View {
+        let isDragged = draggedID == icon.id
+        let isDropTarget = dropTargetSlot == slot
         ZStack(alignment: .topLeading) {
-            iconTile(icon)
-                .frame(width: 56, height: 56)
-                // Same lift as the grid cells: bigger, shadowed, spring
-                // back on release (was opacity 0.6 with no scale and no
-                // animation, so the lift snapped).
-                .opacity(draggedID == icon.id ? 0.85 : 1.0)
-                .scaleEffect(draggedID == icon.id ? 1.12 : 1.0)
-                .shadow(color: draggedID == icon.id ? .black.opacity(0.3) : .clear, radius: draggedID == icon.id ? 10 : 0, x: 0, y: draggedID == icon.id ? 6 : 0)
-                .animation(.spring(response: 0.3, dampingFraction: 0.75), value: draggedID)
+            LCDesktopIconTile(icon: icon, darkModeIcon: darkModeIcon, size: 56)
+                // The dragged icon's slot is an empty dashed slot
+                // (the ghost is the dragged tile); the hovered slot
+                // keeps its icon and gets the demo's 2 pt outline.
+                .opacity(isDragged ? 0.0 : 1.0)
+                .overlay {
+                    if isDragged {
+                        RoundedRectangle(cornerRadius: 56 * 0.2667)
+                            .strokeBorder(style: StrokeStyle(lineWidth: 1.5, dash: [4, 4]))
+                            .foregroundStyle(.secondary)
+                            .frame(width: 56, height: 56)
+                    }
+                    if isDropTarget {
+                        RoundedRectangle(cornerRadius: 56 * 0.2667)
+                            .strokeBorder(Color.white.opacity(0.85), lineWidth: 2)
+                            .padding(-2)
+                            .frame(width: 56, height: 56)
+                    }
+                }
+                .animation(.easeInOut(duration: 0.15), value: isDragged)
+                .animation(.easeInOut(duration: 0.15), value: isDropTarget)
                 .onTapGesture {
                     guard !isEditing else {
                         return
                     }
                     onTapIcon(icon)
                 }
-                .onLongPressGesture(minimumDuration: 0.5) {
-                    onLongPressIcon()
-                }
-                .apply { tile in
-                    // Same long-press fix as the grid: onDrag's internal
-                    // press recogniser would claim the touch before the
-                    // 0.5 s long-press could fire, so Dock drag only
-                    // attaches in edit mode. Outside edit mode the
-                    // long-press enters edit mode.
-                    if isEditing {
-                        tile.onDrag {
-                            onDragStarted(icon)
-                            return NSItemProvider(object: NSString(string: icon.id))
-                        }
-                    } else {
-                        tile
-                    }
-                }
+                .gesture(dragGestureFor(icon))
 
             if isEditing {
                 Button {
@@ -138,31 +130,35 @@ struct LCDesktopDockView: View {
                 .offset(x: -7, y: -7)
             }
         }
+        // Slot frame for the drag hit-test (positional Dock insert).
+        .background(
+            GeometryReader { proxy in
+                Color.clear.preference(
+                    key: LCDesktopDockFramePreferenceKey.self,
+                    value: LCDesktopDockFrames(bar: .zero, slots: [slot: proxy.frame(in: .named("desktop"))])
+                )
+            }
+        )
     }
 
-    private var emptySlot: some View {
+    private func emptySlot(slot: Int) -> some View {
+        let isDropTarget = dropTargetSlot == slot
         RoundedRectangle(cornerRadius: 56 * 0.2667)
             .strokeBorder(
-                style: StrokeStyle(lineWidth: 1.5, dash: [4, 4])
+                style: StrokeStyle(lineWidth: isDropTarget ? 2 : 1.5, dash: isDropTarget ? [] : [4, 4])
             )
-            .foregroundStyle(.secondary)
+            .foregroundStyle(isDropTarget ? Color.white.opacity(0.85) : .secondary)
             .frame(width: 56, height: 56)
-            .opacity(isEditing || isDragOver ? 1.0 : 0.0)
-    }
-
-    @ViewBuilder
-    private func iconTile(_ icon: LCDesktopIcon) -> some View {
-        switch icon {
-        case .app(let model):
-            IconImageView(icon: model.appInfo.iconIsDarkIcon(darkModeIcon))
-        case .system(let page):
-            RoundedRectangle(cornerRadius: 56 * 0.2667)
-                .fill(page.tint)
-                .overlay {
-                    Image(systemName: page.systemImage)
-                        .font(.system(size: 24, weight: .semibold))
-                        .foregroundStyle(.white)
+            .opacity(isEditing || isDragOver || isDropTarget ? 1.0 : 0.0)
+            .animation(.easeInOut(duration: 0.15), value: isDropTarget)
+            // Slot frame for the drag hit-test.
+            .background(
+                GeometryReader { proxy in
+                    Color.clear.preference(
+                        key: LCDesktopDockFramePreferenceKey.self,
+                        value: LCDesktopDockFrames(bar: .zero, slots: [slot: proxy.frame(in: .named("desktop"))])
+                    )
                 }
-        }
+            )
     }
 }

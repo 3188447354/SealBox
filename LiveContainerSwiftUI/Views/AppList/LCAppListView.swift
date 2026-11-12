@@ -90,10 +90,13 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
     @Environment(\.scenePhase) private var scenePhase
 
     /// Edit / jiggle mode. Entered by long-pressing the desktop
-    /// (0.5 s). Exited by tapping blank desktop or the "···" menu's
-    /// Done entry. There is no toolbar "✓" anymore: the home screen
-    /// has no toolbar at all.
+    /// (0.45 s, demo §1.3). Exited by tapping blank desktop or the
+    /// "···" menu's Done entry. There is no toolbar "✓" anymore: the
+    /// home screen has no toolbar at all.
     @State private var isEditing = false
+    /// When edit mode was entered (demo §2.5): a tap on blank desktop
+    /// within 400 ms of entering does not exit edit mode.
+    @State private var editingSince = Date.distantPast
     /// Floating search field, opened from the edit-mode "···" menu.
     /// It is not a permanent search bar: the desktop shows no search
     /// UI until the user asks for it.
@@ -207,9 +210,17 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
                 // Top strip: edit-mode capsules, the floating search
                 // field, the install progress pill. Empty in normal
                 // mode — the desktop shows nothing but icons.
-                if isEditing {
-                    editModeTopBar
+                // Edit-mode chrome (demo §2.3): fades/slides in with a
+                // 0.34 s spring-pop when edit mode is entered. The
+                // animation lives on this Group alone so it never
+                // leaks into the grid cells' own animations.
+                Group {
+                    if isEditing {
+                        editModeTopBar
+                            .transition(.scale(scale: 0.9).combined(with: .opacity))
+                    }
                 }
+                .animation(.spring(response: 0.34, dampingFraction: 0.6), value: isEditing)
                 if showSearchBar {
                     searchFieldView
                 }
@@ -221,18 +232,14 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
                 desktopPageDots
             }
             .padding(.top, geometry.safeAreaInsets.top)
-            .overlay(alignment: .leading) {
-                edgeZone(direction: .previous)
-            }
-            .overlay(alignment: .trailing) {
-                edgeZone(direction: .next)
-            }
             // Tap the blank desktop to exit edit mode; triple-tap it
             // in normal mode to unlock hidden apps (the unlock gesture
             // used to live behind the old app-counter footer, which is
-            // gone with the old list UI).
+            // gone with the old list UI). The exit guard (demo §2.5):
+            // a tap within 400 ms of entering edit mode does not exit
+            // (it is the same press that just entered it).
             .onTapGesture {
-                if isEditing {
+                if isEditing, Date().timeIntervalSince(editingSince) >= 0.4 {
                     exitEditMode()
                 }
             }
@@ -241,26 +248,47 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
                     Task { await authenticateUser() }
                 }
             }
-            // Long-press the blank desktop to enter edit mode. This
-            // gesture did not exist before: long-pressing blank space
-            // did literally nothing (only icons had a long-press), and
-            // long-pressing an icon was eaten by its onDrag (see the
-            // drag gating in desktopPageGrid), so on a real device
-            // long-press never entered edit mode at all.
-            .onLongPressGesture(minimumDuration: 0.5) {
-                if !isEditing {
-                    isEditing = true
-                }
+            // Long-press the blank desktop to enter edit mode (0.45 s,
+            // demo §1.3).
+            .onLongPressGesture(minimumDuration: 0.45) {
+                enterEditMode()
+            }
+
+            // The drag ghost: the icon being dragged, floating above
+            // the grid and following the finger 1:1 (demo §1.4). It is
+            // the only child that hit-tests nothing, so it never eats
+            // taps meant for the icons below it.
+            if desktopDrag.isDragging || desktopDrag.isLanding,
+               let ghostIcon = desktopDrag.draggedIcon {
+                desktopDragGhost(for: ghostIcon)
+                    .allowsHitTesting(false)
             }
         }
         // SealBox shell (§11 / §13): the whole desktop window shrinks
-        // with the home-bar gesture (scaleEffect on the desktop content
+        // with the home-bar gesture (transforms on the desktop content
         // only — the trigger and lock button below are overlays attached
-        // after it, so they stay put and keep receiving gestures).
+        // after them, so they stay put and keep receiving gestures).
         // The frame pins the overlay anchors to the full content area
         // above the Dock.
+        // Layers (demo §7.1 / §8.3): while the switcher is open the
+        // desktop sits at 0.92 / 0.5; otherwise it is the front window
+        // and follows the finger (proportional shrink, not a slide-out,
+        // demo §8.3: scale 1 − p·0.22, slight upward drift, corner
+        // radius in 3 discrete steps). The corner clip is only applied
+        // while the radius is > 0, so it never clips the wallpaper's
+        // parallax overscan at rest.
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .scaleEffect(homeBarState.windowScale)
+        .scaleEffect(showSwitcher ? 0.92 : homeBarState.windowScale)
+        .offset(y: showSwitcher ? 0 : homeBarState.windowOffsetY)
+        .apply { content in
+            if !showSwitcher, homeBarState.windowCornerRadius > 0 {
+                content.clipShape(RoundedRectangle(cornerRadius: homeBarState.windowCornerRadius))
+            } else {
+                content
+            }
+        }
+        .opacity(showSwitcher ? 0.5 : 1.0)
+        .animation(.spring(response: 0.42, dampingFraction: 0.85), value: showSwitcher)
         .overlay(alignment: .topTrailing) {
             // Control-centre trigger: the top 44pt strip at the
             // trailing edge (§13). It sits over the status-bar area,
@@ -283,20 +311,33 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
         }
         }
         .coordinateSpace(name: "scroll")
+        // The "desktop" coordinate space: the drag gesture, the cell /
+        // grid / Dock frame reports and the ghost all resolve in it, so
+        // hit-testing and the ghost position share one origin (the
+        // screen's top-left).
+        .coordinateSpace(name: "desktop")
+        // Drag hit-test frames (see LCDesktopDragState).
+        .onPreferenceChange(LCDesktopCellFramePreferenceKey.self) { frames in
+            desktopDrag.cellFrames = frames
+        }
+        .onPreferenceChange(LCDesktopGridFramePreferenceKey.self) { frames in
+            desktopDrag.gridFrames = frames
+        }
+        .onPreferenceChange(LCDesktopDockFramePreferenceKey.self) { frames in
+            desktopDrag.dockFrame = frames.bar
+            desktopDrag.dockSlotFrames = frames.slots
+        }
+        // Status bar (demo §2.2): hidden in edit mode — the edit chrome
+        // replaces it — and shown otherwise.
+        .statusBar(hidden: isEditing)
         .onAppear {
             if !didAppear {
                 onAppear()
             }
         }
         .onAppear {
-            // Wire the edge auto-flip action and bring the persisted
-            // order / Dock up to date with the installed apps.
-            desktopDrag.flipPageAction = { [weak desktopDrag] direction in
-                guard desktopDrag != nil else {
-                    return
-                }
-                flipPage(direction)
-            }
+            // Bring the persisted order / Dock up to date with the
+            // installed apps.
             syncDesktopOrder()
             refreshDock()
         }
@@ -343,6 +384,7 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
                 // the state machine (restoreWindow in endGesture /
                 // fireSwitcher) before it posts the action, so there is
                 // nothing to un-shrink here.
+                exitEditMode()
                 showSwitcher = false
                 systemPage = nil
             case .openSwitcher:
@@ -350,12 +392,18 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
                 // then show. The system-page cover (if any) must go
                 // away too: the switcher is an overlay on the desktop,
                 // so it would stay hidden behind the cover otherwise.
+                // Entering the switcher exits edit mode (demo §2.5).
+                exitEditMode()
                 switcherStore.refresh(
                     apps: sharedModel.apps + sharedModel.hiddenApps,
                     tweakNames: sharedModel.tweakFolderNames,
                     openSystemPage: systemPage,
                     darkModeIcon: darkModeIcon
                 )
+                // The demo only enters the switcher when there is a
+                // current app or recents; with no cards there is
+                // nothing to switch to, so stay put.
+                guard !switcherStore.cards.isEmpty else { return }
                 systemPage = nil
                 showSwitcher = true
             }
@@ -385,6 +433,7 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
                 isDragOver: desktopDrag.isOverDock,
                 darkModeIcon: darkModeIcon,
                 draggedID: desktopDrag.draggedID,
+                dropTargetSlot: dockDropTargetSlot,
                 onTapIcon: { icon in
                     desktopIconTapped(icon)
                 },
@@ -394,24 +443,22 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
                     // app; app deletion is the grid "−" button.
                     removeIconFromDock(icon)
                 },
-                onLongPressIcon: {
-                    if !isEditing {
-                        isEditing = true
-                    }
-                },
-                onDragStarted: { icon in
-                    desktopDrag.beginDrag(id: icon.id)
-                },
-                onDragEntered: {
-                    desktopDrag.isOverDock = true
-                },
-                onDragExited: {
-                    desktopDrag.isOverDock = false
-                },
-                onDropOnDock: { draggedID in
-                    dropIconOnDock(draggedID)
+                dragGestureFor: { icon in
+                    desktopIconDragGesture(for: icon, isInDock: true)
                 }
             )
+            // Dock follow (demo §7.1 / §8.3): while the switcher is
+            // open it sits at 0.96 / 0.55; while a system page is open
+            // it fades in with the home-bar follow (scale 0.92 + p·0.08,
+            // opacity p) as the page shrinks and reveals it. Otherwise
+            // it is fixed (MEMORY: the Dock is never pushed, shrunk or
+            // hidden by paging, dragging, searching or the keyboard).
+            // The p-driven changes follow per-frame (no animation); the
+            // state flips animate.
+            .scaleEffect(dockLayerScale)
+            .opacity(dockLayerOpacity)
+            .animation(.spring(response: 0.35, dampingFraction: 0.85), value: systemPage)
+            .animation(.spring(response: 0.42, dampingFraction: 0.85), value: showSwitcher)
         }
         .ignoresSafeArea(.keyboard, edges: .bottom)
         .alert("lc.common.error".loc, isPresented: $errorShow){
@@ -583,48 +630,65 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
             // full-screen covers have no swipe-down dismiss.
             // Left-edge swipe-back is a second way back (Done stays):
             // a horizontal drag that STARTS within 24pt of the left
-            // edge and travels right more than 80pt (and more
-            // horizontally than vertically) dismisses the page.
+            // edge and travels right more than 46pt (and less than
+            // 60pt vertically) dismisses the page (demo §10).
             // simultaneousGesture so the page's own vertical scrolling
             // keeps working; a drag starting anywhere else, or a
             // mostly-vertical drag, never dismisses. The gesture lives
             // only on this cover, so a right swipe on the desktop's
             // first page can never trigger it, and it is unrelated to
             // the desktop's edit-mode icon dragging.
-            page.view
-                .simultaneousGesture(
-                    DragGesture(minimumDistance: 30)
-                        .onChanged { value in
-                            if value.startLocation.x <= 24 {
-                                edgeSwipeFromLeft = true
+            // The page is the front window for the home-bar follow
+            // (demo §8.3): it shrinks proportionally with the finger
+            // (scale 1 − p·0.22, slight upward drift, corner radius in
+            // 3 discrete steps) while the desktop is revealed behind
+            // it. The home-bar strip floats above the page (outside
+            // the shrink) so it stays put.
+            ZStack {
+                page.view
+                    .simultaneousGesture(
+                        DragGesture(minimumDistance: 30)
+                            .onChanged { value in
+                                if value.startLocation.x <= 24 {
+                                    edgeSwipeFromLeft = true
+                                }
                             }
-                        }
-                        .onEnded { value in
-                            defer { edgeSwipeFromLeft = false }
-                            guard edgeSwipeFromLeft else {
-                                return
+                            .onEnded { value in
+                                defer { edgeSwipeFromLeft = false }
+                                guard edgeSwipeFromLeft else {
+                                    return
+                                }
+                                if value.translation.width > 46
+                                    && abs(value.translation.height) < 60 {
+                                    systemPage = nil
+                                }
                             }
-                            if value.translation.width > 80
-                                && abs(value.translation.height) < value.translation.width {
+                    )
+                    .toolbar {
+                        ToolbarItem(placement: .topBarTrailing) {
+                            Button("lc.common.done".loc) {
                                 systemPage = nil
                             }
                         }
-                )
-                .toolbar {
-                    ToolbarItem(placement: .topBarTrailing) {
-                        Button("lc.common.done".loc) {
-                            systemPage = nil
+                    }
+                    .scaleEffect(homeBarState.windowScale)
+                    .offset(y: homeBarState.windowOffsetY)
+                    .apply { content in
+                        if homeBarState.windowCornerRadius > 0 {
+                            content.clipShape(RoundedRectangle(cornerRadius: homeBarState.windowCornerRadius))
+                        } else {
+                            content
                         }
                     }
-                }
-                // The home bar works on system pages too (§11): the
-                // same 36pt strip, bottom-anchored over the page. It
-                // floats above the page content like a real home
-                // indicator; unlocked it does not hit-test, so the
-                // page's own scrolling and taps are untouched.
-                .overlay(alignment: .bottom) {
-                    LCSealBoxHomeIndicatorView(state: homeBarState, isLocked: lockStore.isLocked)
-                }
+            }
+            // The home bar works on system pages too (§11): the
+            // same 36pt strip, bottom-anchored over the page. It
+            // floats above the page content like a real home
+            // indicator; unlocked it does not hit-test, so the
+            // page's own scrolling and taps are untouched.
+            .overlay(alignment: .bottom) {
+                LCSealBoxHomeIndicatorView(state: homeBarState, isLocked: lockStore.isLocked)
+            }
         }
         .alert("lc.appBanner.confirmUninstallTitle".loc, isPresented: $showDeleteConfirm) {
             Button(role: .destructive) {
@@ -659,8 +723,12 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
                         systemPage = page
                     }
                 )
+                // Entry/exit fade (demo §7.1/§7.4: the scrim fades
+                // 0.42 s; the cards stagger in inside the switcher).
+                .transition(.opacity)
             }
         }
+        .animation(.easeOut(duration: 0.42), value: showSwitcher)
         .overlay {
             if showControlCenter {
                 LCSealBoxControlCenterView(
@@ -672,8 +740,15 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
                         systemPage = .settings
                     }
                 )
+                // Open/close (demo §6/§11.1): the panel slides in
+                // from the top and fades, 0.58 s spring-sheet.
+                .transition(.asymmetric(
+                    insertion: .move(edge: .top).combined(with: .opacity),
+                    removal: .move(edge: .top).combined(with: .opacity)
+                ))
             }
         }
+        .animation(.spring(response: 0.58, dampingFraction: 0.8), value: showControlCenter)
 
     }
     
@@ -1333,8 +1408,18 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
     }
 
     /// Live page count: ceil(total icons / 24). Never hardcoded.
+    /// In edit mode the demo (§1.6) appends an extra trailing blank
+    /// page whenever the last page is non-empty, so an icon can always
+    /// be dragged onto a fresh page. It disappears on exiting edit
+    /// mode (the current page clamps back via the onChange above).
+    /// The grid size stays 24/page (MEMORY.md: 4 columns × 6 rows);
+    /// the demo's 16/page is not adopted.
     var desktopPageCount: Int {
-        max(1, desktopPages.count)
+        let base = max(1, desktopPages.count)
+        if isEditing, let last = desktopPages.last, !last.isEmpty {
+            return base + 1
+        }
+        return base
     }
 
     // MARK: Desktop grid views
@@ -1352,11 +1437,33 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
                     .resizable()
                     .aspectRatio(contentMode: .fill)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    // Overscan (demo §5): the image extends 14 pt past
+                    // the screen on every side so the parallax shift
+                    // never exposes an edge, plus a permanent 1.04× so
+                    // the shift has room to pan.
+                    .padding(-14)
                     .overlay(desktopTheme.wallpaperDim)
                     .clipped()
                     .ignoresSafeArea()
+                    .scaleEffect(1.04)
+                    // Parallax (demo §3): −12 pt per page, 0.55 s
+                    // spring-snap. (The live −0.04×dx follow during a
+                    // page swipe is not available: the system TabView
+                    // does not expose the finger's offset.)
+                    .offset(x: -CGFloat(currentPage) * 12)
+                    .animation(.spring(response: 0.55, dampingFraction: 0.75), value: currentPage)
+                    // Wallpaper change (demo §5): crossfade, opacity
+                    // 0.4 s. The view's identity is keyed on the
+                    // store's version so a new image fades in.
+                    .id(wallpaperStore.version)
+                    .transition(.opacity)
+                    .animation(.easeOut(duration: 0.4), value: wallpaperStore.version)
             }
         }
+        // Pinned to the screen size: the −14 pt overscan above must
+        // overflow (it is the parallax room), never grow the desktop
+        // layout and push the grid up.
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private var desktopPagesView: some View {
@@ -1382,7 +1489,7 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
                     icon: icon,
                     isEditing: isEditing,
                     isDragged: desktopDrag.draggedID == icon.id,
-                    isDropTarget: desktopDrag.dropTargetID == icon.id,
+                    isDropTarget: desktopDrag.dropTarget == .cell(id: icon.id),
                     darkModeIcon: darkModeIcon,
                     theme: desktopTheme,
                     onTap: {
@@ -1390,47 +1497,25 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
                     },
                     onDelete: icon.isDeletable ? {
                         requestDelete(icon)
-                    } : nil,
-                    onLongPress: {
-                        if !isEditing {
-                            isEditing = true
-                        }
-                    }
+                    } : nil
                 )
                 .apply { cell in
                     // Dragging is disabled while searching: a search
                     // shows a filtered subset, and reordering a subset
-                    // would corrupt the persisted full order.
-                    // Dragging is ALSO disabled while NOT in edit mode.
-                    // That is the long-press fix: SwiftUI's onDrag
-                    // carries its own internal press recogniser, and it
-                    // claims the touch before the cell's 0.5 s
-                    // long-press can fire — so on a real device a
-                    // long-press on an icon never entered edit mode, it
-                    // just silently armed a drag. With onDrag gated off
-                    // outside edit mode, the long-press is the only
-                    // press gesture and it fires; once editing, onDrag
-                    // attaches and dragging works. (Same touch cannot
-                    // continue from "enter edit" into a drag — the drag
-                    // gesture attaches mid-touch and misses this touch;
-                    // lift the finger and long-press again to drag, the
-                    // same as the iPhone home screen's second press.)
-                    if isSearching || !isEditing {
+                    // would corrupt the persisted full order. Otherwise
+                    // the icon carries the long-press → drag gesture
+                    // (demo §1.4): it attaches on pointerdown
+                    // regardless of edit mode, so the finger that
+                    // long-pressed into edit mode can keep moving and
+                    // drag without lifting. SwiftUI's onDrag / onDrop
+                    // cannot do this — onDrag's internal press
+                    // recogniser claims the touch before the long-press
+                    // fires — so the drag is implemented by hand (see
+                    // LCDesktopDrag.swift).
+                    if isSearching {
                         cell
                     } else {
-                        cell
-                            .onDrag {
-                                desktopDrag.beginDrag(id: icon.id)
-                                return NSItemProvider(object: NSString(string: icon.id))
-                            }
-                            .onDrop(
-                                of: [.text],
-                                delegate: LCDesktopCellDropDelegate(
-                                    targetID: icon.id,
-                                    dragState: desktopDrag,
-                                    onMove: moveIcon
-                                )
-                            )
+                        cell.gesture(desktopIconDragGesture(for: icon, isInDock: false))
                     }
                 }
             }
@@ -1438,15 +1523,15 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
         .padding(.horizontal, 20)
         .padding(.top, 12)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-        // Drop on the page's blank area: land at the end of this page.
-        // This also allows dropping onto the last page's blank area.
-        .onDrop(
-            of: [.text],
-            delegate: LCDesktopPageDropDelegate(
-                page: page,
-                dragState: desktopDrag,
-                onMoveToPageEnd: moveIconToPageEnd
-            )
+        // Grid frame for the drag hit-test: a drag over a page's blank
+        // area lands at the end of that page.
+        .background(
+            GeometryReader { proxy in
+                Color.clear.preference(
+                    key: LCDesktopGridFramePreferenceKey.self,
+                    value: [page: proxy.frame(in: .named("desktop"))]
+                )
+            }
         )
     }
 
@@ -1454,11 +1539,13 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
     /// dots' style and position cannot be guaranteed to sit above the
     /// Dock, and they are not tappable). Centred above the Dock; current
     /// page is a bright solid dot, others gray; tappable to jump; hidden
-    /// when there is only one page.
+    /// when there is only one page. Demo §3: 8 pt dots, 7 pt gap, each
+    /// dot in a padded tap target (6×2 pt), colour transition 0.3 s
+    /// spring-open. The active dot does not scale in the demo.
     private var desktopPageDots: some View {
         Group {
             if desktopPageCount > 1 {
-                HStack(spacing: 8) {
+                HStack(spacing: 7) {
                     ForEach(0..<desktopPageCount, id: \.self) { page in
                         Button {
                             withAnimation {
@@ -1468,7 +1555,10 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
                             Circle()
                                 .fill(page == currentPage ? Color.primary : Color.secondary.opacity(0.5))
                                 .frame(width: 8, height: 8)
+                                .animation(.spring(response: 0.3, dampingFraction: 0.85), value: currentPage)
                         }
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
                     }
                 }
                 .padding(.vertical, 8)
@@ -1601,6 +1691,15 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
         .padding(.top, 12)
     }
 
+    /// Enters edit mode and records the entry time (the 400 ms
+    /// exit guard, demo §2.5). All entry paths go through here:
+    /// long-press on blank desktop, on an icon, or on a Dock icon.
+    private func enterEditMode() {
+        guard !isEditing else { return }
+        isEditing = true
+        editingSince = Date()
+    }
+
     /// Exits edit mode: stops jiggling and dragging, hides the search
     /// field and clears the query.
     private func exitEditMode() {
@@ -1608,26 +1707,6 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
         desktopDrag.endDrag()
         showSearchBar = false
         searchContext.query = ""
-    }
-
-    /// Invisible 28pt edge zone, only present while a drag is active.
-    /// Hovering flips one page after 0.7 s and re-arms while hovering.
-    private func edgeZone(direction: LCDesktopEdgeDirection) -> some View {
-        Group {
-            if desktopDrag.isDragging {
-                Color.clear
-                    .frame(width: 28)
-                    .frame(maxHeight: .infinity)
-                    .contentShape(Rectangle())
-                    .onDrop(
-                        of: [.text],
-                        delegate: LCDesktopEdgeDropDelegate(
-                            direction: direction,
-                            dragState: desktopDrag
-                        )
-                    )
-            }
-        }
     }
 
     // MARK: Desktop grid actions
@@ -1641,10 +1720,10 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
     }
 
     func flipPage(_ direction: LCDesktopEdgeDirection) {
-        // Explicit spring (was withAnimation with the default curve):
-        // the page glides instead of snapping when an edge hover
+        // Page-transition spring (demo §3): 0.52 s spring-snap.
+        // The page glides instead of snapping when an edge hover
         // flips it mid-drag.
-        withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
+        withAnimation(.spring(response: 0.52, dampingFraction: 0.75)) {
             switch direction {
             case .previous:
                 currentPage = max(0, currentPage - 1)
@@ -1773,25 +1852,326 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
         appPendingDelete = nil
     }
 
-    /// Move the dragged icon to just before `targetID`. A Dock icon
-    /// dragged onto the grid leaves the Dock (its slot stays empty).
-    func moveIcon(draggedID: String, toBeforeID targetID: String) {
-        // Spring the reorder instead of snapping: the icons glide to
-        // their new slots on drop (see the drag-smoothness notes in
-        // SEALBOX_DOCK_FIX.md). The drop itself still only happens on
-        // performDrop — the hover state only shows the dashed slot.
-        withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
-            if desktopDock.dockIDs.contains(draggedID) {
-                desktopDock.removeFromDock(id: draggedID)
+    // MARK: - Desktop drag (custom long-press → drag, demo §1)
+
+    /// The long-press → drag gesture for one icon (grid or Dock).
+    /// Built here so the handlers can reach the order / Dock stores.
+    /// Long-press fires `enterEditMode()`; the drag itself starts on
+    /// the first move past the 7 pt threshold, so the same finger
+    /// that long-pressed keeps dragging without lifting (demo §1.2).
+    private func desktopIconDragGesture(for icon: LCDesktopIcon, isInDock: Bool) -> AnyGesture<SequenceGesture<LongPressGesture, DragGesture>.Value> {
+        LCDesktopIconDragGesture(
+            icon: icon,
+            isInDock: isInDock,
+            isEditing: isEditing,
+            onLongPress: { _, _ in
+                enterEditMode()
+            },
+            onDragChanged: { icon, isInDock, value in
+                desktopIconDragChanged(icon: icon, isInDock: isInDock, value: value)
+            },
+            onDragEnded: { icon, isInDock, value in
+                desktopIconDragEnded(icon: icon, isInDock: isInDock, value: value)
             }
-            desktopOrder.move(id: draggedID, beforeID: targetID)
+        )
+    }
+
+    /// The Dock slot currently hovered as a drop target (swap), if any.
+    /// An append target (empty Dock space) highlights the slot it will
+    /// land in: the first empty slot, or the last slot when the Dock is
+    /// full (that icon is the one the append evicts).
+    private var dockDropTargetSlot: Int? {
+        switch desktopDrag.dropTarget {
+        case .dockSlot(let index, _):
+            return index
+        case .dockAppend:
+            return min(dockDisplayIcons.count, LCDesktopDockStore.maxDockItems - 1)
+        default:
+            return nil
         }
-        desktopDrag.endDrag()
+    }
+
+    /// Dock layer scale for the home-bar follow / switcher (demo
+    /// §7.1 / §8.3). The Dock follows the front window down (scale
+    /// 0.92 + p·0.08, opacity p) when a system page is open, and
+    /// shrinks to 0.96 / 0.55 while the switcher is up.
+    private var dockLayerScale: CGFloat {
+        if showSwitcher { return 0.96 }
+        if systemPage != nil { return 0.92 + homeBarState.followProgress * 0.08 }
+        return 1.0
+    }
+
+    /// Dock layer opacity for the home-bar follow / switcher.
+    private var dockLayerOpacity: Double {
+        if showSwitcher { return 0.55 }
+        if systemPage != nil { return Double(homeBarState.followProgress) }
+        return 1.0
+    }
+
+    /// The ghost icon: the dragged tile (1.15× + shadow while
+    /// dragging, shrinking to 1× on landing) at the finger's position
+    /// in the "desktop" coordinate space, with its name label below
+    /// for grid icons (mirroring the cell).
+    private func desktopDragGhost(for icon: LCDesktopIcon) -> some View {
+        let lift = max(0, min(1, (desktopDrag.ghostScale - 1) / 0.15))
+        let tileSize: CGFloat = desktopDrag.draggedFromDock ? 56 : 60
+        return VStack(spacing: 4) {
+            LCDesktopIconTile(icon: icon, darkModeIcon: darkModeIcon, size: tileSize)
+            if !desktopDrag.draggedFromDock {
+                Text(icon.displayName)
+                    .font(.system(size: 12))
+                    .lineLimit(1)
+                    .foregroundStyle(desktopTheme.nameColor)
+                    .shadow(color: .black.opacity(0.55), radius: 2, x: 0, y: 1)
+                    .frame(maxWidth: 76)
+            }
+        }
+        .scaleEffect(desktopDrag.ghostScale)
+        .shadow(color: .black.opacity(0.3 * lift), radius: 12 * lift, x: 0, y: 8 * lift)
+        .position(x: desktopDrag.ghostCenter.x, y: desktopDrag.ghostCenter.y)
+    }
+
+    /// A drag move event: pick the icon up on the first move past the
+    /// 7 pt threshold, then follow the finger, flip pages at the edges
+    /// and update the drop target.
+    private func desktopIconDragChanged(icon: LCDesktopIcon, isInDock: Bool, value: DragGesture.Value) {
+        guard !desktopDrag.isLanding else { return }
+        if !desktopDrag.isDragging {
+            startDesktopDrag(icon: icon, isInDock: isInDock, value: value)
+        }
+        guard desktopDrag.isDragging else { return }
+        updateDesktopDrag(value: value)
+    }
+
+    /// Picks the icon up: records the origin (cell centre + frame,
+    /// finger location, grid/Dock origin) and shows the ghost.
+    private func startDesktopDrag(icon: LCDesktopIcon, isInDock: Bool, value: DragGesture.Value) {
+        let startFrame: CGRect
+        let startCenter: CGPoint
+        let originIndex: Int?
+        if isInDock {
+            let slot = dockDisplayIcons.firstIndex { $0.id == icon.id }
+            if let slot, let frame = desktopDrag.dockSlotFrames[slot] {
+                startFrame = frame
+                startCenter = CGPoint(x: frame.midX, y: frame.midY)
+            } else {
+                // Frames not yet reported (first drag before the
+                // preference change landed): centre the ghost on the
+                // finger rather than offsetting it.
+                startFrame = CGRect(
+                    x: value.startLocation.x - 28,
+                    y: value.startLocation.y - 28,
+                    width: 56, height: 56
+                )
+                startCenter = value.startLocation
+            }
+            originIndex = nil
+        } else {
+            if let frame = desktopDrag.cellFrames[icon.id] {
+                startFrame = frame
+                startCenter = CGPoint(x: frame.midX, y: frame.midY)
+            } else {
+                startFrame = CGRect(
+                    x: value.startLocation.x - 30,
+                    y: value.startLocation.y - 39.5,
+                    width: 60, height: 79
+                )
+                startCenter = value.startLocation
+            }
+            originIndex = desktopOrder.order.firstIndex(of: icon.id)
+        }
+        desktopDrag.beginDrag(
+            icon: icon,
+            fromDock: isInDock,
+            originIndex: originIndex,
+            startCenter: startCenter,
+            startFrame: startFrame,
+            startLocation: value.startLocation
+        )
+    }
+
+    /// Follows the finger: ghost position, edge page-flip, drop target.
+    private func updateDesktopDrag(value: DragGesture.Value) {
+        let location = value.location
+        desktopDrag.ghostCenter = desktopDrag.dragStartCenter + (location - desktopDrag.dragStartLocation)
+        // Edge page-flip (demo §1.6): a 24 pt zone at each screen
+        // edge, 650 ms cooldown, and the first flip needs 650 ms of
+        // dragging first (lastFlip is set at drag start). The hover
+        // clears on flip; the frames refresh after the page lands.
+        let now = CACurrentMediaTime()
+        let width = UIScreen.main.bounds.width
+        if now - desktopDrag.lastFlipTime >= LCDesktopDragState.edgeFlipCooldown {
+            if location.x > width - LCDesktopDragState.edgeFlipZoneWidth, currentPage < desktopPageCount - 1 {
+                desktopDrag.lastFlipTime = now
+                flipPage(.next)
+                desktopDrag.setDropTarget(.none)
+                return
+            }
+            if location.x < LCDesktopDragState.edgeFlipZoneWidth, currentPage > 0 {
+                desktopDrag.lastFlipTime = now
+                flipPage(.previous)
+                desktopDrag.setDropTarget(.none)
+                return
+            }
+        }
+        desktopDrag.setDropTarget(hitTestDropTarget(at: location))
+    }
+
+    /// Hit-tests the finger against the live frames: the Dock first
+    /// (slot or empty space), then the current page's cells, then the
+    /// page's blank area. Anything else is an invalid spot.
+    private func hitTestDropTarget(at point: CGPoint) -> LCDesktopDropTarget {
+        if desktopDrag.dockFrame.contains(point) {
+            for (slot, frame) in desktopDrag.dockSlotFrames where frame.contains(point) {
+                if slot < dockDisplayIcons.count {
+                    return .dockSlot(index: slot, iconID: dockDisplayIcons[slot].id)
+                }
+                return .dockAppend
+            }
+            return .dockAppend
+        }
+        let icons = currentPage < desktopPages.count ? desktopPages[currentPage] : []
+        for icon in icons {
+            if let frame = desktopDrag.cellFrames[icon.id], frame.contains(point) {
+                return .cell(id: icon.id)
+            }
+        }
+        if let gridFrame = desktopDrag.gridFrames[currentPage], gridFrame.contains(point) {
+            return .pageEnd(page: currentPage)
+        }
+        return .none
+    }
+
+    /// Release: the ghost flies to its landing cell (0.42 s,
+    /// no-overshoot) or back to its origin cell (0.45 s), and the
+    /// order commits at handoff (demo §1.7).
+    private func desktopIconDragEnded(icon: LCDesktopIcon, isInDock: Bool, value: DragGesture.Value) {
+        guard desktopDrag.isDragging, !desktopDrag.isLanding else { return }
+        guard let draggedID = desktopDrag.draggedID else { return }
+        let target = desktopDrag.dropTarget
+        let fromDock = desktopDrag.draggedFromDock
+        let originIndex = desktopDrag.dragOriginIndex
+        let (changes, targetCenter) = landingPlan(draggedID: draggedID, target: target, fromDock: fromDock)
+        let duration = changes ? LCDesktopDragState.landingDuration : LCDesktopDragState.flyBackDuration
+        desktopDrag.beginLanding()
+        withAnimation(.spring(response: duration, dampingFraction: 1.0)) {
+            desktopDrag.ghostCenter = targetCenter
+            desktopDrag.ghostScale = 1.0
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + duration + 0.03) { [draggedID, target, fromDock, originIndex] in
+            if changes {
+                self.commitDrop(draggedID: draggedID, target: target, fromDock: fromDock, originIndex: originIndex)
+            }
+            desktopDrag.finishLanding()
+        }
+    }
+
+    /// Resolves the landing: whether the drop changes anything, and
+    /// where the ghost flies to (the target cell's centre, or the
+    /// origin cell for a no-change drop).
+    private func landingPlan(draggedID: String, target: LCDesktopDropTarget, fromDock: Bool) -> (changes: Bool, center: CGPoint) {
+        let originCenter = CGPoint(x: desktopDrag.dragStartFrame.midX, y: desktopDrag.dragStartFrame.midY)
+        switch target {
+        case .cell(let targetID):
+            guard targetID != draggedID else { return (false, originCenter) }
+            if let frame = desktopDrag.cellFrames[targetID] {
+                return (true, CGPoint(x: frame.midX, y: frame.midY))
+            }
+            return (true, originCenter)
+        case .dockSlot(let index, let iconID):
+            guard iconID != draggedID, !fromDock, !LCDesktopIcon.isSystemID(draggedID) else { return (false, originCenter) }
+            if let frame = desktopDrag.dockSlotFrames[index] {
+                return (true, CGPoint(x: frame.midX, y: frame.midY))
+            }
+            return (true, originCenter)
+        case .dockAppend:
+            guard !fromDock, !LCDesktopIcon.isSystemID(draggedID) else { return (false, originCenter) }
+            let appendIndex = min(dockDisplayIcons.count, LCDesktopDockStore.maxDockItems - 1)
+            if let frame = desktopDrag.dockSlotFrames[appendIndex] {
+                return (true, CGPoint(x: frame.midX, y: frame.midY))
+            }
+            return (true, CGPoint(x: desktopDrag.dockFrame.midX, y: desktopDrag.dockFrame.midY))
+        case .pageEnd(let page):
+            let icons = page < desktopPages.count ? desktopPages[page] : []
+            if icons.last?.id == draggedID { return (false, originCenter) }
+            if let lastID = icons.last?.id, let frame = desktopDrag.cellFrames[lastID] {
+                // The icon lands in the next slot after the last one:
+                // one column to the right, or the first column of the
+                // next row if the row is full. The column width is the
+                // cell width + the 12 pt column spacing; the row
+                // height is the cell height + the 18 pt row spacing.
+                let col = (icons.count - 1) % 4
+                let cellW = frame.width
+                let cellH = frame.height
+                if col < 3 {
+                    return (true, CGPoint(x: frame.midX + cellW + 12, y: frame.midY))
+                }
+                let firstColX = frame.midX - CGFloat(col) * (cellW + 12)
+                return (true, CGPoint(x: firstColX, y: frame.midY + cellH + 18))
+            }
+            // Empty page: the first slot's position.
+            if let gridFrame = desktopDrag.gridFrames[page] {
+                let cellSize = desktopDrag.dragStartFrame.size
+                let center = CGPoint(
+                    x: gridFrame.minX + 20 + cellSize.width / 2,
+                    y: gridFrame.minY + 12 + cellSize.height / 2
+                )
+                return (true, center)
+            }
+            return (true, originCenter)
+        case .none:
+            return (false, originCenter)
+        }
+    }
+
+    /// Commits a drop at handoff (demo §1.5 swap semantics). Called
+    /// after the ghost's landing flight, inside the landing spring's
+    /// animation so the swapped icons glide to their new slots.
+    private func commitDrop(draggedID: String, target: LCDesktopDropTarget, fromDock: Bool, originIndex: Int?) {
+        let spring = Animation.spring(response: LCDesktopDragState.landingDuration, dampingFraction: 1.0)
+        switch target {
+        case .cell(let targetID):
+            guard targetID != draggedID else { return }
+            if fromDock {
+                // Dock → occupied grid cell: the occupant goes to
+                // the first free slot, the dragged icon takes the cell.
+                withAnimation(spring) {
+                    desktopDock.removeFromDock(id: draggedID)
+                    desktopOrder.replace(id: targetID, with: draggedID)
+                    desktopOrder.insert(id: targetID, at: desktopOrder.order.count)
+                }
+            } else {
+                withAnimation(spring) {
+                    desktopOrder.swap(id: draggedID, withID: targetID)
+                }
+            }
+        case .dockSlot(let index, let iconID):
+            guard iconID != draggedID, !fromDock, !LCDesktopIcon.isSystemID(draggedID) else { return }
+            // Grid → occupied Dock slot: swap. The Dock icon returns
+            // to the dragged icon's original grid cell.
+            withAnimation(spring) {
+                desktopOrder.remove(id: draggedID)
+                desktopDock.replaceDockIcon(at: index, with: draggedID)
+                if let originIndex, originIndex <= desktopOrder.order.count {
+                    desktopOrder.insert(id: iconID, at: originIndex)
+                } else {
+                    desktopOrder.insert(id: iconID, at: desktopOrder.order.count)
+                }
+            }
+        case .dockAppend:
+            guard !fromDock, !LCDesktopIcon.isSystemID(draggedID) else { return }
+            dropIconOnDock(draggedID)
+        case .pageEnd(let page):
+            moveIconToPageEnd(draggedID: draggedID, page: page)
+        case .none:
+            break
+        }
     }
 
     /// Drop on a page's blank area: land at the end of that page.
     func moveIconToPageEnd(draggedID: String, page: Int) {
-        withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+        // Landing spring (demo §1.7): 0.42 s, no overshoot.
+        withAnimation(.spring(response: 0.42, dampingFraction: 1.0)) {
             if desktopDock.dockIDs.contains(draggedID) {
                 desktopDock.removeFromDock(id: draggedID)
             }
@@ -1802,7 +2182,6 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
                 desktopOrder.insert(id: draggedID, at: desktopOrder.order.count)
             }
         }
-        desktopDrag.endDrag()
     }
 
     /// Drop an icon onto the Dock. If the Dock is full, the last Dock
@@ -1811,19 +2190,16 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
         // System icons never enter the Dock: they live in the grid.
         guard !draggedID.isEmpty, !desktopDock.dockIDs.contains(draggedID),
               !LCDesktopIcon.isSystemID(draggedID) else {
-            desktopDrag.endDrag()
             return
         }
-        // Same spring as the grid drops: the Dock fills and the
-        // evicted icon glides back to the grid instead of jumping.
-        withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+        // Landing spring (demo §1.7): 0.42 s, no overshoot.
+        withAnimation(.spring(response: 0.42, dampingFraction: 1.0)) {
             let evicted = desktopDock.addToDock(id: draggedID)
             desktopOrder.remove(id: draggedID)
             if let evicted {
                 desktopOrder.insert(id: evicted, at: desktopOrder.order.count)
             }
         }
-        desktopDrag.endDrag()
     }
 
     /// Dock "−": remove the icon from the Dock only; it returns to the

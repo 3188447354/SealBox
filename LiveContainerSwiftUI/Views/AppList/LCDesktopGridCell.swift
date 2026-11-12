@@ -16,6 +16,13 @@
 //  existing IconImageView (corner radius = width x 0.2667, same as the
 //  banner and the custom-sort list).
 //
+//  Dragging (demo §1): the cell itself carries no drag gesture —
+//  LCAppListView attaches the long-press → drag gesture (see
+//  LCDesktopIconDragGesture in LCDesktopDrag.swift). While an icon is
+//  being dragged, its cell is drawn as an empty dashed slot (the ghost
+//  icon floats above it); the hovered drop target keeps its icon and
+//  gets the demo's 2 pt white outline (a drop swaps with that one cell).
+//
 
 import SwiftUI
 
@@ -24,11 +31,11 @@ import SwiftUI
 struct LCDesktopGridCell: View {
     let icon: LCDesktopIcon
     let isEditing: Bool
-    /// True while this icon is the one being dragged (slightly enlarged,
-    /// semi-transparent).
+    /// True while this icon is the one being dragged: the cell is drawn
+    /// as an empty slot (the ghost icon is the dragged tile).
     let isDragged: Bool
-    /// True while a dragged icon hovers over this cell: the cell is drawn
-    /// as an empty slot so the user sees where the drop will land.
+    /// True while a dragged icon hovers over this cell: the cell keeps
+    /// its icon and gets the demo's drop outline (a drop swaps with it).
     let isDropTarget: Bool
     let darkModeIcon: Bool
     /// Desktop theme (system / dark / light). Drives the icon-name
@@ -38,26 +45,58 @@ struct LCDesktopGridCell: View {
 
     var onTap: () -> Void
     var onDelete: (() -> Void)?
-    var onLongPress: () -> Void
 
     @State private var jiggling = false
+    /// Edit-entry pop (demo §1.3): icons scale 0.88 → 1 once, 0.34 s
+    /// spring-pop, when edit mode is entered.
+    @State private var editPopScale: CGFloat = 1.0
+
+    /// Jiggle phase, per icon (demo §2.2): the icons must not rock in
+    /// unison. Derived from the icon id so it is stable per icon:
+    /// durations 0.31 / 0.23 / 0.26 s, one variant mirrored.
+    private var jiggleDuration: Double {
+        switch abs(icon.id.hashValue) % 3 {
+        case 0: return 0.31
+        case 1: return 0.23
+        default: return 0.26
+        }
+    }
+
+    /// Jiggle angles (demo §2.2): −1.6°…+1.5°, mirrored (+1.4°…−1.6°)
+    /// for every fourth icon.
+    private var jiggleAngles: (from: Double, to: Double) {
+        abs(icon.id.hashValue) % 4 == 0 ? (1.4, -1.6) : (-1.6, 1.5)
+    }
 
     var body: some View {
         VStack(spacing: 4) {
             ZStack(alignment: .topLeading) {
-                iconTile
-                    .frame(width: 60, height: 60)
-                    .opacity(isDropTarget ? 0.0 : 1.0)
+                LCDesktopIconTile(icon: icon, darkModeIcon: darkModeIcon, size: 60)
+                    .opacity(isDragged ? 0.0 : 1.0)
                     .overlay {
-                        // Empty-slot hint: a dashed rounded rect where the
-                        // dragged icon will land.
-                        if isDropTarget {
+                        // Empty origin slot: the dragged icon's cell
+                        // shows a dashed rounded rect while the ghost
+                        // floats above it.
+                        if isDragged {
                             RoundedRectangle(cornerRadius: 60 * 0.2667)
                                 .strokeBorder(style: StrokeStyle(lineWidth: 2, dash: [5, 4]))
                                 .foregroundStyle(.secondary)
                                 .frame(width: 60, height: 60)
                         }
+                        // Drop-target highlight (demo §1.4): the
+                        // hovered cell keeps its icon and gets a 2 pt
+                        // white outline, offset 2 pt.
+                        if isDropTarget {
+                            RoundedRectangle(cornerRadius: 60 * 0.2667)
+                                .strokeBorder(Color.white.opacity(0.85), lineWidth: 2)
+                                .padding(-2)
+                                .frame(width: 60, height: 60)
+                        }
                     }
+                    // The tile fading out (dragged) and the highlight
+                    // appearing (drop target) ease over 0.15 s.
+                    .animation(.easeInOut(duration: 0.15), value: isDragged)
+                    .animation(.easeInOut(duration: 0.15), value: isDropTarget)
 
                 if isEditing, icon.isDeletable {
                     Button {
@@ -70,6 +109,8 @@ struct LCDesktopGridCell: View {
                             .background(Circle().fill(.red))
                     }
                     .offset(x: -8, y: -8)
+                    // Badge-in (demo §2.2): 0.38 s spring-pop, scale 0 → 1.
+                    .transition(.scale.combined(with: .opacity))
                 }
 
                 if isLocked {
@@ -95,26 +136,47 @@ struct LCDesktopGridCell: View {
                 .frame(maxWidth: 76)
         }
         .frame(maxWidth: .infinity)
-        // Lifted icon: bigger, slightly transparent, floating on a
-        // shadow — the iPhone home-screen lift. Was scale 1.08 /
-        // opacity 0.6 with no shadow, and the change snapped because
-        // the only .animation on the cell was keyed on jiggling.
-        .opacity(isDragged ? 0.85 : 1.0)
-        .scaleEffect(isDragged ? 1.15 : 1.0)
-        .shadow(color: isDragged ? .black.opacity(0.3) : .clear, radius: isDragged ? 12 : 0, x: 0, y: isDragged ? 8 : 0)
-        .animation(.spring(response: 0.3, dampingFraction: 0.75), value: isDragged)
-        // The hovered drop target fades to the dashed slot smoothly
-        // instead of blinking out.
-        .animation(.easeInOut(duration: 0.15), value: isDropTarget)
-        // Jiggle: small back-and-forth rotation, iPhone edit-mode style.
-        .rotationEffect(.degrees(isEditing ? (jiggling ? 1.2 : -1.2) : 0))
+        // The dragged cell is an empty slot (see above); the lift
+        // (1.15× + shadow) lives on the ghost icon, not the cell.
+        // Edit-entry pop: 0.88 → 1 once on entering edit mode.
+        .scaleEffect(editPopScale)
+        // Jiggle (demo §2.2): ±1.5–1.6° with ±0.5 px vertical shift,
+        // phase/speed varying per icon so they don't rock in unison.
+        .rotationEffect(.degrees(isEditing ? (jiggling ? jiggleAngles.to : jiggleAngles.from) : 0))
+        .offset(y: isEditing ? (jiggling ? 0.5 : -0.5) : 0)
         .animation(
-            isEditing ? .easeInOut(duration: 0.12).repeatForever(autoreverses: true) : .default,
+            isEditing ? .easeInOut(duration: jiggleDuration).repeatForever(autoreverses: true) : .default,
             value: jiggling
         )
         .onChange(of: isEditing) { editing in
-            jiggling = editing
+            if editing {
+                // Start the jiggle from the `from` angle: the angle
+                // is `from` while jiggling is false, so flip the phase
+                // on the next runloop — the repeatForever animation
+                // then oscillates `from` ↔ `to`. Flipping it in this
+                // same transaction would interpolate from 0 (the
+                // non-editing angle) instead, a one-sided wobble.
+                jiggling = false
+                DispatchQueue.main.async {
+                    jiggling = true
+                }
+                // Entry pop: start at 0.88 (instant — the isEditing
+                // animation below must not ease this leg) and spring
+                // to 1 over 0.34 s.
+                withAnimation(nil) {
+                    editPopScale = 0.88
+                }
+                withAnimation(.spring(response: 0.34, dampingFraction: 0.6)) {
+                    editPopScale = 1.0
+                }
+            } else {
+                jiggling = false
+                editPopScale = 1.0
+            }
         }
+        // The delete badge's scale/opacity transition (badge-in) is
+        // driven by the edit-mode change.
+        .animation(.spring(response: 0.38, dampingFraction: 0.6), value: isEditing)
         // High-priority tap: without this, a tap on an icon in edit
         // mode ALSO fires the desktop container's tap-to-exit-edit
         // gesture (SwiftUI delivers the tap to ancestor gestures too),
@@ -133,9 +195,16 @@ struct LCDesktopGridCell: View {
                 onTap()
             }
         )
-        .onLongPressGesture(minimumDuration: 0.5) {
-            onLongPress()
-        }
+        // Frame reporting for the drag hit-test: the cell's rect in
+        // the "desktop" coordinate space.
+        .background(
+            GeometryReader { proxy in
+                Color.clear.preference(
+                    key: LCDesktopCellFramePreferenceKey.self,
+                    value: [icon.id: proxy.frame(in: .named("desktop"))]
+                )
+            }
+        )
     }
 
     private var isLocked: Bool {
@@ -143,22 +212,6 @@ struct LCDesktopGridCell: View {
             return false
         }
         return model.appInfo.isLocked
-    }
-
-    @ViewBuilder
-    private var iconTile: some View {
-        switch icon {
-        case .app(let model):
-            IconImageView(icon: model.appInfo.iconIsDarkIcon(darkModeIcon))
-        case .system(let page):
-            RoundedRectangle(cornerRadius: 60 * 0.2667)
-                .fill(page.tint)
-                .overlay {
-                    Image(systemName: page.systemImage)
-                        .font(.system(size: 26, weight: .semibold))
-                        .foregroundStyle(.white)
-                }
-        }
     }
 }
 

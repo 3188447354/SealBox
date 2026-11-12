@@ -77,11 +77,27 @@ struct LCSealBoxControlCenterView: View {
     /// the Settings page (its existing JIT section).
     var onOpenSettings: () -> Void
 
+    /// The panel's drag-follow offset (demo §6: the panel follows
+    /// the finger up 1:1, down at 0.25×). Zero at rest.
+    @State private var dragOffset: CGFloat = 0
+    /// Release velocity for the dismiss decision (demo §6).
+    @State private var velocityTracker = LCVelocityTracker()
+
     var body: some View {
         ZStack(alignment: .topTrailing) {
             Color.black.opacity(0.35)
                 .ignoresSafeArea()
                 .onTapGesture(perform: onDismiss)
+                // Swipe up on the dim area dismisses too (demo §6
+                // path 3): a mostly-upward drag ending past −40pt.
+                .simultaneousGesture(
+                    DragGesture(minimumDistance: 20)
+                        .onEnded { value in
+                            if value.translation.height < -40 {
+                                onDismiss()
+                            }
+                        }
+                )
             VStack(alignment: .leading, spacing: 0) {
                 Text("JIT")
                     .font(.headline)
@@ -132,14 +148,31 @@ struct LCSealBoxControlCenterView: View {
             .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 24))
             .padding(.top, 12)
             .padding(.trailing, 16)
-        }
-        .simultaneousGesture(
-            DragGesture(minimumDistance: 20)
-                .onEnded { value in
-                    if value.translation.height < -60 {
-                        onDismiss()
+            .offset(y: dragOffset)
+            // Panel drag (demo §6): the panel follows the finger —
+            // up 1:1, down damped to 0.25×. Release past −90pt, or
+            // past −24pt with a fast upward flick, dismisses it;
+            // anything else springs back (0.58 s spring-sheet).
+            .gesture(
+                DragGesture(minimumDistance: 8)
+                    .onChanged { value in
+                        velocityTracker.record(CGPoint(x: value.translation.width, y: value.translation.height))
+                        let dy = value.translation.height
+                        dragOffset = dy < 0 ? dy : dy * 0.25
                     }
-                }
-        )
+                    .onEnded { value in
+                        let dy = value.translation.height
+                        let vy = velocityTracker.velocity.dy
+                        velocityTracker.reset()
+                        if dy < -90 || (dy < -24 && vy < -0.5) {
+                            onDismiss()
+                        } else {
+                            withAnimation(.spring(response: 0.58, dampingFraction: 0.8)) {
+                                dragOffset = 0
+                            }
+                        }
+                    }
+            )
+        }
     }
 }

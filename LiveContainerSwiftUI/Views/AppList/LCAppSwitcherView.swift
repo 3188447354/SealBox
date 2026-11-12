@@ -138,6 +138,9 @@ final class LCAppSwitcherStore: ObservableObject {
     static let zIndexFlyingOut = 1000
 
     @Published private(set) var cards: [LCAppSwitcherCard] = []
+    /// The id of the card that is currently open (the system page the
+    /// switcher was opened from), for the "当前" pill in its header.
+    @Published private(set) var currentCardID: String?
     /// Real tweak folder names, for the Tweaks card preview.
     @Published private(set) var tweakNames: [String] = []
     /// Real settings rows, for the Settings card preview.
@@ -202,6 +205,7 @@ final class LCAppSwitcherStore: ObservableObject {
         if merged != cards {
             cards = merged
         }
+        currentCardID = openSystemPage?.id
         self.tweakNames = tweakNames
         settingsPreview = LCAppSwitcherSettingsPreview.readReal()
     }
@@ -262,8 +266,15 @@ final class LCAppSwitcherDragState: ObservableObject {
     @Published private(set) var axis: Axis?
     @Published private(set) var isDragging = false
 
+    /// Release velocity, in pt/ms (the drag state's own samples —
+    /// SwiftUI's predictedEndTranslation is not the actual velocity).
+    let velocityTracker = LCVelocityTracker()
+
     private let sampler = LCFrameSampler()
     private var lastTranslation = CGPoint.zero
+    /// Guards the delayed reset after a spring-back: a new drag
+    /// bumps the token so a stale reset cannot clear it.
+    private var springBackToken = 0
 
     func begin() {
         guard !isDragging else {
@@ -274,6 +285,9 @@ final class LCAppSwitcherDragState: ObservableObject {
         lastTranslation = .zero
         focusOffset = 0
         closeOffset = 0
+        springBackToken += 1
+        velocityTracker.reset()
+        velocityTracker.record(.zero)
         sampler.record(.zero)
         sampler.onFrame = { [weak self] point in
             guard let self else {
@@ -289,19 +303,57 @@ final class LCAppSwitcherDragState: ObservableObject {
         guard isDragging else {
             return
         }
-        if axis == nil, max(abs(translation.x), abs(translation.y)) > 12 {
-            axis = abs(translation.x) > abs(translation.y) ? .horizontal : .vertical
+        velocityTracker.record(translation)
+        // Axis lock (demo §7.2): locks at 9pt, with a ratio so a
+        // mostly-horizontal drag never becomes vertical (and vice
+        // versa). Before the lock, neither axis is committed.
+        if axis == nil {
+            let ax = abs(translation.x)
+            let ay = abs(translation.y)
+            if ax > 9, ax > 1.15 * ay {
+                axis = .horizontal
+            } else if ay > 9, ay >= ax {
+                axis = .vertical
+            }
         }
         lastTranslation = translation
         sampler.record(translation)
     }
 
-    func end() {
+    /// Stops sampling (the display link) but keeps the offsets and
+    /// the locked axis: the release animation reads them.
+    func stopSampling() {
+        sampler.stop()
+        isDragging = false
+    }
+
+    /// Clears everything (after a snap, a close, or a dismiss).
+    func reset() {
         sampler.stop()
         isDragging = false
         axis = nil
         focusOffset = 0
         closeOffset = 0
+    }
+
+    /// The drag ended without a close or a dismiss: animate the
+    /// close offset back to 0 (0.32 s spring-open) and clear the drag
+    /// state after the spring lands. A new drag starting mid-spring
+    /// bumps the token, so the delayed reset is a no-op then.
+    func springBack() {
+        springBackToken += 1
+        let token = springBackToken
+        withAnimation(.spring(response: 0.32, dampingFraction: 0.85)) {
+            closeOffset = 0
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.34) { [weak self] in
+            guard let self, self.springBackToken == token else { return }
+            self.reset()
+        }
+    }
+
+    func end() {
+        reset()
     }
 }
 
@@ -388,8 +440,13 @@ struct LCAppSwitcherView: View {
     @State private var closingCardID: String?
     /// Fly-out offset of the closing card.
     @State private var closingOffsetY: CGFloat = 0
+    /// Fly-out scale of the closing card (0.94 while flying out).
+    @State private var closingScale: CGFloat = 1
     /// Fly-out opacity of the closing card.
     @State private var closingOpacity: Double = 1
+    /// Entry stagger: false until the switcher appears, then true;
+    /// the cards fade in staggered by their distance from focus.
+    @State private var entryRevealed = false
 
     var body: some View {
         GeometryReader { geometry in
@@ -435,6 +492,11 @@ struct LCAppSwitcherView: View {
             }
             .onAppear {
                 focusPosition = CGFloat(max(0, store.cards.count - 1))
+                // Entry stagger (demo §7.1): the cards fade in over
+                // 380 ms, staggered 55 ms per step of distance from
+                // the focus card. The per-card delay lives on the
+                // card's own animation modifier (see cardColumn).
+                entryRevealed = true
             }
             .onChange(of: store.cards.count) { _ in
                 // Clamp the focus when cards close; stay on the last
@@ -469,9 +531,13 @@ struct LCAppSwitcherView: View {
     }
 
     private func switcherLayout(for size: CGSize) -> SwitcherLayout {
-        let cardHeight = max(200, size.height - 2 * Self.trackPadding)
-        let cardWidth = min(cardHeight * 0.46, size.width * 0.82)
-        return SwitcherLayout(cardWidth: cardWidth, cardHeight: cardHeight, stride: cardWidth * 0.55)
+        // Demo §7.1: the card height leaves the 54pt track padding
+        // top and bottom plus 46pt for the icon + name header above
+        // each card; the width is the card's 0.4615 aspect (capped at
+        // 84% of the screen width); the stride is 0.58 of the width.
+        let cardHeight = max(200, size.height - 2 * Self.trackPadding - 46)
+        let cardWidth = min(cardHeight * 0.4615, size.width * 0.84)
+        return SwitcherLayout(cardWidth: cardWidth, cardHeight: cardHeight, stride: cardWidth * 0.58)
     }
 
     /// Soft edge resistance: past either end the focus moves at 0.3x.
@@ -537,13 +603,29 @@ struct LCAppSwitcherView: View {
                 return closingOffsetY
             }
             if isFocused, dragState.axis == .vertical {
-                return min(0, dragState.closeOffset)
+                // Up follows 1:1; down is damped (demo §7.2: the
+                // card sinks at most 44pt, scaled by 0.35).
+                let c = dragState.closeOffset
+                return c < 0 ? c : min(c, 44) * 0.35
             }
             return 0
         }()
+        // Shadow (demo §7.1): focused is the strongest, resting is
+        // mid, and while anything is moving (drag / zoom / fly-out)
+        // every card takes the soft motion shadow.
+        let isMotion = dragState.isDragging || openingCardID != nil || closingCardID != nil
+        let shadow: (opacity: Double, radius: CGFloat, y: CGFloat) = {
+            if isMotion {
+                return (0.3, 9, 4)
+            }
+            if isFocused {
+                return (0.45, 17, 9)
+            }
+            return (0.35, 14, 7)
+        }()
         return VStack(spacing: 10) {
             cardHeader(card: card)
-            cardBody(card: card, layout: layout)
+            cardBody(card: card, layout: layout, shadowOpacity: shadow.opacity, shadowRadius: shadow.radius, shadowY: shadow.y)
                 .background(
                     GeometryReader { proxy in
                         Color.clear.preference(
@@ -554,9 +636,13 @@ struct LCAppSwitcherView: View {
                 )
         }
         .offset(x: xOffset, y: yOffset)
-        .scaleEffect(isOpening ? openingScale : 1, anchor: .center)
-        .opacity(isClosing ? closingOpacity : (isOpening ? 1 : othersOpacity))
+        .scaleEffect(isClosing ? closingScale : (isOpening ? openingScale : 1), anchor: .center)
+        .opacity((entryRevealed ? 1 : 0) * (isClosing ? closingOpacity : (isOpening ? 1 : othersOpacity)))
         .zIndex(zIndex)
+        // Entry stagger (demo §7.1): 380 ms easeOut, delayed 55 ms
+        // per step of distance from the focus card. Keyed on
+        // entryRevealed only, so it never touches the drag follow.
+        .animation(.easeOut(duration: 0.38).delay(0.055 * Double(abs(index - focusedIndex))), value: entryRevealed)
         .onTapGesture {
             openCard(card, size: size, layout: layout)
         }
@@ -571,6 +657,17 @@ struct LCAppSwitcherView: View {
                 .font(.headline)
                 .foregroundStyle(.white)
                 .lineLimit(1)
+            // The card that is currently open (the system page the
+            // switcher was opened from) carries a small white "当前" pill.
+            if store.currentCardID == card.id {
+                Text("当前")
+                    .font(.caption2)
+                    .fontWeight(.semibold)
+                    .foregroundStyle(.black)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(Capsule().fill(.white))
+            }
         }
         .shadow(color: .black.opacity(0.5), radius: 2, x: 0, y: 1)
     }
@@ -601,7 +698,7 @@ struct LCAppSwitcherView: View {
 
     // MARK: Card body (real content only, no fake screenshots)
 
-    private func cardBody(card: LCAppSwitcherCard, layout: SwitcherLayout) -> some View {
+    private func cardBody(card: LCAppSwitcherCard, layout: SwitcherLayout, shadowOpacity: Double, shadowRadius: CGFloat, shadowY: CGFloat) -> some View {
         Group {
             switch card {
             case .guest(let guest):
@@ -617,11 +714,12 @@ struct LCAppSwitcherView: View {
                 }
             }
         }
-        // No border (§10.2). One shadow spec for every card, never
-        // restyled mid-animation (§14).
+        // No border (§10.2). The shadow depends on focus / motion
+        // (see cardColumn); it is one spec per state, never restyled
+        // mid-animation (§14).
         .frame(width: layout.cardWidth, height: layout.cardHeight)
         .clipShape(RoundedRectangle(cornerRadius: 28))
-        .shadow(color: .black.opacity(0.25), radius: 16, x: 0, y: 8)
+        .shadow(color: .black.opacity(shadowOpacity), radius: shadowRadius, x: 0, y: shadowY)
     }
 
     /// Guest apps have no usable live snapshot in this process, so the
@@ -723,13 +821,33 @@ struct LCAppSwitcherView: View {
     private func endDrag(value: DragGesture.Value, layout: SwitcherLayout) {
         let wasVertical = dragState.axis == .vertical
         let closeOffset = dragState.closeOffset
-        dragState.end()
+        let vy = dragState.velocityTracker.velocity.dy
+        // Stop sampling first; the shadow's motion → focus transition
+        // rides the settle spring so it does not snap at release.
+        withAnimation(Self.settleSpring) {
+            dragState.stopSampling()
+        }
         guard !store.cards.isEmpty else {
+            dragState.reset()
             return
         }
-        if wasVertical, closeOffset < -90 {
-            // Swipe the focused card up to close it.
-            closeCard(store.cards[focusedIndex])
+        if wasVertical && (closeOffset < -64 || (closeOffset < -16 && vy < -0.5)) {
+            // Swipe the focused card up to close it (demo §7.2: past
+            // −64pt, or past −16pt with a fast upward flick).
+            dragState.reset()
+            closeCard(store.cards[focusedIndex], layout: layout)
+            return
+        }
+        if wasVertical && (closeOffset > 84 || (closeOffset > 30 && vy > 0.6)) {
+            // Swipe the focused card down to the desktop (demo §7.2).
+            dragState.reset()
+            onDismiss()
+            return
+        }
+        if wasVertical {
+            // A downward drag that did not commit: spring the card
+            // back to its slot instead of snapping.
+            dragState.springBack()
             return
         }
         // Snap to the nearest card with a velocity-aware spring, one
@@ -738,26 +856,31 @@ struct LCAppSwitcherView: View {
         let target = clampedFocus(predicted, count: store.cards.count).rounded()
         let clampedTarget = max(0, min(CGFloat(store.cards.count - 1), target))
         withAnimation(Self.settleSpring) {
+            dragState.reset()
             focusPosition = clampedTarget
         }
     }
 
     // MARK: Close a card (fly out, then remove for good)
 
-    private func closeCard(_ card: LCAppSwitcherCard) {
+    private func closeCard(_ card: LCAppSwitcherCard, layout: SwitcherLayout) {
         guard closingCardID == nil else {
             return
         }
         closingCardID = card.id
         closingOffsetY = 0
+        closingScale = 1
         closingOpacity = 1
-        // Fly out: straight up off the screen, fading. Only this card
-        // is topmost while flying (§10.2).
-        withAnimation(.easeInOut(duration: 0.3)) {
-            closingOffsetY = -UIScreen.main.bounds.height
+        // Fly out: up and off the screen (1.12× the card height —
+        // just enough for the centred card to clear the top),
+        // shrinking to 0.94 and fading. Only this card is topmost
+        // while flying (§10.2). 0.38 s spring-open (demo §7.2).
+        withAnimation(.spring(response: 0.38, dampingFraction: 0.85)) {
+            closingOffsetY = -layout.cardHeight * 1.12
+            closingScale = 0.94
             closingOpacity = 0
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.32) { [card] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.39) { [card] in
             finishClose(card: card)
         }
     }
@@ -765,6 +888,7 @@ struct LCAppSwitcherView: View {
     private func finishClose(card: LCAppSwitcherCard) {
         closingCardID = nil
         closingOffsetY = 0
+        closingScale = 1
         closingOpacity = 1
         switch card {
         case .guest(let guest):
@@ -799,11 +923,15 @@ struct LCAppSwitcherView: View {
         let measured = measuredSizes[card.id] ?? CGSize(width: layout.cardWidth, height: layout.cardHeight)
         let scale = max(size.width / max(1, measured.width), size.height / max(1, measured.height))
         openingCardID = card.id
-        withAnimation(.easeInOut(duration: 0.32)) {
+        // Open zoom (demo §7.3): the card scales to full screen over
+        // 0.46 s spring-open; the other cards fade out over 0.18 s.
+        withAnimation(.spring(response: 0.46, dampingFraction: 0.85)) {
             openingScale = scale
+        }
+        withAnimation(.easeOut(duration: 0.18)) {
             othersOpacity = 0
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.32) { [card] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.46) { [card] in
             openingCardID = nil
             openingScale = 1
             othersOpacity = 1

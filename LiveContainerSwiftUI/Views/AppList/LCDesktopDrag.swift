@@ -3,208 +3,293 @@
 //  LiveContainerSwiftUI
 //
 //  Desktop grid v1: drag & drop for the desktop grid, cross-page drag and
-//  Dock drag in / out. Pure SwiftUI onDrag / onDrop only; no third-party
-//  drag library.
+//  Dock drag in / out.
 //
-//  How the gestures are kept apart (see DESKTOP_GRID_V1.md for the full
-//  discussion; device verification still needed):
-//  - Tap to launch is disabled while isEditing (the cell's onTapGesture
-//    returns early), so a tap can never launch an app by accident in
-//    edit mode.
-//  - Long-press (0.5 s) enters edit mode. onDrag on iOS itself needs a
-//    press-and-hold before the drag starts, so in normal mode a long
-//    press first enters edit mode and the same touch can continue into a
-//    drag; a quick horizontal swipe never enters edit mode and goes to
-//    the pager's swipe instead.
-//  - The drag payload is the icon's id string (UTType.text). The dragged
-//    id is also kept in LCDesktopDragState so DropDelegates can act on it
-//    synchronously; DropInfo item providers are async and cannot be
-//    awaited inside dropEntered / performDrop.
-//  - Cross-page drag: while a drag is active, invisible 28pt edge zones
-//    appear at the left / right screen edges. Hovering over one starts a
-//    0.7 s timer that flips one page (and re-arms while still hovering,
-//    so holding at the edge keeps flipping). Dropping on a page's blank
-//    area lands the icon at the end of that page; dropping on the last
-//    page's blank area is allowed.
-//  - Dock drag in: dropping on the Dock inserts at the front; if the
-//    Dock is full (4), the last Dock icon is evicted back to the grid
-//    (never lost, never deleted). Drag out: the Dock leaves an empty
-//    slot and does NOT auto-fill; manual order wins from then on.
+//  Interaction model (demo spec §1, verified against the demo HTML — the
+//  spec text alone is ambiguous on one point, see below):
+//  - One gesture per icon: long-press (0.45 s, cancelled by > 9 pt of
+//    movement) sequenced into a zero-distance drag. The drag listeners
+//    attach on pointerdown regardless of edit mode, so the finger that
+//    long-pressed into edit mode can keep moving and drag immediately —
+//    no lift-and-re-press. SwiftUI's onDrag / onDrop cannot do this:
+//    onDrag's internal press recogniser claims the touch before the
+//    long-press fires, and a drag gesture attached mid-touch misses the
+//    touch. The drag is therefore implemented by hand: a ghost icon
+//    follows the finger 1:1 (grab offset preserved), the hovered cell is
+//    hit-tested from the live cell frames, and the drop commits with the
+//    demo's swap semantics (see below).
+//  - Reorder semantics (demo §1.5, free placement, no auto-fill): drop
+//    on an occupied cell SWAPS with that one cell only; all other icons
+//    stay put. Drop on an empty cell / a page's blank area lands at the
+//    end of that page. Dock → occupied grid cell: the occupant moves to
+//    the first free slot (the end of the order); the dragged icon takes
+//    the cell. Grid → Dock icon: swap — that app returns to the dragged
+//    app's original grid cell. Grid → empty Dock space: appends to the
+//    Dock (evicting the last Dock icon if full). Dock → Dock: no change
+//    (the demo flies back).
+//  - NO live reflow: the demo does not shift icons during hover. Its
+//    drag move handler only toggles the `.drop-hover` outline on the
+//    hovered cell; the reorder happens on drop (finishDrag swaps). This
+//    implementation matches that — it does not reflow during hover.
+//  - Landing (demo §1.7): on drop the ghost flies to the target cell's
+//    rect over 0.42 s on the no-overshoot curve, shrinking 1.15 → 1×
+//    with the shadow falling back; the order commits at handoff. A
+//    no-change drop flies back to the origin cell over 0.45 s.
+//    pointercancel / backgrounding cancels the drag with no commit.
+//  - Cross-page drag: while a drag is active, the finger within 24 pt
+//    of the left / right screen edge flips one page; cooldown 650 ms
+//    between flips, and the first flip needs 650 ms of dragging first
+//    (lastFlip is set at drag start).
 //
 
 import Foundation
 import SwiftUI
-import UniformTypeIdentifiers
 
-// MARK: - Shared drag state
+// MARK: - Drop target
 
-final class LCDesktopDragState: ObservableObject {
-    /// Id of the icon currently being dragged, if any.
-    @Published var draggedID: String?
-    /// Id of the cell currently hovered as a drop target (empty-slot hint).
-    @Published var dropTargetID: String?
-    /// True while the dragged icon hovers over the Dock.
-    @Published var isOverDock = false
-
-    var isDragging: Bool { draggedID != nil }
-
-    /// Set by the view: flipping one page in `direction`.
-    var flipPageAction: ((LCDesktopEdgeDirection) -> Void)?
-
-    private var edgeFlipTimer: Timer?
-
-    func beginDrag(id: String) {
-        draggedID = id
-        dropTargetID = nil
-        isOverDock = false
-    }
-
-    func endDrag() {
-        draggedID = nil
-        dropTargetID = nil
-        isOverDock = false
-        cancelEdgeFlipTimer()
-    }
-
-    /// Start the edge auto-flip timer. Fires once after 0.5 s, then
-    /// re-arms itself while the drag still hovers the edge. Was 0.7 s:
-    /// hovering at the edge felt laggy next to the iPhone home screen,
-    /// which flips after about half a second.
-    func beginEdgeFlip(direction: LCDesktopEdgeDirection) {
-        cancelEdgeFlipTimer()
-        edgeFlipTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: false) { [weak self] _ in
-            guard let self, self.draggedID != nil else {
-                return
-            }
-            self.flipPageAction?(direction)
-            self.beginEdgeFlip(direction: direction)
-        }
-    }
-
-    func cancelEdgeFlipTimer() {
-        edgeFlipTimer?.invalidate()
-        edgeFlipTimer = nil
-    }
+/// Where a drag will land, resolved by hit-testing the finger against
+/// the live cell / Dock frames. The hover highlight and the drop commit
+/// both read this one value.
+enum LCDesktopDropTarget: Equatable {
+    /// A grid cell: drop swaps with the icon in this cell.
+    case cell(id: String)
+    /// A Dock slot occupied by `iconID`: drop swaps with that app.
+    case dockSlot(index: Int, iconID: String)
+    /// On the Dock bar but not on an occupied slot: drop appends.
+    case dockAppend
+    /// Blank area of `page`: drop lands at the end of that page.
+    case pageEnd(page: Int)
+    /// Invalid spot (or no target yet): drop flies back, no change.
+    case none
 }
 
+/// Which way an edge page-flip goes.
 enum LCDesktopEdgeDirection {
     case previous
     case next
 }
 
-// MARK: - Drop delegates
+// MARK: - Frame preferences (hit-testing)
 
-/// Drop on a grid cell: the dragged icon is inserted at this cell's
-/// position, the displaced icons make room, and the cell shows an
-/// empty-slot hint while hovered.
-struct LCDesktopCellDropDelegate: DropDelegate {
-    let targetID: String
-    let dragState: LCDesktopDragState
-    /// Move the dragged icon to just before `targetID`.
-    let onMove: (String, String) -> Void
+/// Cell frames in the "desktop" coordinate space, keyed by icon id.
+/// Reported by each grid cell (background GeometryReader); the drag
+/// handler hit-tests the finger against the current page's cells.
+struct LCDesktopCellFramePreferenceKey: PreferenceKey {
+    static var defaultValue: [String: CGRect] = [:]
+    static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) {
+        value.merge(nextValue()) { $1 }
+    }
+}
 
-    func dropEntered(info: DropInfo) {
-        guard dragState.draggedID != nil else {
-            return
+/// Grid frames in the "desktop" coordinate space, keyed by page.
+/// Reported by each page's grid; a drag over a page's blank area lands
+/// at the end of that page.
+struct LCDesktopGridFramePreferenceKey: PreferenceKey {
+    static var defaultValue: [Int: CGRect] = [:]
+    static func reduce(value: inout [Int: CGRect], nextValue: () -> [Int: CGRect]) {
+        value.merge(nextValue()) { $1 }
+    }
+}
+
+/// Dock frames in the "desktop" coordinate space: the bar itself plus
+/// each of the 4 slots (occupied or empty), keyed by slot index.
+struct LCDesktopDockFrames: Equatable {
+    var bar: CGRect = .zero
+    var slots: [Int: CGRect] = [:]
+}
+
+struct LCDesktopDockFramePreferenceKey: PreferenceKey {
+    static var defaultValue: LCDesktopDockFrames = LCDesktopDockFrames()
+    static func reduce(value: inout LCDesktopDockFrames, nextValue: () -> LCDesktopDockFrames) {
+        let next = nextValue()
+        if next.bar != .zero {
+            value.bar = next.bar
         }
-        dragState.dropTargetID = targetID
+        value.slots.merge(next.slots) { $1 }
     }
+}
 
-    func dropExited(info: DropInfo) {
-        if dragState.dropTargetID == targetID {
-            dragState.dropTargetID = nil
-        }
-    }
+// MARK: - Shared drag state
 
-    func dropUpdated(info: DropInfo) -> DropProposal? {
-        return DropProposal(operation: .move)
-    }
+final class LCDesktopDragState: ObservableObject {
+    /// Long-press that enters edit mode (demo §1.3): 450 ms, cancelled
+    /// by > 9 pt of movement. In edit mode the long-press is instant
+    /// (duration 0) so an icon can be grabbed without a second hold.
+    static let longPressDuration: TimeInterval = 0.45
+    static let longPressMaxMovement: CGFloat = 9
+    /// Drag starts once the finger has moved this far after the
+    /// long-press fired (demo §1.4). This is also the drag gesture's
+    /// minimumDistance, so a tap (< 7 pt) never arms a drag and the
+    /// delete badge / tap gestures keep working.
+    static let dragStartDistance: CGFloat = 7
+    /// Edge page-flip zone + cooldown (demo §1.6).
+    static let edgeFlipZoneWidth: CGFloat = 24
+    static let edgeFlipCooldown: TimeInterval = 0.65
+    /// Landing (demo §1.7): 0.42 s, no overshoot; fly-back 0.45 s.
+    static let landingDuration: TimeInterval = 0.42
+    static let flyBackDuration: TimeInterval = 0.45
+    /// The ghost icon's lift while dragging (demo §1.4).
+    static let dragLiftScale: CGFloat = 1.15
 
-    func performDrop(info: DropInfo) -> Bool {
-        guard let draggedID = dragState.draggedID, draggedID != targetID else {
+    /// Id of the icon currently being dragged, if any.
+    @Published var draggedID: String?
+    /// The dragged icon (for the ghost tile).
+    @Published var draggedIcon: LCDesktopIcon?
+    /// True when the dragged icon came from the Dock.
+    @Published var draggedFromDock = false
+    /// The dragged icon's index in the grid order before the drag
+    /// (grid icons only). A grid → Dock swap returns the Dock app to
+    /// this cell.
+    @Published var dragOriginIndex: Int?
+    /// Where the drop will land, from the latest hit-test.
+    @Published var dropTarget: LCDesktopDropTarget = .none
+    /// Ghost centre in the "desktop" coordinate space (1:1 finger
+    /// follow, grab offset preserved).
+    @Published var ghostCenter: CGPoint = .zero
+    /// Ghost scale: 1.15 while dragging, animated to 1.0 on landing.
+    @Published var ghostScale: CGFloat = 1.0
+    /// True while the ghost is flying to its landing cell.
+    @Published var isLanding = false
+
+    /// Live frames in the "desktop" coordinate space (from the
+    /// preference keys above).
+    @Published var cellFrames: [String: CGRect] = [:]
+    @Published var gridFrames: [Int: CGRect] = [:]
+    @Published var dockFrame: CGRect = .zero
+    @Published var dockSlotFrames: [Int: CGRect] = [:]
+
+    /// Timestamp of the last edge page-flip (set at drag start, so the
+    /// first flip needs a full cooldown of dragging first).
+    var lastFlipTime: CFTimeInterval = 0
+    /// The dragged cell's frame at drag start (ghost size + fallback
+    /// landing centre).
+    var dragStartFrame: CGRect = .zero
+    /// The dragged cell's centre at drag start (the ghost's anchor).
+    var dragStartCenter: CGPoint = .zero
+    /// The finger's location when the drag phase started (the grab
+    /// offset is `dragStartLocation - dragStartCenter`).
+    var dragStartLocation: CGPoint = .zero
+
+    var isDragging: Bool { draggedID != nil }
+    /// True while the finger hovers the Dock (any Dock target).
+    var isOverDock: Bool {
+        switch dropTarget {
+        case .dockSlot, .dockAppend:
+            return true
+        default:
             return false
         }
-        dragState.dropTargetID = nil
-        onMove(draggedID, targetID)
-        return true
-    }
-}
-
-/// Drop on a page's blank area (or the grid background): the dragged icon
-/// lands at the end of that page.
-struct LCDesktopPageDropDelegate: DropDelegate {
-    let page: Int
-    let dragState: LCDesktopDragState
-    /// Move the dragged icon to the end of `page`.
-    let onMoveToPageEnd: (String, Int) -> Void
-
-    func dropEntered(info: DropInfo) {
-        dragState.dropTargetID = nil
     }
 
-    func dropUpdated(info: DropInfo) -> DropProposal? {
-        return DropProposal(operation: .move)
+    func beginDrag(icon: LCDesktopIcon, fromDock: Bool, originIndex: Int?, startCenter: CGPoint, startFrame: CGRect, startLocation: CGPoint) {
+        guard draggedID == nil, !isLanding else { return }
+        draggedID = icon.id
+        draggedIcon = icon
+        draggedFromDock = fromDock
+        dragOriginIndex = originIndex
+        dragStartCenter = startCenter
+        dragStartFrame = startFrame
+        dragStartLocation = startLocation
+        ghostCenter = startCenter
+        ghostScale = Self.dragLiftScale
+        dropTarget = .none
+        isLanding = false
+        lastFlipTime = CACurrentMediaTime()
     }
 
-    func performDrop(info: DropInfo) -> Bool {
-        guard let draggedID = dragState.draggedID else {
-            return false
+    /// The ghost starts its landing flight (0.42 s, no overshoot). The
+    /// caller animates ghostCenter / ghostScale inside withAnimation
+    /// and commits at handoff.
+    func beginLanding() {
+        guard draggedID != nil, !isLanding else { return }
+        isLanding = true
+    }
+
+    /// Handoff after the landing flight: the ghost goes away and the
+    /// drag state clears. Idempotent.
+    func finishLanding() {
+        isLanding = false
+        draggedID = nil
+        draggedIcon = nil
+        draggedFromDock = false
+        dragOriginIndex = nil
+        dropTarget = .none
+        ghostScale = 1.0
+    }
+
+    /// Cancel (pointercancel / backgrounding): no commit, the grid
+    /// restores. A landing already in flight is left to finish (the
+    /// drop was already released; its commit runs at handoff).
+    func cancelDrag() {
+        guard !isLanding else { return }
+        draggedID = nil
+        draggedIcon = nil
+        draggedFromDock = false
+        dragOriginIndex = nil
+        dropTarget = .none
+        ghostScale = 1.0
+    }
+
+    /// Backgrounding ends a drag (same as cancel).
+    func endDrag() {
+        cancelDrag()
+    }
+
+    /// The drop target only changes when the hovered cell / slot
+    /// changes, so the highlight (and any re-render) fires once per
+    /// hover change, not on every move event.
+    func setDropTarget(_ target: LCDesktopDropTarget) {
+        if dropTarget != target {
+            dropTarget = target
         }
-        onMoveToPageEnd(draggedID, page)
-        return true
     }
 }
 
-/// Hover zone at the left / right screen edge. Not a drop target itself:
-/// hovering flips pages while the drag is held at the edge.
-struct LCDesktopEdgeDropDelegate: DropDelegate {
-    let direction: LCDesktopEdgeDirection
-    let dragState: LCDesktopDragState
+// MARK: - The icon drag gesture
 
-    func dropEntered(info: DropInfo) {
-        guard dragState.draggedID != nil else {
-            return
-        }
-        dragState.beginEdgeFlip(direction: direction)
-    }
-
-    func dropExited(info: DropInfo) {
-        dragState.cancelEdgeFlipTimer()
-    }
-
-    func dropUpdated(info: DropInfo) -> DropProposal? {
-        return DropProposal(operation: .forbidden)
-    }
-
-    func performDrop(info: DropInfo) -> Bool {
-        return false
-    }
-}
-
-/// Drop on the Dock: highlight the Dock while hovering; on drop the caller
-/// inserts the icon (evicting the last Dock icon if full). The dragged id
-/// is supplied by the Dock view from the shared drag state (see
-/// LCDesktopDockView); DropInfo providers are async and cannot be awaited
-/// inside performDrop, so the delegate only signals enter / exit / drop.
-struct LCDesktopDockDropDelegate: DropDelegate {
-    let onDragEntered: () -> Void
-    let onDragExited: () -> Void
-    let onDrop: (String) -> Void
-
-    func dropEntered(info: DropInfo) {
-        onDragEntered()
-    }
-
-    func dropExited(info: DropInfo) {
-        onDragExited()
-    }
-
-    func dropUpdated(info: DropInfo) -> DropProposal? {
-        return DropProposal(operation: .move)
-    }
-
-    func performDrop(info: DropInfo) -> Bool {
-        onDrop("")
-        return true
-    }
+/// One gesture per icon: long-press (0.45 s, or instant in edit mode)
+/// sequenced into a drag (minimumDistance 7 pt), so the finger that
+/// long-pressed into edit mode can keep moving and drag immediately —
+/// no lift-and-re-press (demo §1.4). The drag listeners attach on
+/// pointerdown regardless of edit mode; a quick horizontal swipe fails
+/// the long-press (> 9 pt) and goes to the pager instead.
+///
+/// The gesture is type-erased so both the grid cell and the Dock icon
+/// can attach the same gesture from LCAppListView. The drag gesture's
+/// minimumDistance is the 7 pt drag-start threshold: a tap (or a tap
+/// on the delete badge) never arms a drag.
+func LCDesktopIconDragGesture(
+    icon: LCDesktopIcon,
+    isInDock: Bool,
+    isEditing: Bool,
+    onLongPress: @escaping (LCDesktopIcon, Bool) -> Void,
+    onDragChanged: @escaping (LCDesktopIcon, Bool, DragGesture.Value) -> Void,
+    onDragEnded: @escaping (LCDesktopIcon, Bool, DragGesture.Value) -> Void
+) -> AnyGesture<SequenceGesture<LongPressGesture, DragGesture>.Value> {
+    let longPress = LongPressGesture(
+        minimumDuration: isEditing ? 0 : LCDesktopDragState.longPressDuration,
+        maximumDistance: LCDesktopDragState.longPressMaxMovement
+    )
+    let drag = DragGesture(minimumDistance: LCDesktopDragState.dragStartDistance, coordinateSpace: .named("desktop"))
+    let sequence = longPress.sequenced(before: drag)
+    return AnyGesture(
+        sequence
+            .onChanged { value in
+                switch value {
+                case .first(let pressed):
+                    if pressed {
+                        onLongPress(icon, isInDock)
+                    }
+                case .second(_, let dragValue):
+                    if let dragValue {
+                        onDragChanged(icon, isInDock, dragValue)
+                    }
+                }
+            }
+            .onEnded { value in
+                if case .second(_, let dragValue) = value, let dragValue {
+                    onDragEnded(icon, isInDock, dragValue)
+                }
+            }
+    )
 }
