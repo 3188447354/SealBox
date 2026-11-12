@@ -295,14 +295,23 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
             // editing (§11; the edit-mode capsules own the corners
             // then). Kept below the 44pt trigger strip:
             // max(safeArea, 44) + 12 from the top.
-            if !isEditing {
-                LCSealBoxLockButton(lockStore: lockStore)
-                    .padding(.top, max(geometry.safeAreaInsets.top, 44) + 12)
-                    .padding(.trailing, 20)
-            } else {
-                EmptyView()
-            }
+            lockButtonOverlayView(topInset: geometry.safeAreaInsets.top)
         }
+        }
+    }
+
+    /// Lock-button overlay content, extracted from `desktopWindowView`
+    /// so its type is inferred on its own. (Run #24: the generic
+    /// `.apply` in that chain plus an if/else overlay content broke
+    /// the type checker's inference, and it fell back to `()`.)
+    @ViewBuilder
+    private func lockButtonOverlayView(topInset: CGFloat) -> some View {
+        if !isEditing {
+            LCSealBoxLockButton(lockStore: lockStore)
+                .padding(.top, max(topInset, 44) + 12)
+                .padding(.trailing, 20)
+        } else {
+            EmptyView()
         }
     }
 
@@ -2533,5 +2542,5 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
 }
 
 extension View {
-    func apply<V: View>(@ViewBuilder _ block: (Self) -> V) -> V { block(self) }
+    func apply<V: View>(@ViewBuilder _ block: (Self) -> V) -> some View { block(self) }
 }
