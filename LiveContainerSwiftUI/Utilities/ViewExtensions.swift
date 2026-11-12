@@ -74,6 +74,49 @@ extension View {
     }
 }
 
+/// Walk the presented-view-controller chain to the topmost controller.
+fileprivate func topmostViewController(from root: UIViewController?) -> UIViewController? {
+    var top = root
+    while let presented = top?.presentedViewController {
+        top = presented
+    }
+    return top
+}
+
+/// Present `vc` from the topmost view controller in `window`, retrying
+/// briefly while a presentation/dismissal transition is in flight.
+/// UIKit silently drops a `present` issued mid-transition. That is what
+/// broke certificate import: the file picker was presented right after
+/// the confirmation alert was confirmed, while the alert's dismissal
+/// animation was still running, so the picker never appeared and the
+/// import hung forever waiting for a picker callback. The same race hit
+/// the password prompt after the picker was dismissed. Presenting from
+/// the topmost controller also matters because Settings is a
+/// fullScreenCover over the desktop. `isStillWanted` is re-checked
+/// before every attempt so a presentation that is no longer wanted is
+/// never shown late.
+fileprivate func presentFromTopmost(
+    _ vc: UIViewController,
+    in window: UIWindow?,
+    isStillWanted: @escaping () -> Bool,
+    attempts: Int = 0
+) {
+    guard isStillWanted() else { return }
+    guard let top = topmostViewController(from: window?.rootViewController) else { return }
+    // A transition in flight, or a transient system UI (alert / picker)
+    // on top: presenting now would be silently dropped by UIKit.
+    // Wait it out and retry.
+    if top.isBeingPresented || top.isBeingDismissed
+        || top is UIAlertController || top is UIDocumentPickerViewController {
+        guard attempts < 30 else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            presentFromTopmost(vc, in: window, isStillWanted: isStillWanted, attempts: attempts + 1)
+        }
+        return
+    }
+    top.present(vc, animated: true)
+}
+
 public struct DocModifier: ViewModifier {
     @EnvironmentObject var sceneDelegate: SceneDelegate
     @State private var docController: UIDocumentPickerViewController?
@@ -102,7 +145,7 @@ public struct DocModifier: ViewModifier {
                 controller.allowsMultipleSelection = multiple
                 controller.delegate = delegate
                 self.docController = controller
-                sceneDelegate.window?.rootViewController?.present(controller, animated: true)
+                presentFromTopmost(controller, in: sceneDelegate.window) { self.isPresented }
             } else if !isPresented, let docController = docController {
                 docController.dismiss(animated: true)
                 self.docController = nil
@@ -152,7 +195,7 @@ public struct TextFieldAlertModifier: ViewModifier {
             if isPresented, alertController == nil {
                 let alertController = makeAlertController()
                 self.alertController = alertController
-                sceneDelegate.window?.rootViewController?.present(alertController, animated: true)
+                presentFromTopmost(alertController, in: sceneDelegate.window) { self.isPresented }
             } else if !isPresented, let alertController = alertController {
                 alertController.dismiss(animated: true)
                 self.alertController = nil
