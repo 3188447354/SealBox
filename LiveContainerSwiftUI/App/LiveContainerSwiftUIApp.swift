@@ -16,8 +16,6 @@ struct LiveContainerSwiftUIApp : SwiftUI.App {
         var tempTweakFolderNames : [String] = []
         
         var tempApps: [LCAppModel] = []
-        var tempArm32EmuApps: [LCAppModel] = []
-        var tempHiddenApps: [LCAppModel] = []
         var tempURLSchemes: Set<String>? = DataManager.shared.model.multiLCStatus != 2 ? Set() : nil
 
         do {
@@ -32,15 +30,11 @@ struct LiveContainerSwiftUIApp : SwiftUI.App {
                 newApp.relativeBundlePath = appDir
                 newApp.isShared = false
                 let model = LCAppModel(appInfo: newApp)
-                if newApp.isHidden {
-                    tempHiddenApps.append(model)
-                } else {
-                    tempApps.append(model)
-                    tempURLSchemes?.formUnion(newApp.urlSchemes() as! [String])
-                }
-                if newApp.is32bitEmulator {
-                    tempArm32EmuApps.append(model)
-                }
+                // Hidden apps are gone (the demo has no such concept):
+                // every installed app is visible, and its URL schemes
+                // are registered.
+                tempApps.append(model)
+                tempURLSchemes?.formUnion(newApp.urlSchemes() as! [String])
             }
             if LCPath.lcGroupDocPath != LCPath.docPath {
                 try fm.createDirectory(at: LCPath.lcGroupBundlePath, withIntermediateDirectories: true)
@@ -53,15 +47,8 @@ struct LiveContainerSwiftUIApp : SwiftUI.App {
                     newApp.relativeBundlePath = appDir
                     newApp.isShared = true
                     let model = LCAppModel(appInfo: newApp)
-                    if newApp.isHidden {
-                        tempHiddenApps.append(model)
-                    } else {
-                        tempApps.append(model)
-                        tempURLSchemes?.formUnion(newApp.urlSchemes() as! [String])
-                    }
-                    if newApp.is32bitEmulator {
-                        tempArm32EmuApps.append(model)
-                    }
+                    tempApps.append(model)
+                    tempURLSchemes?.formUnion(newApp.urlSchemes() as! [String])
                 }
             }
             // load document folders
@@ -91,8 +78,6 @@ struct LiveContainerSwiftUIApp : SwiftUI.App {
         }
         
         DataManager.shared.model.apps = tempApps
-        DataManager.shared.model.arm32EmuApps = tempArm32EmuApps
-        DataManager.shared.model.hiddenApps = tempHiddenApps
         DataManager.shared.model.appDataFolderNames = tempAppDataFolderNames
         DataManager.shared.model.tweakFolderNames = tempTweakFolderNames
         if let tempURLSchemes {
@@ -102,10 +87,9 @@ struct LiveContainerSwiftUIApp : SwiftUI.App {
     
     var body: some Scene {
         WindowGroup(id: "Main") {
-            LCTabView()
+            LCSealBoxRootView()
                 .handlesExternalEvents(preferring: ["*"], allowing: ["*"])
                 .environmentObject(DataManager.shared.model)
-                .environmentObject(LCAppSortManager.shared)
         }
         
         if UIApplication.shared.supportsMultipleScenes, #available(iOS 16.1, *) {
