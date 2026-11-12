@@ -304,6 +304,16 @@ final class LCDesktopDragState: ObservableObject {
 /// it carries no edit-dependent parameter at all and gates on
 /// LCDesktopDragState.isEditingForDrag at event time.
 ///
+/// GUARD — the tap on the icon must stay NORMAL priority (see
+/// LCDesktopGridCell): a high-priority tap outranks this sequence,
+/// so the long-press can never succeed while the tap is still
+/// possible, and the tap only fails past its ~10 pt tolerance —
+/// already past this gesture's 9 pt maxDistance. That deadlock
+/// made `beginDrag` unreachable from grid icons (the "drag is
+/// completely gone" report, 2026-11-12): hold still and the tap
+/// stays alive, move and the long-press fails first. Never raise
+/// the icon tap back to high-priority.
+///
 /// The gesture is type-erased so both the grid cell and the Dock icon
 /// can attach the same gesture from LCAppListView. The drag gesture's
 /// minimumDistance is the 7 pt drag-start threshold: a tap (or a tap

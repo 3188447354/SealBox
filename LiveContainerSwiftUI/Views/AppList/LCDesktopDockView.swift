@@ -16,7 +16,9 @@
 //
 //  Dragging (demo §4): Dock icons use the same long-press → drag gesture
 //  as the grid (see LCDesktopIconDragGesture in LCDesktopDrag.swift),
-//  passed in as `dragGestureFor`. A drop on an occupied Dock slot swaps
+//  passed in as `dragGestureFor`, plus the same edit-mode instant drag
+//  as the grid (`editDragGestureFor`): in edit mode a Dock icon is
+//  grabbed by moving > 7 pt, with no hold. A drop on an occupied Dock slot swaps
 //  with that app (it returns to the dragged app's original grid cell);
 //  a drop on empty Dock space appends (evicting the last Dock icon if
 //  full). Dragging a Dock icon onto another Dock slot is a no-change
@@ -47,12 +49,24 @@ struct LCDesktopDockView: View {
     let draggedID: String?
     /// The Dock slot currently hovered as a drop target (swap), if any.
     let dropTargetSlot: Int?
+    /// Drag state (reference type): the tap handler reads
+    /// `isDragging` / `isLanding` from it AT TAP TIME, so a tap
+    /// that fires on the same lift-off as a drag release stands down
+    /// (demo §1.7 suppressClick). Passed as a plain `let`, not
+    /// @ObservedObject: the Dock must not re-render on drag-state
+    /// changes, the parent already re-renders it with the drag flags
+    /// it needs. Same pattern as LCDesktopGridCell.
+    let dragState: LCDesktopDragState
 
     var onTapIcon: (LCDesktopIcon) -> Void
     var onDeleteIcon: (LCDesktopIcon) -> Void
     /// The long-press → drag gesture for a Dock icon (built by the
     /// caller, same gesture as the grid cells).
     var dragGestureFor: (LCDesktopIcon) -> AnyGesture<SequenceGesture<LongPressGesture, DragGesture>.Value>
+    /// The edit-mode instant drag for a Dock icon (built by the
+    /// caller, same gesture as the grid cells): in edit mode a Dock
+    /// icon is grabbed by moving > 7 pt, with no hold (demo §1.4).
+    var editDragGestureFor: (LCDesktopIcon) -> AnyGesture<DragGesture.Value>
 
     /// Jiggle phase driver (demo §2.2): flipped on edit-mode entry so
     /// the repeatForever animation oscillates from the `from` angle.
@@ -189,14 +203,37 @@ struct LCDesktopDockView: View {
                         }
                 )
                 .onTapGesture {
+                    // Drag-release suppression (demo §1.7): a drag
+                    // that moved only just past the 7 pt drag
+                    // threshold can still pass the tap recogniser's
+                    // own movement tolerance, so the release would
+                    // fire BOTH the drop and this tap. The drag state
+                    // is read live here: at lift-off it is either
+                    // still dragging (this tap fires first) or already
+                    // landing (the drag's onEnded fired first), so one
+                    // of the two flags is always set for a real drag
+                    // release and the tap stands down — the app must
+                    // not launch right after a Dock drop. The "−"
+                    // badge is a sibling Button, not a descendant of
+                    // this tile, so tapping it does not fire this
+                    // gesture.
                     // Edit-mode taps open the app (demo §2.5 / P2-28);
                     // the exit from edit mode happens in
-                    // desktopIconTapped. The "−" badge is a sibling
-                    // Button, not a descendant of this tile, so
-                    // tapping it does not fire this gesture.
+                    // desktopIconTapped.
+                    guard !dragState.isDragging, !dragState.isLanding else { return }
                     onTapIcon(icon)
                 }
                 .gesture(dragGestureFor(icon))
+                // Edit-mode instant drag (demo §1.4, Q5): the plain
+                // drag that lets a Dock icon be grabbed in edit mode
+                // by moving > 7 pt, with no hold — the same gesture
+                // the grid cells carry. It gates on
+                // `isEditingForDrag` at event time, so a page swipe
+                // or a non-edit touch is unaffected, and it is
+                // simultaneous with the sequence above, so the two
+                // never fight over one touch (`beginDrag` refuses a
+                // second drag while one is active).
+                .simultaneousGesture(editDragGestureFor(icon))
 
             if isEditing {
                 Button {

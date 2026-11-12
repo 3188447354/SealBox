@@ -231,18 +231,29 @@ struct LCDesktopGridCell: View {
         // The delete badge's scale/opacity transition (badge-in) is
         // driven by the edit-mode change.
         .animation(.spring(response: 0.38, dampingFraction: 0.6), value: isEditing)
-        // High-priority tap: without this, a tap on an icon in edit
-        // mode ALSO fires the desktop container's tap-to-exit-edit
-        // gesture (SwiftUI delivers the tap to ancestor gestures too),
-        // so tapping any icon would silently leave edit mode. The
-        // high-priority tap claims the touch first.
-        // Edit-mode taps open the app (demo §2.5 / P2-28: opening
-        // exits edit mode, in desktopIconTapped) instead of doing
-        // nothing as before. The tap is deferred one runloop: a tap
-        // on the delete badge fires this gesture on the same
-        // touch-up as the badge button, and by the next runloop the
-        // button has set badgeJustTapped, so the badge tap stands
-        // down here and never opens the app.
+        // Normal-priority tap (NOT high-priority): a high-priority
+        // tap on this cell deadlocks the drag. The long-press → drag
+        // sequence lives on the parent (LCAppListView attaches it to
+        // the cell); a high-priority tap outranks it, so the
+        // long-press can never succeed while the tap is still
+        // possible — and the tap only fails once the finger moves
+        // past its tolerance (~10 pt), which is already past the
+        // long-press's 9 pt maxDistance (LCDesktopDragState).
+        // Hold still: tap alive, long-press held forever. Move:
+        // long-press fails first. Net: beginDrag was unreachable
+        // from a grid icon — the "drag is completely gone" report.
+        // With a normal tap the parent sequence wins the hold
+        // (long-press fires at 0.45 s, the tap fails) and the tap
+        // wins the quick lift (the sequence never armed) — first
+        // to succeed wins, both paths work.
+        // The ancestor desktop tap-to-exit-edit may also fire on an
+        // icon tap; that is harmless now (P2-28): desktopIconTapped
+        // exits edit mode itself on every icon tap, so the ancestor
+        // tap firing as well changes nothing. The tap is deferred
+        // one runloop: a tap on the delete badge fires this gesture
+        // on the same touch-up as the badge button, and by the next
+        // runloop the button has set badgeJustTapped, so the badge
+        // tap stands down here and never opens the app.
         // Drag-release suppression (demo §1.7): a drag that moved
         // only just past the 7 pt drag threshold can still pass the
         // tap recogniser's own movement tolerance, so the release
@@ -251,20 +262,18 @@ struct LCDesktopGridCell: View {
         // (this tap fires first) or already landing (the drag's
         // onEnded fired first), so one of the two flags is always
         // set for a real drag release and the tap stands down.
-        .highPriorityGesture(
-            TapGesture().onEnded {
-                DispatchQueue.main.async {
-                    if badgeJustTapped {
-                        badgeJustTapped = false
-                        return
-                    }
-                    if dragState.isDragging || dragState.isLanding {
-                        return
-                    }
-                    onTap()
+        .onTapGesture {
+            DispatchQueue.main.async {
+                if badgeJustTapped {
+                    badgeJustTapped = false
+                    return
                 }
+                if dragState.isDragging || dragState.isLanding {
+                    return
+                }
+                onTap()
             }
-        )
+        }
         // Frame reporting for the drag hit-test: the cell's rect in
         // the "desktop" coordinate space.
         .background(

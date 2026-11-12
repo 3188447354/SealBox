@@ -224,6 +224,16 @@ struct LCAppListView : View, LCAppModelDelegate {
                 }
 
                 desktopPagesView
+                    // The grid takes exactly the height that is left
+                    // after the fixed rows below it: without this cap
+                    // the paging TabView reports its full 6-row ideal
+                    // height (~560 pt) and the VStack overflows on
+                    // short screens / with a second page, pushing the
+                    // fixed system-icons row — Settings included —
+                    // under the Dock. The grid is top-aligned, so a
+                    // shorter grid only hides empty bottom slots.
+                    .frame(maxHeight: desktopPagesMaxHeight(in: geometry), alignment: .top)
+                    .clipped()
                 desktopSystemIconsRow
                 desktopPageDots
             }
@@ -346,11 +356,6 @@ struct LCAppListView : View, LCAppModelDelegate {
     private var desktopShellView: some View {
         desktopWindowView
         .coordinateSpace(name: "scroll")
-        // The "desktop" coordinate space: the drag gesture, the cell /
-        // grid / Dock frame reports and the ghost all resolve in it, so
-        // hit-testing and the ghost position share one origin (the
-        // screen's top-left).
-        .coordinateSpace(name: "desktop")
         // Drag hit-test frames (see LCDesktopDragState).
         .onPreferenceChange(LCDesktopCellFramePreferenceKey.self) { frames in
             desktopDrag.cellFrames = frames
@@ -466,6 +471,13 @@ struct LCAppListView : View, LCAppModelDelegate {
                 darkModeIcon: darkModeIcon,
                 draggedID: desktopDrag.draggedID,
                 dropTargetSlot: dockDropTargetSlot,
+                // Drag state (reference type): the Dock tap handler
+                // reads `isDragging` / `isLanding` from it AT TAP
+                // TIME, so a tap that fires on the same lift-off as
+                // a drag release stands down (demo §1.7
+                // suppressClick) — the same pattern as
+                // LCDesktopGridCell.
+                dragState: desktopDrag,
                 onTapIcon: { icon in
                     desktopIconTapped(icon)
                 },
@@ -479,6 +491,15 @@ struct LCAppListView : View, LCAppModelDelegate {
                 },
                 dragGestureFor: { icon in
                     desktopIconDragGesture(for: icon, isInDock: true)
+                },
+                // Edit-mode instant drag (demo §1.4, Q5): the same
+                // plain drag the grid cells carry — a Dock icon in
+                // edit mode is grabbed by moving > 7 pt, with no
+                // hold. Without it the Dock only had the 0.45 s
+                // sequence, so in edit mode Dock icons could not be
+                // dragged out the way grid icons drag around.
+                editDragGestureFor: { icon in
+                    desktopIconEditDragGesture(for: icon, isInDock: true)
                 }
             )
             // Dock follow (demo §7.1 / §8.3): while the switcher is
@@ -496,6 +517,22 @@ struct LCAppListView : View, LCAppModelDelegate {
             .animation(.spring(response: 0.35, dampingFraction: 0.85), value: guestZoomActive)
         }
         .ignoresSafeArea(.keyboard, edges: .bottom)
+        // The "desktop" coordinate space: the drag gesture, the cell /
+        // grid / Dock frame reports and the ghost all resolve in it, so
+        // hit-testing and the ghost position share one origin (the
+        // screen's top-left). It MUST sit here, on the outermost shell
+        // — not on desktopWindowView. The Dock is attached via
+        // safeAreaInset below, i.e. a sibling subtree of the window
+        // view, not its descendant: a space declared on the window
+        // view is invisible to the Dock's GeometryReaders, so the
+        // Dock's bar/slot frames never resolved and hitTestDropTarget
+        // could never match the Dock (drag-into-Dock dead, Dock
+        // drag-out ghost centred on a fallback frame). Declared here
+        // it covers both the grid and the Dock. The origin is
+        // unchanged (shell top-left = screen top-left, same as the
+        // window view's), so every grid frame resolves to the same
+        // rect as before.
+        .coordinateSpace(name: "desktop")
     }
 
     /// Alerts, sheets, full-screen covers and dialogs
@@ -1785,6 +1822,32 @@ struct LCAppListView : View, LCAppModelDelegate {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
+    /// Max height for the paging grid, measured from the GeometryReader
+    /// that owns the desktop: the whole VStack must fit the screen
+    /// above the Dock (the Dock + home-bar strip already shrink the
+    /// GeometryReader), and the system-icons row is the VStack's last
+    /// child, so the grid — never the row — absorbs any shortfall.
+    /// A maxHeight (not a fixed height) is deliberate: the VStack
+    /// measures the real pill heights, so if the estimates below are
+    /// off by a few points the grid still takes exactly the remaining
+    /// space instead of overflowing. The row's own height is fixed:
+    /// 60 pt tile + 4 pt spacing + ~15 pt label (12 pt font) + 4 pt
+    /// top padding — if the tile size in systemIconCell ever changes,
+    /// update this number with it. Dots are 8 pt + 16 pt vertical
+    /// padding + 4 pt tap padding, only when there is a second page.
+    private func desktopPagesMaxHeight(in geometry: GeometryProxy) -> CGFloat {
+        let systemRow: CGFloat = 60 + 4 + 15 + 4
+        let dots: CGFloat = desktopPageCount > 1 ? 8 + 16 + 4 : 0
+        let search: CGFloat = showSearchBar ? 46 : 0
+        let install: CGFloat = installprogressVisible ? 48 : 0
+        return max(
+            0,
+            geometry.size.height
+                - geometry.safeAreaInsets.top
+                - systemRow - dots - search - install
+        )
+    }
+
     private var desktopPagesView: some View {
         // TabView + .page: chosen over a horizontal ScrollView because
         // paging, selection binding (for the dots) and swipe-to-flip work
@@ -1845,7 +1908,26 @@ struct LCAppListView : View, LCAppModelDelegate {
                                 cell
                             } else {
                                 cell
-                                    .gesture(desktopIconDragGesture(for: icon, isInDock: false))
+                                    // High-priority: the grid lives in a
+                                    // paging TabView, and an ancestor's
+                                    // page-swipe pan otherwise claims a
+                                    // horizontal move and cancels the
+                                    // in-flight drag. High priority
+                                    // inverts that for the hold-then-drag
+                                    // path (the long-press succeeds
+                                    // while the finger is still, so the
+                                    // pager must wait for this gesture
+                                    // to fail — it never does mid-drag).
+                                    // A page swipe starting on an icon
+                                    // still works: the long-press fails
+                                    // as soon as the finger moves past
+                                    // 9 pt, so the pager is delayed by
+                                    // one flick, not blocked. The cell's
+                                    // tap is normal-priority (see
+                                    // LCDesktopGridCell), so the
+                                    // hold still wins the tap and the
+                                    // quick lift still wins the drag.
+                                    .highPriorityGesture(desktopIconDragGesture(for: icon, isInDock: false))
                                     // Edit-mode instant drag (demo
                                     // §1.4, Q5): the plain drag that
                                     // lets an icon be grabbed in edit
@@ -2551,23 +2633,23 @@ struct LCAppListView : View, LCAppModelDelegate {
     /// - a page swipe starting on an icon: the flag is still false
     ///   (the long-press fails past 9 pt), so the moves are ignored
     ///   and the TabView flips the page as before.
-    /// Both gestures call the same handlers, and both are safe to
-    /// fire for one touch: `beginDrag` refuses a second drag while
-    /// one is active, and `desktopIconDragEnded` refuses a second
-    /// landing while one is in flight. Attached to grid cells only:
-    /// the Dock's gestures live in LCDesktopDockView (out of scope
-    /// for this fix), where the now-constant 0.45 s sequence gives
-    /// hold-then-drag instead of instant grab.
-    private func desktopIconEditDragGesture(for icon: LCDesktopIcon, isInDock: Bool) -> some Gesture {
-        DragGesture(minimumDistance: LCDesktopDragState.dragStartDistance, coordinateSpace: .named("desktop"))
-            .onChanged { value in
-                guard desktopDrag.isEditingForDrag else { return }
-                desktopIconDragChanged(icon: icon, isInDock: isInDock, value: value)
-            }
-            .onEnded { value in
-                guard desktopDrag.isDragging else { return }
-                desktopIconDragEnded(icon: icon, isInDock: isInDock, value: value)
-            }
+    /// Attached to grid cells AND Dock icons: the Dock's gestures
+    /// live in LCDesktopDockView, which takes this as
+    /// `editDragGestureFor` (type-erased, so it can cross the view
+    /// boundary). Grid and Dock share the same handlers, so a Dock
+    /// icon drags out exactly like a grid icon drags in.
+    private func desktopIconEditDragGesture(for icon: LCDesktopIcon, isInDock: Bool) -> AnyGesture<DragGesture.Value> {
+        AnyGesture(
+            DragGesture(minimumDistance: LCDesktopDragState.dragStartDistance, coordinateSpace: .named("desktop"))
+                .onChanged { value in
+                    guard desktopDrag.isEditingForDrag else { return }
+                    desktopIconDragChanged(icon: icon, isInDock: isInDock, value: value)
+                }
+                .onEnded { value in
+                    guard desktopDrag.isDragging else { return }
+                    desktopIconDragEnded(icon: icon, isInDock: isInDock, value: value)
+                }
+        )
     }
 
     /// The Dock slot currently hovered as a drop target (swap), if any.
