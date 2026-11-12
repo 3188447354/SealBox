@@ -26,7 +26,9 @@ struct LiveContainerSwiftUIApp : SwiftUI.App {
                 if !appDir.hasSuffix(".app") {
                     continue
                 }
-                let newApp = LCAppInfo(bundlePath: "\(LCPath.bundlePath.path)/\(appDir)")!
+                guard let newApp = LCAppInfo(bundlePath: "\(LCPath.bundlePath.path)/\(appDir)") else {
+                    continue
+                }
                 newApp.relativeBundlePath = appDir
                 newApp.isShared = false
                 let model = LCAppModel(appInfo: newApp)
@@ -34,7 +36,7 @@ struct LiveContainerSwiftUIApp : SwiftUI.App {
                 // every installed app is visible, and its URL schemes
                 // are registered.
                 tempApps.append(model)
-                tempURLSchemes?.formUnion(newApp.urlSchemes() as! [String])
+                tempURLSchemes?.formUnion(newApp.urlSchemes() as? [String] ?? [])
             }
             if LCPath.lcGroupDocPath != LCPath.docPath {
                 try fm.createDirectory(at: LCPath.lcGroupBundlePath, withIntermediateDirectories: true)
@@ -43,12 +45,14 @@ struct LiveContainerSwiftUIApp : SwiftUI.App {
                     if !appDir.hasSuffix(".app") {
                         continue
                     }
-                    let newApp = LCAppInfo(bundlePath: "\(LCPath.lcGroupBundlePath.path)/\(appDir)")!
+                    guard let newApp = LCAppInfo(bundlePath: "\(LCPath.lcGroupBundlePath.path)/\(appDir)") else {
+                        continue
+                    }
                     newApp.relativeBundlePath = appDir
                     newApp.isShared = true
                     let model = LCAppModel(appInfo: newApp)
                     tempApps.append(model)
-                    tempURLSchemes?.formUnion(newApp.urlSchemes() as! [String])
+                    tempURLSchemes?.formUnion(newApp.urlSchemes() as? [String] ?? [])
                 }
             }
             // load document folders
