@@ -28,9 +28,11 @@
 //  不是本文件的缺口（见汇报）。卡片为空时显示中性空状态，不拼凑假卡片。
 //
 //  未编译、未真机验证（本机无 Xcode/Swift）：dismissWindow 的 (id:value:)
-//  签名已按 WindowGroup(id: "appView", for: String.self) 对过，iOS 15
-//  部署目标的引用问题靠调用点 `if #available(iOS 17.0, *)` 守卫
-//  （存储属性上不能加 @available）；场景销毁是否彻底，须在 Mac /
+//  签名已按 WindowGroup(id: "appView", for: String.self) 对过。iOS 15
+//  部署目标下 @Environment(\.dismissWindow) 连声明都不能出现在本视图
+//  （存储属性上不能加 @available），所以它住在 @available(iOS 17.0, *)
+//  的 AppViewWindowDismisser 里，由本视图的 ZStack 在
+//  `if #available(iOS 17.0, *)` 内挂载；场景销毁是否彻底，须在 Mac /
 //  CI 上先编后真机走查。
 //
 
@@ -312,6 +314,36 @@ private struct CardSizePreferenceKey: PreferenceKey {
     }
 }
 
+/// iOS 17.0+ only: owns the dismissWindow environment value and
+/// dismisses guest appView scenes on request.
+///
+/// The `dismissWindow` environment key is iOS 17.0+, so the
+/// @Environment cannot be declared on LCAppSwitcherView at all:
+/// the deployment target is iOS 15.0 and a stored property cannot
+/// carry @available. It lives here, behind the type-level gate.
+/// The parent mounts this view inside `if #available(iOS 17.0, *)`
+/// and signals a dismissal by appending to `pendingDataUUIDs`;
+/// this view dismisses each listed scene and clears the list.
+/// On iOS 15/16 the view is never mounted, so the list is never
+/// read and scenes are simply not dismissed (unchanged behaviour).
+@available(iOS 17.0, *)
+private struct AppViewWindowDismisser: View {
+    @Environment(\.dismissWindow) private var dismissWindow
+    @Binding var pendingDataUUIDs: [String]
+
+    var body: some View {
+        Color.clear
+            .onChange(of: pendingDataUUIDs) { _, newValue in
+                for dataUUID in newValue {
+                    dismissWindow(id: "appView", value: dataUUID)
+                }
+                if !newValue.isEmpty {
+                    pendingDataUUIDs = []
+                }
+            }
+    }
+}
+
 struct LCAppSwitcherView: View {
     /// Track clearance above and below the cards (§10.2: 54px each side).
     static let trackPadding: CGFloat = 54
@@ -328,15 +360,14 @@ struct LCAppSwitcherView: View {
     /// and presents the page.
     var onOpenSystem: (LCSystemPage) -> Void
 
-    // dismissWindow is iOS 17.0+, but this target still deploys to
-    // iOS 15.0 (LiveContainerSwiftUI: IPHONEOS_DEPLOYMENT_TARGET =
-    // 15.0). A stored property cannot be marked potentially
-    // unavailable with @available, so the property carries none;
-    // the only use is inside `if #available(iOS 17.0, *)` in
-    // finishClose. The (id:value:) signature matches
-    // WindowGroup(id: "appView", for: String.self) in
-    // LiveContainerSwiftUIApp.swift:112.
-    @Environment(\.dismissWindow) private var dismissWindow
+    /// dataUUIDs of guest scenes waiting to be dismissed (iOS 17.0+).
+    /// finishClose appends; AppViewWindowDismisser dismisses each and
+    /// clears the list. A plain [String] so it compiles on iOS 15.0 —
+    /// the dismissWindow environment value itself cannot live here
+    /// (see AppViewWindowDismisser). The (id:value:) signature
+    /// matches WindowGroup(id: "appView", for: String.self) in
+    /// LiveContainerSwiftUIApp.swift:112.
+    @State private var pendingDismissDataUUIDs: [String] = []
     @StateObject private var dragState = LCAppSwitcherDragState()
 
     /// Continuous focus position in card-index space (1.0 = card 1
@@ -392,6 +423,14 @@ struct LCAppSwitcherView: View {
                         .background(Capsule().fill(.ultraThinMaterial))
                 } else {
                     cardsLayer(size: size, layout: layout)
+                }
+
+                // iOS 17.0+ only: the view that owns the dismissWindow
+                // environment value (see AppViewWindowDismisser). It
+                // is invisible and never intercepts touches.
+                if #available(iOS 17.0, *) {
+                    AppViewWindowDismisser(pendingDataUUIDs: $pendingDismissDataUUIDs)
+                        .allowsHitTesting(false)
                 }
             }
             .onAppear {
@@ -733,9 +772,11 @@ struct LCAppSwitcherView: View {
             // Ask the system to dismiss the WindowGroup scene. The
             // scene may need its own terminate to fully die — verify
             // on a real device (see the file header).
-            if #available(iOS 17.0, *) {
-                dismissWindow(id: "appView", value: guest.dataUUID)
-            }
+            // The request goes through AppViewWindowDismisser (the
+            // only place that may touch dismissWindow, iOS 17.0+):
+            // on iOS 15/16 there is no dismisser view, so the entry
+            // simply sits unread and the scene is not dismissed.
+            pendingDismissDataUUIDs.append(guest.dataUUID)
         case .system:
             // The system page is closed by the caller: removing the
             // card here is enough; the caller re-opens the desktop.
