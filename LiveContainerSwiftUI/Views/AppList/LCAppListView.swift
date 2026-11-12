@@ -184,22 +184,14 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
         _installOptions = State(initialValue: [])
     }
     
-    var body: some View {
-        // SealBox is a virtual phone inside an app: the home screen is
-        // a phone home screen, not an app list. No NavigationView, no
-        // title, no search bar, no toolbar, no Tab Bar shell — just the
-        // wallpaper, the icon grid, the page dots and the pinned Dock.
-        // The LCTabView that hosts this view still exists as the app
-        // root (it owns deep links, crash checks and the download
-        // alert); its Tab Bar stays hidden here via
-        // .hideDesktopTabBar() (iOS 16+; on iOS 15 it still shows —
-        // known gap, see DESKTOP_GRID_V1.md).
-        // The TabView page lays its content out edge-to-edge, so the
-        // grid would start at y=0 under the status bar (MJ's 02:56
-        // screenshot: the time was hidden behind the first row of
-        // icons). Read the real safe-area inset and pad the content
-        // below the status bar by exactly that much; the wallpaper
-        // still fills the whole screen behind everything.
+    /// The desktop window itself: wallpaper, icon grid,
+    /// page dots and the drag ghost, plus the home-bar
+    /// shell transforms (shrink / corner radius / the
+    /// control-centre trigger and lock-button overlays).
+    /// Split out of `body` so the type checker sees a
+    /// smaller expression per property: the whole body
+    /// in one expression timed the checker out.
+    private var desktopWindowView: some View {
         GeometryReader { geometry in
         ZStack {
             // Wallpaper fills the whole phone screen, behind everything
@@ -310,6 +302,14 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
             }
         }
         }
+    }
+
+    /// Shell modifiers on the desktop window: coordinate
+    /// spaces, drag frame reports, status bar, appear /
+    /// change hooks, tab-bar hiding, colour scheme and
+    /// the pinned home-bar strip and Dock.
+    private var desktopShellView: some View {
+        desktopWindowView
         .coordinateSpace(name: "scroll")
         // The "desktop" coordinate space: the drag gesture, the cell /
         // grid / Dock frame reports and the ghost all resolve in it, so
@@ -461,6 +461,12 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
             .animation(.spring(response: 0.42, dampingFraction: 0.85), value: showSwitcher)
         }
         .ignoresSafeArea(.keyboard, edges: .bottom)
+    }
+
+    /// Alerts, sheets, full-screen covers and dialogs
+    /// on the desktop shell.
+    private var desktopDialogsView: some View {
+        desktopShellView
         .alert("lc.common.error".loc, isPresented: $errorShow){
             Button("lc.common.ok".loc, action: {
             })
@@ -620,6 +626,25 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
                 Task { await installFromUrl(urlStr: installUrl.absoluteString) }
             }
         }
+    }
+
+    var body: some View {
+        // SealBox is a virtual phone inside an app: the home screen is
+        // a phone home screen, not an app list. No NavigationView, no
+        // title, no search bar, no toolbar, no Tab Bar shell — just the
+        // wallpaper, the icon grid, the page dots and the pinned Dock.
+        // The LCTabView that hosts this view still exists as the app
+        // root (it owns deep links, crash checks and the download
+        // alert); its Tab Bar stays hidden here via
+        // .hideDesktopTabBar() (iOS 16+; on iOS 15 it still shows —
+        // known gap, see DESKTOP_GRID_V1.md).
+        // The TabView page lays its content out edge-to-edge, so the
+        // grid would start at y=0 under the status bar (MJ's 02:56
+        // screenshot: the time was hidden behind the first row of
+        // icons). Read the real safe-area inset and pad the content
+        // below the status bar by exactly that much; the wallpaper
+        // still fills the whole screen behind everything.
+        desktopDialogsView
         .fullScreenCover(item: $systemPage) { page in
             // Full-screen cover (not a sheet, not a NavigationLink):
             // the three Views each embed their own NavigationView
@@ -749,7 +774,6 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
             }
         }
         .animation(.spring(response: 0.58, dampingFraction: 0.8), value: showControlCenter)
-
     }
     
     var JITEnablingModal : some View {
@@ -1993,7 +2017,10 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
     /// Follows the finger: ghost position, edge page-flip, drop target.
     private func updateDesktopDrag(value: DragGesture.Value) {
         let location = value.location
-        desktopDrag.ghostCenter = desktopDrag.dragStartCenter + (location - desktopDrag.dragStartLocation)
+        desktopDrag.ghostCenter = CGPoint(
+            x: desktopDrag.dragStartCenter.x + (location.x - desktopDrag.dragStartLocation.x),
+            y: desktopDrag.dragStartCenter.y + (location.y - desktopDrag.dragStartLocation.y)
+        )
         // Edge page-flip (demo §1.6): a 24 pt zone at each screen
         // edge, 650 ms cooldown, and the first flip needs 650 ms of
         // dragging first (lastFlip is set at drag start). The hover

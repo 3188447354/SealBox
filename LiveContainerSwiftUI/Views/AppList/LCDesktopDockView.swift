@@ -143,7 +143,7 @@ struct LCDesktopDockView: View {
 
     private func emptySlot(slot: Int) -> some View {
         let isDropTarget = dropTargetSlot == slot
-        RoundedRectangle(cornerRadius: 56 * 0.2667)
+        return RoundedRectangle(cornerRadius: 56 * 0.2667)
             .strokeBorder(
                 style: StrokeStyle(lineWidth: isDropTarget ? 2 : 1.5, dash: isDropTarget ? [] : [4, 4])
             )
