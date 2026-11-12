@@ -81,45 +81,42 @@ public final class DownloadHelper : ObservableObject {
     }
 }
 
+/// Download progress sheet content (demo §11.1 bottom sheet).
+/// The engine (DownloadHelper.download) is untouched; this is only
+/// the presentation. The sheet shows real progress (progress bar +
+/// downloaded / total bytes) and a Cancel button that cancels the
+/// download. Tapping the scrim or dragging the grabber down only
+/// hides the sheet — the download keeps running in the background
+/// (hiding progress must never cancel a download by accident).
 struct DownloadAlert : View {
     @StateObject var helper : DownloadHelper
     var body: some View {
-        
-        Color.black.opacity(0.2) // Semi-transparent grey background
-            .edgesIgnoringSafeArea(.all) // Covers entire screen
-        
-        VStack {
+        VStack(spacing: 12) {
             Text("lc.download.downloading".loc)
                 .font(.headline)
-                .padding(.top)
-            
+
             ProgressView(value: helper.downloadProgress, total: 1)
-                .padding()
-            
+
             Text("\(formatBytes(helper.downloadedSize)) / \(formatBytes(helper.totalSize))")
                 .font(.subheadline)
-                .padding(.bottom)
-            
-            Button(action: cancelDownload) {
-                Text("lc.common.cancel".loc)
-                    .foregroundColor(.red)
-                    .padding(.bottom)
+                .foregroundStyle(.secondary)
+
+            Divider()
+
+            LCBottomSheetActionRow(title: "lc.common.cancel".loc, role: .destructive) {
+                cancelDownload()
             }
         }
-        .frame(width: 300)
-        .background(Color(UIColor.secondarySystemBackground))
-        .cornerRadius(12)
-        .shadow(radius: 10)
-        .padding()
+        .padding(.top, 4)
     }
-    
+
     private func formatBytes(_ bytes: Int64) -> String {
         let formatter = ByteCountFormatter()
         formatter.allowedUnits = [.useKB, .useMB, .useGB] // Allow KB, MB, and GB
         formatter.countStyle = .file
         return formatter.string(fromByteCount: bytes)
     }
-    
+
     func cancelDownload() {
         helper.cancel()
     }
@@ -128,22 +125,28 @@ struct DownloadAlert : View {
 public struct DownloadAlertModifier: ViewModifier {
     @ObservedObject var helper : DownloadHelper
     @State var show = false
-    
-    public func body(content: Content) -> some View {
 
-        ZStack {
-            content
-            if show {
-                DownloadAlert(helper: helper)
-                
+    public func body(content: Content) -> some View {
+        content
+            .overlay {
+                if show {
+                    // Bottom sheet (demo §11.1): 0.58 s spring-sheet
+                    // in place of the old centred card + 0.1 s
+                    // easeInOut appear/disappear.
+                    LCBottomSheet(onDismiss: {
+                        show = false
+                    }) {
+                        DownloadAlert(helper: helper)
+                    }
+                    .transition(LCBottomSheet.transition)
+                } else {
+                    EmptyView()
+                }
             }
-            
-        }
-        .onChange(of: helper.isDownloading) { newVal in
-            withAnimation(.easeInOut(duration: 0.1)) {
+            .animation(LCBottomSheet.spring, value: show)
+            .onChange(of: helper.isDownloading) { newVal in
                 show = newVal
             }
-        }
     }
 }
 

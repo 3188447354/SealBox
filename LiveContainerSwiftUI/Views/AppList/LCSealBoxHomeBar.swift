@@ -2,17 +2,30 @@
 //  LCSealBoxHomeBar.swift
 //  LiveContainerSwiftUI
 //
-//  SealBox 应用锁与底部横杠（开发文档 §11 定稿、§14 动画规范）。
+//  SealBox 应用锁与底部横杠（demo §8 重建；开发文档 §11 定稿、§14 动画规范）。
 //
-//  定稿规则：
-//  - 只有锁定后才接管横杠手势；未锁定完全不响应、不误触真机。
-//  - 接管命中区下沿距屏幕底部 36px 封顶（36pt 高、贴底的命中条）。
-//  - 上滑跟手：窗口整体慢慢等比缩小（不是上移）；快滑松手回桌面；
-//    上滑并停顿进入应用切换器；按住约 0.42 秒或双击横杠直达切换器。
+//  定稿规则（demo §8）：
+//  - 虚拟横杠只在「锁定且有 App 打开」时出现（bottom 118px，Dock 上方）；
+//    桌面上没有任何可见横杠，只有一条看不见的命中条。
+//  - 锁按钮 40×40、右 14、下 118，只在 App 打开时显示；状态只靠
+//    闭锁/开锁图标区分，无发光。
+//  - 手势只在锁定时接管；未锁定完全不响应、不误触真机。
+//  - 上滑快甩回桌面（up > 22% 屏高，或 v < -0.55 且 up > 26px）；
+//    上滑停顿进切换器（静止 > 60ms 且 up 在 30px–62% 屏高）；
+//    按住 0.42s（移动 < 14px）进切换器；双击（两击 < 380ms）进切换器。
+//  - 跟随按比例缩小（scale 1 − p·0.22，p = up / (H·0.5)）；圆角只在
+//    0 / 22 / 38 三档切换；命中区下沿距屏幕底部 36px 封顶。
 //  - 进切换器与回桌面是同一条连续手势流，不分段跳变。
 //  - 手势被系统打断时，窗口必须回落到进入手势前的完整状态。
-//  - 桌面悬浮锁按钮：锁定只靠闭锁图标区分，无发光。
 //  - 动画只写 transform / opacity；手势采样与样式写入按帧合并（§14）。
+//
+//  与 demo 的已知偏差（原生结构所限）：
+//  - 桌面命中条放在 Dock 正上方（下沿约 118px，高 34px、宽
+//    max(280px, 76% 屏宽），而不是 demo 的屏底 36–70px 一带——原生
+//    Dock 本身占了屏底约 118px，条子不能压在 Dock 图标上；「不进
+//    屏底 36px 系统手势区」这一条仍满足。
+//  - 双击用手动计时（两击 < 380ms），不用系统 double-tap 识别器，
+//    以便与 demo 的 380ms 精确对齐。
 //
 //  诚实边界（§11 无法绕过的架构事实）：经典模式下客 App 运行时容器 UI
 //  不在，SwiftUI 手势伸不进客 App 进程——本文件的横杠只覆盖桌面与系统页
@@ -140,8 +153,24 @@ enum LCSealBoxHomeBarAction: Equatable {
 }
 
 final class LCSealBoxHomeBarState: ObservableObject {
-    /// Takeover hit zone: 36pt tall, bottom-anchored (§11: 下沿距屏幕底部 36px 封顶).
-    static let hitZoneHeight: CGFloat = 36
+    /// Desktop hit strip (demo §8.3): 34pt tall, centred, width
+    /// max(280pt, 76% of screen width). It sits directly above the
+    /// Dock (see the file header for why it is not at the screen
+    /// bottom); its bottom edge never enters the bottom-36pt system
+    /// gesture zone.
+    static let desktopStripHeight: CGFloat = 34
+    static let desktopStripMinWidth: CGFloat = 280
+    static let desktopStripWidthFraction: CGFloat = 0.76
+    /// Virtual bar position (demo §8.2): the capsule's bottom edge
+    /// sits 118pt above the screen bottom, above the Dock.
+    static let virtualBarBottomOffset: CGFloat = 118
+    /// Virtual bar hit area (demo §8.3): the capsule expanded by
+    /// 44pt left/right, 28pt up, 22pt down.
+    static let virtualBarHitExpandHorizontal: CGFloat = 44
+    static let virtualBarHitExpandTop: CGFloat = 28
+    static let virtualBarHitExpandBottom: CGFloat = 22
+    /// Double-tap on the bar (demo §8.3): two taps < 380 ms apart.
+    static let doubleTapMaxInterval: TimeInterval = 0.38
     /// Press-and-hold on the bar to go straight to the switcher (§11: 约 0.42 秒).
     static let holdToSwitcherDuration: TimeInterval = 0.42
     /// Press-and-hold movement allowance: the finger must stay within
@@ -185,6 +214,9 @@ final class LCSealBoxHomeBarState: ObservableObject {
     private var gestureStartTime: CFTimeInterval = 0
     private var lastMoveTime: CFTimeInterval = 0
     private var lastRecordedTranslation = CGPoint.zero
+    /// Time of the last light tap on the bar, for the manual
+    /// double-tap check (demo §8.3: two taps < 380 ms apart).
+    private var lastBarTapTime: CFTimeInterval = 0
     private var switcherFired = false
     /// Set while a gesture was consumed by the switcher, so the same
     /// finger's continued movement cannot start a second gesture.
@@ -241,16 +273,21 @@ final class LCSealBoxHomeBarState: ObservableObject {
             restoreWindow()
             return
         }
-        // Release precedence (demo §8.2): the switcher check FIRST.
+        // Release precedence (demo §8.3, flick listed first): a fast
+        // flick or a far swipe goes to the desktop; only a slow
+        // release inside the middle zone opens the switcher. The
+        // mid-gesture pause check (applyFrame) already opens the
+        // switcher while dragging, so a slow drag that pauses never
+        // reaches this release check.
         let up = -translation.y
         let vy = velocityTracker.velocity.dy
-        if up >= Self.switcherMinUpward, up <= screenHeight * 0.65, vy > -0.85 {
-            restoreWindow()
-            requestAction(.openSwitcher)
-        } else if up > screenHeight * Self.goDesktopMinUpwardFraction
+        if up > screenHeight * Self.goDesktopMinUpwardFraction
             || (vy < -0.55 && up > Self.goDesktopFlickMinUpward) {
             restoreWindow()
             requestAction(.goDesktop)
+        } else if up >= Self.switcherMinUpward, up <= screenHeight * 0.65, vy > -0.85 {
+            restoreWindow()
+            requestAction(.openSwitcher)
         } else {
             // Slow short drag released: spring back, no action.
             restoreWindow()
@@ -275,6 +312,20 @@ final class LCSealBoxHomeBarState: ObservableObject {
 
     /// Double-tap on the bar: straight to the switcher (§11).
     func requestOpenSwitcher() {
+        requestAction(.openSwitcher)
+    }
+
+    /// A light tap on the bar (from the view's TapGesture): two taps
+    /// < 380 ms apart open the switcher (demo §8.3). A single tap does
+    /// nothing except press feedback. Manual timing (not the system's
+    /// double-tap recogniser) so the 380 ms matches the demo exactly.
+    func recordBarTap() {
+        let now = CACurrentMediaTime()
+        defer { lastBarTapTime = now }
+        guard now - lastBarTapTime < Self.doubleTapMaxInterval else {
+            return
+        }
+        lastBarTapTime = 0
         requestAction(.openSwitcher)
     }
 
@@ -352,51 +403,171 @@ final class LCSealBoxHomeBarState: ObservableObject {
 
 // MARK: - Home indicator view (the bar itself)
 
-/// SealBox's own bottom bar: the pill is always drawn (it is the virtual
-/// phone's home indicator); the gestures only exist while locked.
-/// Unlocked, the strip does not hit-test at all, so Dock taps and the
-/// real system's Home gesture are untouched.
+/// SealBox's virtual home bar (demo §8).
+///
+/// Two modes, chosen by the caller:
+/// - App open (`isAppOpen == true`): the glass capsule is visible —
+///   13pt lock icon + 96×5 white line + "SealBox" 10pt bold tag —
+///   bottom 118pt, centred above the Dock. The hit area is the capsule
+///   expanded 44pt left/right, 28pt up, 22pt down. The caller only
+///   mounts this mode while locked (the capsule never shows unlocked).
+/// - Desktop (`isAppOpen == false`): no visible bar at all — only an
+///   invisible centred strip, 34pt tall, width max(280pt, 76% of
+///   screen width), sitting directly above the Dock (see the file
+///   header for why it is not at the screen bottom).
+/// In both modes the gestures exist ONLY while locked; unlocked, the
+/// view does not hit-test at all, so Dock taps and the real system's
+/// Home gesture are untouched.
 struct LCSealBoxHomeIndicatorView: View {
     @ObservedObject var state: LCSealBoxHomeBarState
     var isLocked: Bool
+    var isAppOpen: Bool = false
+
+    /// Measured capsule size, for sizing the expanded hit area.
+    @State private var capsuleSize: CGSize = CGSize(width: 200, height: 31)
+    /// Press feedback (demo §8.2): capsule scales 1.07 and brightens
+    /// ×1.3 while pressed.
+    @State private var isPressed = false
+    /// Entry animation (demo §8.2: vbar-in 0.5 s spring-pop from
+    /// translateY(14) scale(.92), opacity 0).
+    @State private var entered = false
 
     var body: some View {
-        ZStack(alignment: .bottom) {
-            Color.clear
-                .frame(height: LCSealBoxHomeBarState.hitZoneHeight)
-                .frame(maxWidth: .infinity)
-                .contentShape(Rectangle())
-                .allowsHitTesting(isLocked)
-                .gesture(dragGesture, including: isLocked ? .all : .none)
-                // Press-and-hold (demo §8.2): the drag needs 6pt of
-                // movement to start, so a finger that presses and
-                // never moves would never fire the drag's own hold
-                // check. This LongPressGesture runs in parallel and
-                // fires at 0.42 s if the finger stays within 14pt —
-                // the same trigger, for the stationary press.
-                .simultaneousGesture(
-                    LongPressGesture(minimumDuration: LCSealBoxHomeBarState.holdToSwitcherDuration, maximumDistance: LCSealBoxHomeBarState.holdMaxMovement)
-                        .onEnded { _ in
-                            if isLocked {
-                                state.pressHoldFired()
-                            }
-                        },
-                    including: isLocked ? .all : .none
-                )
-                .onTapGesture(count: 2) {
-                    if isLocked {
-                        state.requestOpenSwitcher()
-                    }
-                }
-            Capsule()
-                .fill(Color.white.opacity(0.9))
-                .shadow(color: .black.opacity(0.35), radius: 2, x: 0, y: 1)
-                .frame(width: 134, height: 5)
-                .padding(.bottom, 8)
-                .allowsHitTesting(false)
+        Group {
+            if isAppOpen {
+                virtualBar
+            } else {
+                desktopStrip
+            }
         }
-        .frame(height: LCSealBoxHomeBarState.hitZoneHeight)
     }
+
+    // MARK: Virtual bar (app open, locked)
+
+    private var virtualBar: some View {
+        capsule
+            .scaleEffect(barScale)
+            .brightness(isPressed ? 0.3 : 0)
+            .animation(.spring(response: 0.2, dampingFraction: 0.6), value: isPressed)
+            .opacity(entered ? 1 : 0)
+            .offset(y: entered ? 0 : 14)
+            .overlay {
+                // Expanded hit area (demo §8.3): capsule +44 left/right,
+                // +28 up, +22 down. An overlay does not change layout,
+                // so the capsule's bottom stays exactly 118pt above the
+                // screen bottom (the .padding below). Its bottom edge
+                // (118 − 22 = 96pt up) never enters the bottom-36pt
+                // system gesture zone.
+                Color.clear
+                    .frame(
+                        width: capsuleSize.width + 2 * LCSealBoxHomeBarState.virtualBarHitExpandHorizontal,
+                        height: capsuleSize.height + LCSealBoxHomeBarState.virtualBarHitExpandTop + LCSealBoxHomeBarState.virtualBarHitExpandBottom
+                    )
+                    .contentShape(Rectangle())
+                    .allowsHitTesting(isLocked)
+                    .gesture(dragGesture, including: isLocked ? .all : .none)
+                    .simultaneousGesture(pressTracker, including: isLocked ? .all : .none)
+                    .simultaneousGesture(
+                        LongPressGesture(minimumDuration: LCSealBoxHomeBarState.holdToSwitcherDuration, maximumDistance: LCSealBoxHomeBarState.holdMaxMovement)
+                            .onEnded { _ in
+                                if isLocked {
+                                    state.pressHoldFired()
+                                }
+                            },
+                        including: isLocked ? .all : .none
+                    )
+                    .onTapGesture {
+                        if isLocked {
+                            state.recordBarTap()
+                        }
+                    }
+            }
+            .padding(.bottom, LCSealBoxHomeBarState.virtualBarBottomOffset)
+            .onAppear {
+                entered = false
+                withAnimation(.spring(response: 0.5, dampingFraction: 0.6)) {
+                    entered = true
+                }
+            }
+            .onDisappear {
+                entered = false
+                isPressed = false
+            }
+    }
+
+    /// Entry scale (0.92 → 1) times press scale (1.07 while pressed).
+    private var barScale: CGFloat {
+        let entryScale: CGFloat = entered ? 1 : 0.92
+        return entryScale * (isPressed ? 1.07 : 1)
+    }
+
+    /// The capsule itself: glass, 13pt lock icon + 96×5 white line
+    /// (with a 3pt translucent ring) + "SealBox" 10pt bold tag
+    /// (demo §8.2). Never hit-tests on its own — the expanded hit
+    /// area above owns the gestures.
+    private var capsule: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "lock.fill")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(.white)
+            Capsule()
+                .fill(.white)
+                .frame(width: 96, height: 5)
+                .overlay {
+                    Capsule()
+                        .stroke(.white.opacity(0.3), lineWidth: 3)
+                        .padding(-3)
+                }
+            Text("SealBox")
+                .font(.system(size: 10, weight: .bold))
+                .foregroundStyle(.white)
+        }
+        .padding(.vertical, 9)
+        .padding(.horizontal, 16)
+        .background(.ultraThinMaterial, in: Capsule())
+        .background(
+            GeometryReader { proxy in
+                Color.clear
+                    .onAppear { capsuleSize = proxy.size }
+                    .onChange(of: proxy.size) { size in
+                        capsuleSize = size
+                    }
+            }
+        )
+        .allowsHitTesting(false)
+    }
+
+    // MARK: Desktop strip (invisible hit area only)
+
+    private var desktopStrip: some View {
+        Color.clear
+            .frame(
+                width: max(
+                    LCSealBoxHomeBarState.desktopStripMinWidth,
+                    UIScreen.main.bounds.width * LCSealBoxHomeBarState.desktopStripWidthFraction
+                ),
+                height: LCSealBoxHomeBarState.desktopStripHeight
+            )
+            .contentShape(Rectangle())
+            .allowsHitTesting(isLocked)
+            .gesture(dragGesture, including: isLocked ? .all : .none)
+            .simultaneousGesture(
+                LongPressGesture(minimumDuration: LCSealBoxHomeBarState.holdToSwitcherDuration, maximumDistance: LCSealBoxHomeBarState.holdMaxMovement)
+                    .onEnded { _ in
+                        if isLocked {
+                            state.pressHoldFired()
+                        }
+                    },
+                including: isLocked ? .all : .none
+            )
+            .onTapGesture {
+                if isLocked {
+                    state.recordBarTap()
+                }
+            }
+    }
+
+    // MARK: Shared gestures
 
     private var dragGesture: some Gesture {
         DragGesture(minimumDistance: 6)
@@ -407,18 +578,34 @@ struct LCSealBoxHomeIndicatorView: View {
                 state.recordTranslation(CGPoint(x: value.translation.width, y: value.translation.height))
             }
             .onEnded { value in
+                isPressed = false
                 state.endGesture(
                     translation: CGPoint(x: value.translation.width, y: value.translation.height)
                 )
             }
     }
+
+    /// Press tracking (demo §8.2): a zero-distance drag that only
+    /// records press state. Simultaneous with the real drag gesture,
+    /// so it never steals the gesture — it only drives the 1.07× /
+    /// brightness press feedback.
+    private var pressTracker: some Gesture {
+        DragGesture(minimumDistance: 0)
+            .onChanged { _ in
+                isPressed = true
+            }
+            .onEnded { _ in
+                isPressed = false
+            }
+    }
 }
 
-// MARK: - Floating lock button (desktop only)
+// MARK: - Floating lock button (app open only)
 
-/// Floating lock button on the desktop. Locked vs unlocked is shown
-/// ONLY by the closed/open lock icon — no glow, no colour change (§11).
-/// Hidden while editing (the edit-mode capsules own the corners then).
+/// Lock button (demo §8.1): 40×40 circle, shown only while an app is
+/// open — never on the desktop. Locked vs unlocked is shown ONLY by
+/// the closed/open lock icon — no glow, no colour change (§11). The
+/// caller positions it (right 14, bottom 118).
 struct LCSealBoxLockButton: View {
     @ObservedObject var lockStore: LCSealBoxLockStore
 
@@ -429,7 +616,7 @@ struct LCSealBoxLockButton: View {
             Image(systemName: lockStore.isLocked ? "lock.fill" : "lock.open")
                 .font(.system(size: 14, weight: .semibold))
                 .foregroundStyle(.primary)
-                .frame(width: 34, height: 34)
+                .frame(width: 40, height: 40)
                 .background(.ultraThinMaterial, in: Circle())
         }
         .accessibilityLabel(lockStore.isLocked ? "已锁定横杠" : "未锁定横杠")

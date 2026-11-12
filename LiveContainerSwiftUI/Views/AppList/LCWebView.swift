@@ -37,43 +37,42 @@ struct LCWebView: View {
         self.itmsServicesHandler = itmsServicesHandler
     }
     
+    /// Left-edge swipe-back arming (demo §10): set while a drag that
+    /// started within 26 pt of the left edge is in progress.
+    @State private var edgeSwipeArmed = false
+    /// Whether the web view had back history when the edge swipe
+    /// started. If it did, the system's own back/forward gesture
+    /// (allowsBackForwardNavigationGestures) owns the swipe and this
+    /// view must not also dismiss; only with no history does the
+    /// swipe close the web view.
+    @State private var edgeSwipeCanGoBack = false
+
     var body: some View {
-        
+
         VStack(spacing: 0) {
+            // Slim chrome: title + Done only. The LiveContainer
+            // legacy chrome (back / forward / reload buttons on a
+            // grey bar) is gone: back/forward is the system edge
+            // swipe (allowsBackForwardNavigationGestures, kept in
+            // WebView.makeUIView), and the page closes with Done or
+            // the left-edge swipe below (demo §10).
             HStack {
-                HStack {
-                    Button(action: {
-                        webView.goBack()
-                    }, label: {
-                        Image(systemName: "chevron.backward")
-                    })
-                    
-                    Button(action: {
-                        webView.goForward()
-                    }, label: {
-                        Image(systemName: "chevron.forward")
-                    }).padding(.horizontal)
-                }
-                
-                Spacer()
                 Text(pageTitle)
+                    .font(.headline)
                     .lineLimit(1)
                 Spacer()
-                Button(action: {
-                    webView.reload()
-                }, label: {
-                    Image(systemName: "arrow.clockwise")
-                }).padding(.horizontal)
                 Button(action: {
                     isPresent = false
                 }, label: {
                     Text("lc.common.done".loc)
+                        .font(.headline)
                 })
-                
             }
             .padding([.bottom, .horizontal])
-            .background(Color(.systemGray6))
-            .overlay(alignment: .bottomTrailing) {
+            .background(Color(.systemBackground))
+            .overlay(alignment: .bottom) {
+                // Load progress: thin line at the bottom of the bar,
+                // easing in over 0.3 s on increases only (unchanged).
                 ProgressView(value: uiLoadStatus)
                     .opacity(loadStatus == 1.0 ? 0 : 1)
                     .scaleEffect(y: 0.5)
@@ -87,9 +86,37 @@ struct LCWebView: View {
                             uiLoadStatus = newValue
                         }
                     }
-                
             }
             webView
+                // Left-edge swipe-back (demo §10): a drag starting
+                // within 26 pt of the left edge dismisses the view
+                // when it travels right more than 90 pt, or flings
+                // right (predicted end past 200 pt — DragGesture
+                // exposes no velocity, so the predicted end is the
+                // proxy for the demo's 0.45 pt/ms). simultaneousGesture
+                // so the page's own vertical scrolling keeps working.
+                // The back history is sampled at gesture start: with
+                // history the system edge gesture navigates back and
+                // this handler stands down.
+                .simultaneousGesture(
+                    DragGesture(minimumDistance: 30)
+                        .onChanged { value in
+                            if value.startLocation.x <= 26, !edgeSwipeArmed {
+                                edgeSwipeArmed = true
+                                edgeSwipeCanGoBack = webView.webView.canGoBack
+                            }
+                        }
+                        .onEnded { value in
+                            defer { edgeSwipeArmed = false }
+                            guard edgeSwipeArmed, !edgeSwipeCanGoBack else {
+                                return
+                            }
+                            if value.translation.width > 90
+                                || value.predictedEndTranslation.width > 200 {
+                                isPresent = false
+                            }
+                        }
+                )
         }
         .onAppear(){
             webView.loadURL(url: url)
@@ -99,27 +126,68 @@ struct LCWebView: View {
             }
 
         }
-        .alert("lc.webView.runApp".loc, isPresented: $runAppAlert.show) {
-            Button("lc.appBanner.run".loc, action: {
-                runAppAlert.close(result: true)
-            })
-            Button("lc.common.cancel".loc, role: .cancel, action: {
-                runAppAlert.close(result: false)
-            })
-        } message: {
-            Text(runAppAlertMsg)
+        // Run / install confirmations are bottom sheets (demo §11.1),
+        // not system alerts. The YesNoHelper contract is unchanged:
+        // the buttons resolve the awaiting open() with true/false,
+        // and scrim / grabber dismiss resolves false. The error
+        // alert below stays an alert (error display, not a choice).
+        .overlay {
+            if runAppAlert.show {
+                LCBottomSheet(onDismiss: {
+                    runAppAlert.close(result: false)
+                }) {
+                    VStack(spacing: 12) {
+                        Text("lc.webView.runApp".loc)
+                            .font(.headline)
+                            .multilineTextAlignment(.center)
+                        Text(runAppAlertMsg)
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                        Divider()
+                        LCBottomSheetActionRow(title: "lc.appBanner.run".loc) {
+                            runAppAlert.close(result: true)
+                        }
+                        LCBottomSheetActionRow(title: "lc.common.cancel".loc, role: .cancel) {
+                            runAppAlert.close(result: false)
+                        }
+                    }
+                }
+                .transition(LCBottomSheet.transition)
+            } else {
+                EmptyView()
+            }
         }
-        .alert("lc.webView.installApp".loc, isPresented: $installAppAlert.show) {
-            Button("lc.common.install".loc, action: {
-                installAppAlert.close(result: true)
-            })
-            Button("lc.common.cancel".loc, role: .cancel, action: {
-                installAppAlert.close(result: false)
-            })
-        } message: {
-            Text(installAppAlertMsg)
+        .animation(LCBottomSheet.spring, value: runAppAlert.show)
+        .overlay {
+            if installAppAlert.show {
+                LCBottomSheet(onDismiss: {
+                    installAppAlert.close(result: false)
+                }) {
+                    VStack(spacing: 12) {
+                        Text("lc.webView.installApp".loc)
+                            .font(.headline)
+                            .multilineTextAlignment(.center)
+                        Text(installAppAlertMsg)
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                        Divider()
+                        LCBottomSheetActionRow(title: "lc.common.install".loc) {
+                            installAppAlert.close(result: true)
+                        }
+                        LCBottomSheetActionRow(title: "lc.common.cancel".loc, role: .cancel) {
+                            installAppAlert.close(result: false)
+                        }
+                    }
+                }
+                .transition(LCBottomSheet.transition)
+            } else {
+                EmptyView()
+            }
         }
-        
+        .animation(LCBottomSheet.spring, value: installAppAlert.show)
+
         .alert("lc.common.error".loc, isPresented: $errorShow) {
             Button("lc.common.ok".loc, action: {
             })
@@ -172,9 +240,6 @@ struct LCWebView: View {
             return
         }
         
-        if sharedModel.isHiddenAppUnlocked || !LCUtils.appGroupUserDefault.bool(forKey: "LCStrictHiding") {
-            appListsToConsider.append(sharedModel.hiddenApps)
-        }
         appLoop:
         for appList in appListsToConsider {
             for app in appList {
@@ -223,11 +288,6 @@ struct LCWebView: View {
         var bundleIDToAppDict: [String: LCAppModel] = [:]
         for app in sharedModel.apps {
             bundleIDToAppDict[app.appInfo.bundleIdentifier()!] = app
-        }
-        if !LCUtils.appGroupUserDefault.bool(forKey: "LCStrictHiding") || sharedModel.isHiddenAppUnlocked {
-            for app in sharedModel.hiddenApps {
-                bundleIDToAppDict[app.appInfo.bundleIdentifier()!] = app
-            }
         }
         
         var appToLaunch: LCAppModel? = nil

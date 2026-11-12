@@ -447,6 +447,9 @@ struct LCAppSwitcherView: View {
     /// Entry stagger: false until the switcher appears, then true;
     /// the cards fade in staggered by their distance from focus.
     @State private var entryRevealed = false
+    /// Exit in progress: set by exitToDesktop so the cards fade out
+    /// staggered (demo §7.4) instead of replaying the entry stagger.
+    @State private var isExiting = false
 
     var body: some View {
         GeometryReader { geometry in
@@ -458,14 +461,24 @@ struct LCAppSwitcherView: View {
                 Color.black.opacity(0.45)
                     .ignoresSafeArea()
                     .onTapGesture {
-                        onDismiss()
+                        exitToDesktop()
                     }
                     .simultaneousGesture(
                         DragGesture(minimumDistance: 20)
+                            .onChanged { value in
+                                // Demo §7.4: a swipe down on the
+                                // background exits to the desktop
+                                // immediately once dy > 80 — no release
+                                // needed.
+                                if value.translation.height > 80,
+                                   value.translation.height > abs(value.translation.width) {
+                                    exitToDesktop()
+                                }
+                            }
                             .onEnded { value in
                                 if value.translation.height > 80,
                                    value.translation.height > abs(value.translation.width) {
-                                    onDismiss()
+                                    exitToDesktop()
                                 }
                             }
                     )
@@ -640,9 +653,15 @@ struct LCAppSwitcherView: View {
         .opacity((entryRevealed ? 1 : 0) * (isClosing ? closingOpacity : (isOpening ? 1 : othersOpacity)))
         .zIndex(zIndex)
         // Entry stagger (demo §7.1): 380 ms easeOut, delayed 55 ms
-        // per step of distance from the focus card. Keyed on
+        // per step of distance from the focus card. Exit (demo §7.4):
+        // 340 ms easeOut, delayed 30 ms per step. Keyed on
         // entryRevealed only, so it never touches the drag follow.
-        .animation(.easeOut(duration: 0.38).delay(0.055 * Double(abs(index - focusedIndex))), value: entryRevealed)
+        .animation(
+            isExiting
+                ? .easeOut(duration: 0.34).delay(0.03 * Double(abs(index - focusedIndex)))
+                : .easeOut(duration: 0.38).delay(0.055 * Double(abs(index - focusedIndex))),
+            value: entryRevealed
+        )
         .onTapGesture {
             openCard(card, size: size, layout: layout)
         }
@@ -841,7 +860,7 @@ struct LCAppSwitcherView: View {
         if wasVertical && (closeOffset > 84 || (closeOffset > 30 && vy > 0.6)) {
             // Swipe the focused card down to the desktop (demo §7.2).
             dragState.reset()
-            onDismiss()
+            exitToDesktop()
             return
         }
         if wasVertical {
@@ -910,6 +929,22 @@ struct LCAppSwitcherView: View {
         if store.cards.isEmpty {
             onDismiss()
         }
+    }
+
+    /// Exit to the desktop (demo §7.4): the cards fade out staggered
+    /// 30 ms per step of distance from focus over 340 ms, on the same
+    /// timeline as the caller's 0.42 s scrim fade — so the dismiss is
+    /// requested in the same transaction, with no extra wait. Guarded
+    /// so a second exit (or an exit while a card is zooming/flying
+    /// out) is a no-op. Tap-to-open and last-card-close keep the plain
+    /// onDismiss path (snap close / background-only fade).
+    private func exitToDesktop() {
+        guard !isExiting, openingCardID == nil, closingCardID == nil else {
+            return
+        }
+        isExiting = true
+        entryRevealed = false
+        onDismiss()
     }
 
     // MARK: Open a card (zoom from its measured size to full screen)

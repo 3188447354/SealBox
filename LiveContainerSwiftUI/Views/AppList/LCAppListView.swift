@@ -36,7 +36,7 @@ struct AppReplaceOption : Hashable {
     var appToReplace: LCAppModel?
 }
 
-struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
+struct LCAppListView : View, LCAppModelDelegate {
     @State var didAppear = false
     // ipa choosing stuff
     @State var choosingIPA = false
@@ -63,22 +63,12 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
     
     @StateObject private var runWhenMultitaskAlert = YesNoHelper()
     
-    @StateObject private var generatedIconStyleSelector = AlertHelper<GeneratedIconStyle>()
-    
-    @State var safariViewOpened = false
-    @State var safariViewURL = URL(string: "https://google.com")!
-    
-    // Kept for the LCAppBannerDelegate protocol (openNavigationView):
-    // the banner rows are gone from the desktop, so nothing navigates
-    // through these anymore; they are inert.
-    @State private var navigateTo : AnyView?
-    @State private var isNavigationActive = false
-    
-    
-    @State private var customSortViewPresent = false
+    /// The edit-mode "•••" menu (demo §2.4) is open. A custom popover,
+    /// not a system Menu, so it can be exactly the demo's 218 pt wide,
+    /// top-right, scale 0.82 + translateY(−8) popover.
+    @State private var showEditMenu = false
     
     @EnvironmentObject private var sharedModel : SharedModel
-    @EnvironmentObject private var sharedAppSortManager : LCAppSortManager
     
     @AppStorage("LCMultitaskMode", store: LCUtils.appGroupUserDefault) var multitaskMode: MultitaskMode = .virtualWindow
     @AppStorage("darkModeIcon", store: LCUtils.appGroupUserDefault) private var darkModeIcon = false
@@ -103,8 +93,8 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
     @State private var showSearchBar = false
     /// Keyboard focus for the floating search field.
     @FocusState private var searchFieldFocused: Bool
-    /// Currently visible page (0-based). Drives the TabView selection
-    /// and the custom page dots.
+    /// Currently visible page (0-based). Drives the paging TabView
+    /// selection and the custom page dots.
     @State private var currentPage = 0
     @StateObject private var desktopDrag = LCDesktopDragState()
     @StateObject private var desktopOrder = LCDesktopOrderStore()
@@ -131,10 +121,6 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
     /// System photo picker (PHPicker) presentation. The picked image
     /// is applied immediately, as-is — there is no edit page.
     @State private var showWallpaperPicker = false
-    /// "恢复默认壁纸" lives in the edit-mode "···" menu; tapping it
-    /// asks for confirmation before deleting the stored custom
-    /// wallpaper and going back to the bundled default.
-    @State private var showRestoreWallpaperDialog = false
 
     /// App awaiting delete confirmation (grid "−" button).
     @State private var appPendingDelete: LCAppModel?
@@ -146,31 +132,41 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
     /// Left-edge swipe-back on a system page: set while a drag that
     /// started within 24pt of the left edge is in progress.
     @State private var edgeSwipeFromLeft = false
+
+    /// Icon-zoom open (demo §9): the tapped icon's centre is the
+    /// zoom anchor (screen coordinates, from the drag hit-test
+    /// frames). The page starts at scale 0.12 / opacity 0 / radius
+    /// 44 and springs to full screen (0.46 s spring-open, opacity
+    /// 0.18 s, radius flips 44 → 0 discretely). At rest all three
+    /// are 1 / 1 / 0 (no zoom); opens from the switcher / Control
+    /// Center reset them instead of zooming.
+    @State private var zoomAnchor = UnitPoint.center
+    @State private var zoomScale: CGFloat = 1.0
+    @State private var zoomOpacity: Double = 1.0
+    @State private var zoomRadius: CGFloat = 0
+    /// Fake expanding window for a multitask guest launch (demo §9):
+    /// the real window is a new scene, so the container draws the
+    /// window itself for 0.46 s before runApp opens the scene.
+    /// Classic launches relaunch the process and never zoom.
+    @State private var guestZoomIcon: LCDesktopIcon?
+    @State private var guestZoomActive = false
+    @State private var guestZoomScale: CGFloat = 0.12
+    @State private var guestZoomOpacity: Double = 0
+    @State private var guestZoomRadius: CGFloat = 44
+    @State private var guestZoomAnchor = UnitPoint.center
+    /// Dock "−" confirmation (demo §2.6): the icon awaiting removal
+    /// from the Dock (returns to the grid; the app is not deleted).
+    @State private var dockRemovePending: LCDesktopIcon?
+    @State private var showDockRemoveConfirm = false
     
     @ObservedObject var searchContext: SearchContext = SearchContext()
-    var sortedApps: [LCAppModel] {
-        return sharedAppSortManager.sortedApps
-    }
-    
-    var sortedHiddenApps: [LCAppModel] {
-        return sharedAppSortManager.sortedHiddenApps
-    }
     
     var filteredApps: [LCAppModel] {
-        let apps = sortedApps
+        // Desktop order is free placement (the persisted slot order),
+        // never a sort: there is no sort system anymore. This only
+        // filters by the search query.
+        let apps = sharedModel.apps
         if searchContext.debouncedQuery.isEmpty {
-            return apps
-        } else {
-            return apps.filter { app in
-                app.appInfo.displayName().localizedCaseInsensitiveContains(searchContext.debouncedQuery) ||
-                app.appInfo.bundleIdentifier()!.localizedCaseInsensitiveContains(searchContext.debouncedQuery)
-            }
-        }
-    }
-    
-    var filteredHiddenApps: [LCAppModel] {
-        let apps = sortedHiddenApps
-        if searchContext.debouncedQuery.isEmpty || !sharedModel.isHiddenAppUnlocked {
             return apps
         } else {
             return apps.filter { app in
@@ -186,8 +182,11 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
     
     /// The desktop window itself: wallpaper, icon grid,
     /// page dots and the drag ghost, plus the home-bar
-    /// shell transforms (shrink / corner radius / the
-    /// control-centre trigger and lock-button overlays).
+    /// shell transforms (shrink / corner radius). The desktop
+    /// shows no lock button and no control-centre trigger
+    /// (demo §8 / §6: the lock button lives only while an app
+    /// is open; the control centre opens only from the
+    /// edit-mode "···" menu).
     /// Split out of `body` so the type checker sees a
     /// smaller expression per property: the whole body
     /// in one expression timed the checker out.
@@ -221,23 +220,16 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
                 }
 
                 desktopPagesView
+                desktopSystemIconsRow
                 desktopPageDots
             }
             .padding(.top, geometry.safeAreaInsets.top)
-            // Tap the blank desktop to exit edit mode; triple-tap it
-            // in normal mode to unlock hidden apps (the unlock gesture
-            // used to live behind the old app-counter footer, which is
-            // gone with the old list UI). The exit guard (demo §2.5):
-            // a tap within 400 ms of entering edit mode does not exit
-            // (it is the same press that just entered it).
+            // Tap the blank desktop to exit edit mode. The exit guard
+            // (demo §2.5): a tap within 400 ms of entering edit mode
+            // does not exit (it is the same press that just entered it).
             .onTapGesture {
                 if isEditing, Date().timeIntervalSince(editingSince) >= 0.4 {
                     exitEditMode()
-                }
-            }
-            .onTapGesture(count: 3) {
-                if !isEditing {
-                    Task { await authenticateUser() }
                 }
             }
             // Long-press the blank desktop to enter edit mode (0.45 s,
@@ -270,7 +262,7 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
         // while the radius is > 0, so it never clips the wallpaper's
         // parallax overscan at rest.
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .scaleEffect(showSwitcher ? 0.92 : homeBarState.windowScale)
+        .scaleEffect(desktopWindowScale)
         .offset(y: showSwitcher ? 0 : homeBarState.windowOffsetY)
         .apply { content in
             if !showSwitcher, homeBarState.windowCornerRadius > 0 {
@@ -279,45 +271,46 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
                 content
             }
         }
-        .opacity(showSwitcher ? 0.5 : 1.0)
+        .opacity(desktopWindowOpacity)
         .animation(.spring(response: 0.42, dampingFraction: 0.85), value: showSwitcher)
-        .overlay(alignment: .topTrailing) {
-            // Control-centre trigger: the top 44pt strip at the
-            // trailing edge (§13). It sits over the status-bar area,
-            // clear of the lock button and the edit-mode capsules,
-            // which both live below the safe area.
-            LCSealBoxControlCenterTrigger {
-                showControlCenter = true
+        .animation(.spring(response: 0.35, dampingFraction: 0.85), value: systemPage)
+        .animation(.spring(response: 0.35, dampingFraction: 0.85), value: guestZoomActive)
+        .overlay {
+            // Menu scrim (demo §11.1): tapping outside the "•••" menu
+            // closes it. It sits above the desktop (so it also blocks
+            // icon drags while the menu is open) and below the menu
+            // popover itself.
+            if isEditing, showEditMenu {
+                Color.black.opacity(0.001)
+                    .onTapGesture {
+                        withAnimation(.spring(response: 0.34, dampingFraction: 0.6)) {
+                            showEditMenu = false
+                        }
+                    }
             }
         }
         .overlay(alignment: .topTrailing) {
-            // Floating lock button: always on the desktop, hidden while
-            // editing (§11; the edit-mode capsules own the corners
-            // then). Kept below the 44pt trigger strip:
-            // max(safeArea, 44) + 12 from the top.
-            lockButtonOverlayView(topInset: geometry.safeAreaInsets.top)
+            // The edit-mode "•••" menu (demo §2.4): 218 pt wide, top
+            // 58 pt (just below the 52 pt chrome bar), right 30 pt
+            // (aligned with the "•••" button's right edge).
+            if isEditing, showEditMenu {
+                editMenuPopover
+                    .padding(.top, geometry.safeAreaInsets.top + 58)
+                    .padding(.trailing, 30)
+                    .transition(.asymmetric(
+                        insertion: .scale(scale: 0.82, anchor: .topTrailing)
+                            .combined(with: .offset(y: -8))
+                            .combined(with: .opacity),
+                        removal: .opacity
+                    ))
+            }
         }
-        }
-    }
-
-    /// Lock-button overlay content, extracted from `desktopWindowView`
-    /// so its type is inferred on its own. (Run #24: the generic
-    /// `.apply` in that chain plus an if/else overlay content broke
-    /// the type checker's inference, and it fell back to `()`.)
-    @ViewBuilder
-    private func lockButtonOverlayView(topInset: CGFloat) -> some View {
-        if !isEditing {
-            LCSealBoxLockButton(lockStore: lockStore)
-                .padding(.top, max(topInset, 44) + 12)
-                .padding(.trailing, 20)
-        } else {
-            EmptyView()
         }
     }
 
     /// Shell modifiers on the desktop window: coordinate
     /// spaces, drag frame reports, status bar, appear /
-    /// change hooks, tab-bar hiding, colour scheme and
+    /// change hooks, colour scheme and
     /// the pinned home-bar strip and Dock.
     private var desktopShellView: some View {
         desktopWindowView
@@ -338,6 +331,9 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
             desktopDrag.dockFrame = frames.bar
             desktopDrag.dockSlotFrames = frames.slots
         }
+        .onPreferenceChange(LCDesktopSlotFramePreferenceKey.self) { frames in
+            desktopDrag.slotFrames = frames
+        }
         // Status bar (demo §2.2): hidden in edit mode — the edit chrome
         // replaces it — and shown otherwise.
         .statusBar(hidden: isEditing)
@@ -347,18 +343,12 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
             }
         }
         .onAppear {
-            // Bring the persisted order / Dock up to date with the
+            // Bring the persisted slot order up to date with the
             // installed apps.
             syncDesktopOrder()
-            refreshDock()
         }
         .onChange(of: sharedModel.apps.count) { _ in
             syncDesktopOrder()
-            refreshDock()
-        }
-        .onChange(of: sharedModel.hiddenApps.count) { _ in
-            syncDesktopOrder()
-            refreshDock()
         }
         .onChange(of: desktopPageCount) { _ in
             if currentPage >= desktopPageCount {
@@ -406,7 +396,7 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
                 // Entering the switcher exits edit mode (demo §2.5).
                 exitEditMode()
                 switcherStore.refresh(
-                    apps: sharedModel.apps + sharedModel.hiddenApps,
+                    apps: sharedModel.apps,
                     tweakNames: sharedModel.tweakFolderNames,
                     openSystemPage: systemPage,
                     darkModeIcon: darkModeIcon
@@ -419,15 +409,15 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
                 showSwitcher = true
             }
         }
-        .hideDesktopTabBar()
         .preferredColorScheme(desktopTheme.colorScheme)
-        // SealBox home bar (§11): its own 36pt strip directly above
-        // the Dock. This inset is applied before the Dock's, so it sits
-        // between the desktop content and the Dock — never overlapping
-        // the page dots — and the pill is always drawn. Only while
-        // locked does the strip take over the gestures; unlocked it
-        // does not hit-test at all (see LCSealBoxHomeIndicatorView),
-        // so Dock taps and the real system's Home gesture are untouched.
+        // SealBox home bar (demo §8): the desktop shows NO visible
+        // bar — only an invisible centred strip, 34pt tall, sitting
+        // directly above the Dock. This inset is applied before the
+        // Dock's, so it sits between the desktop content and the Dock
+        // — never overlapping the page dots. Only while locked does
+        // the strip take over the gestures; unlocked it does not
+        // hit-test at all (see LCSealBoxHomeIndicatorView), so Dock
+        // taps and the real system's Home gesture are untouched.
         .safeAreaInset(edge: .bottom) {
             LCSealBoxHomeIndicatorView(state: homeBarState, isLocked: lockStore.isLocked)
         }
@@ -449,10 +439,12 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
                     desktopIconTapped(icon)
                 },
                 onDeleteIcon: { icon in
-                    // Dock "−" removes the icon from the Dock only
-                    // (it returns to the grid). It never deletes the
-                    // app; app deletion is the grid "−" button.
-                    removeIconFromDock(icon)
+                    // Dock "−" (demo §2.6): confirm in a bottom
+                    // sheet first. It only removes the icon from the
+                    // Dock (it returns to the grid); it never deletes
+                    // the app; app deletion is the grid "−" button.
+                    dockRemovePending = icon
+                    showDockRemoveConfirm = true
                 },
                 dragGestureFor: { icon in
                     desktopIconDragGesture(for: icon, isInDock: true)
@@ -470,6 +462,7 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
             .opacity(dockLayerOpacity)
             .animation(.spring(response: 0.35, dampingFraction: 0.85), value: systemPage)
             .animation(.spring(response: 0.42, dampingFraction: 0.85), value: showSwitcher)
+            .animation(.spring(response: 0.35, dampingFraction: 0.85), value: guestZoomActive)
         }
         .ignoresSafeArea(.keyboard, edges: .bottom)
     }
@@ -492,55 +485,18 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
         }, onDismiss: {
             choosingIPA = false
         })
-        .alert("lc.appList.installation".loc, isPresented: $installReplaceAlert.show) {
-            ForEach(installOptions, id: \.self) { installOption in
-                Button(role: installOption.isReplace ? .destructive : nil, action: {
-                    installReplaceAlert.close(result: installOption)
-                }, label: {
-                    Text(installOption.isReplace ? installOption.nameOfFolderToInstall : "lc.appList.installAsNew".loc)
-                })
-            
-            }
-            Button(role: .cancel, action: {
-                installReplaceAlert.close(result: nil)
-            }, label: {
-                Text("lc.appList.abortInstallation".loc)
-            })
-        } message: {
-            Text("lc.appList.installReplaceTip".loc)
-        }
-        .alert("lc.webView.runApp".loc, isPresented: $runWhenMultitaskAlert.show) {
-            Button(role: .destructive) {
-                runWhenMultitaskAlert.close(result: true)
-            } label: {
-                Text("lc.common.continue".loc)
-            }
-            Button("lc.common.cancel".loc, role: .cancel) {
-                runWhenMultitaskAlert.close(result: false)
-            }
-        } message: {
-            Text("lc.appBanner.confirmRunWhenMultitasking".loc)
-        }
-        .alert("lc.appList.generatedIconStyleSelector.title".loc, isPresented:$generatedIconStyleSelector.show) {
-            Button {
-                generatedIconStyleSelector.close(result: .Light)
-            } label: {
-                Text("lc.appList.generatedIconStyleSelector.light".loc)
-            }
-            Button {
-                generatedIconStyleSelector.close(result: .Dark)
-            } label: {
-                Text("lc.appList.generatedIconStyleSelector.dark".loc)
-            }
-            Button {
-                generatedIconStyleSelector.close(result: .Original)
-            } label: {
-                Text("lc.appList.generatedIconStyleSelector.original".loc)
-            }
-            Button("lc.common.cancel".loc, role: .cancel) {
-                generatedIconStyleSelector.close(result: nil)
-            }
-        }
+        // The operation / confirmation / selection alerts that used
+        // to live here are bottom sheets now (demo §11.1, P2-25):
+        // install-replace choice, run-when-multitasking, delete
+        // confirm, Dock-remove confirm, restore wallpaper and JIT
+        // modal. Their overlays are attached in `body` next to the
+        // switcher / Control Center.
+        // Left as system alerts on purpose: the error alert (error
+        // display, not a choice) and the text-field alerts (the
+        // UIKit alert handles the keyboard; a bottom-sheet text
+        // field would sit under it). The file importer stays a
+        // UIDocumentPicker via presentFromTopmost — the
+        // certificate-import race fix must not be touched.
         .textFieldAlert(
             isPresented: $webViewUrlInput.show,
             title:  "lc.appList.enterUrlTip".loc,
@@ -565,11 +521,9 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
                 installUrlInput.close(result: nil)
             }
         )
-        .sheet(isPresented: $jitAlert.show, onDismiss: {
-            jitAlert.close(result: false)
-        }) {
-            JITEnablingModal
-        }
+        // JIT modal: bottom sheet now (P2-25); the overlay in `body`
+        // resolves the helper the same way the old .sheet onDismiss
+        // did. isJITModalOpen still tracks jitAlert.show.
         .onChange(of: jitAlert.show) { newValue in
             sharedModel.isJITModalOpen = newValue
         }
@@ -577,12 +531,6 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
             LCWebView(url: $webViewURL, isPresent: $webViewOpened, itmsServicesHandler: { urlStr in
                 await installFromPlist(urlStr: urlStr)
             })
-        }
-        .fullScreenCover(isPresented: $safariViewOpened) {
-            SafariView(url: $safariViewURL)
-        }
-        .sheet(isPresented: $customSortViewPresent) {
-            LCCustomSortView()
         }
         // Wallpaper: system photo picker (single image). The picked
         // image is applied immediately, as-is — no edit page, no crop /
@@ -593,29 +541,46 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
                 wallpaperStore.apply(image: image)
             }
         }
-        .confirmationDialog("恢复默认壁纸", isPresented: $showRestoreWallpaperDialog) {
-            Button("恢复默认壁纸", role: .destructive) {
-                wallpaperStore.resetToDefault()
-            }
-            Button("取消", role: .cancel) {}
-        } message: {
-            Text("将删除自定义壁纸，恢复默认背景。")
-        }
+        // Restore-default-wallpaper confirmation: bottom sheet now
+        // (P2-25); the overlay in `body` asks before deleting the
+        // stored custom wallpaper.
         .onAppear() {
             if !isViewAppeared {
                 if let webpageUrlStr = UserDefaults.standard.string(forKey: "webPageToOpen") {
                     Task { await openWebView(urlString: webpageUrlStr) }
                     UserDefaults.standard.set(nil, forKey: "webPageToOpen")
                 }
-                
-                guard sharedModel.selectedTab == .apps, let link = sharedModel.deepLink else { return }
-                sharedModel.deepLink = nil
-                handleURL(url: link)
+
+                // A deep link that asked for a system page opens its
+                // cover here; the page itself consumes the link.
+                if let page = sharedModel.requestedSystemPage {
+                    systemPage = page
+                } else if let link = sharedModel.deepLink {
+                    sharedModel.deepLink = nil
+                    handleURL(url: link)
+                }
                 isViewAppeared = true
             }
         }
+        // Deep-link routing (no Tab root anymore): a requested system
+        // page opens as a full-screen cover and the page consumes the
+        // link; nil means "desktop", so this view consumes it. An
+        // apps-side link also drops any open system page first, the
+        // way switching to the Apps tab used to. The deepLink watcher
+        // must also open the page: requestedSystemPage is level state,
+        // so a second link for the same page does not re-fire its
+        // own onChange, and the page view only exists once its cover
+        // is open — without this the link would be lost.
+        .onChange(of: sharedModel.requestedSystemPage) { page in
+            systemPage = page
+        }
         .onChange(of: sharedModel.deepLink) { link in
-            guard sharedModel.selectedTab == .apps, let link else { return }
+            guard let link else { return }
+            if let page = sharedModel.requestedSystemPage {
+                systemPage = page
+                return
+            }
+            systemPage = nil
             sharedModel.deepLink = nil
             handleURL(url: link)
         }
@@ -644,104 +609,47 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
         // a phone home screen, not an app list. No NavigationView, no
         // title, no search bar, no toolbar, no Tab Bar shell — just the
         // wallpaper, the icon grid, the page dots and the pinned Dock.
-        // The LCTabView that hosts this view still exists as the app
-        // root (it owns deep links, crash checks and the download
-        // alert); its Tab Bar stays hidden here via
-        // .hideDesktopTabBar() (iOS 16+; on iOS 15 it still shows —
-        // known gap, see DESKTOP_GRID_V1.md).
-        // The TabView page lays its content out edge-to-edge, so the
+        // This view IS the app root now (LCSealBoxRootView just hosts
+        // it and owns deep links, crash checks and the download alert);
+        // there is no Tab root anymore.
+        // The desktop lays its content out edge-to-edge, so the
         // grid would start at y=0 under the status bar (MJ's 02:56
         // screenshot: the time was hidden behind the first row of
         // icons). Read the real safe-area inset and pad the content
         // below the status bar by exactly that much; the wallpaper
         // still fills the whole screen behind everything.
         desktopDialogsView
-        .fullScreenCover(item: $systemPage) { page in
-            // Full-screen cover (not a sheet, not a NavigationLink):
-            // the three Views each embed their own NavigationView
-            // (LCSourcesView:496, LCTweaksView:396, LCSettingsView:83),
-            // which rules out NavigationLink (nested NavigationView),
-            // and they are full app sections, not transient sheets.
-            // The Done button in the navigation bar is the way back;
-            // full-screen covers have no swipe-down dismiss.
-            // Left-edge swipe-back is a second way back (Done stays):
-            // a horizontal drag that STARTS within 24pt of the left
-            // edge and travels right more than 46pt (and less than
-            // 60pt vertically) dismisses the page (demo §10).
-            // simultaneousGesture so the page's own vertical scrolling
-            // keeps working; a drag starting anywhere else, or a
-            // mostly-vertical drag, never dismisses. The gesture lives
-            // only on this cover, so a right swipe on the desktop's
-            // first page can never trigger it, and it is unrelated to
-            // the desktop's edit-mode icon dragging.
-            // The page is the front window for the home-bar follow
-            // (demo §8.3): it shrinks proportionally with the finger
-            // (scale 1 − p·0.22, slight upward drift, corner radius in
-            // 3 discrete steps) while the desktop is revealed behind
-            // it. The home-bar strip floats above the page (outside
-            // the shrink) so it stays put.
-            ZStack {
-                page.view
-                    .simultaneousGesture(
-                        DragGesture(minimumDistance: 30)
-                            .onChanged { value in
-                                if value.startLocation.x <= 24 {
-                                    edgeSwipeFromLeft = true
-                                }
-                            }
-                            .onEnded { value in
-                                defer { edgeSwipeFromLeft = false }
-                                guard edgeSwipeFromLeft else {
-                                    return
-                                }
-                                if value.translation.width > 46
-                                    && abs(value.translation.height) < 60 {
-                                    systemPage = nil
-                                }
-                            }
-                    )
-                    .toolbar {
-                        ToolbarItem(placement: .topBarTrailing) {
-                            Button("lc.common.done".loc) {
-                                systemPage = nil
-                            }
-                        }
-                    }
-                    .scaleEffect(homeBarState.windowScale)
-                    .offset(y: homeBarState.windowOffsetY)
-                    .apply { content in
-                        if homeBarState.windowCornerRadius > 0 {
-                            content.clipShape(RoundedRectangle(cornerRadius: homeBarState.windowCornerRadius))
-                        } else {
-                            content
-                        }
-                    }
-            }
-            // The home bar works on system pages too (§11): the
-            // same 36pt strip, bottom-anchored over the page. It
-            // floats above the page content like a real home
-            // indicator; unlocked it does not hit-test, so the
-            // page's own scrolling and taps are untouched.
-            .overlay(alignment: .bottom) {
-                LCSealBoxHomeIndicatorView(state: homeBarState, isLocked: lockStore.isLocked)
-            }
-        }
-        .alert("lc.appBanner.confirmUninstallTitle".loc, isPresented: $showDeleteConfirm) {
-            Button(role: .destructive) {
-                if let app = appPendingDelete {
-                    deleteDesktopApp(app)
-                }
-            } label: {
-                Text("lc.appBanner.uninstall".loc)
-            }
-            Button("lc.common.cancel".loc, role: .cancel) {
-            }
-        } message: {
-            Text("lc.appBanner.confirmUninstallMsg %@".localizeWithFormat(deleteConfirmName))
-        }
+        // System page as an overlay window (demo §9, P2-28), not a
+        // fullScreenCover: the cover's slide-up cannot zoom from the
+        // tapped icon, and an overlay never fights the switcher /
+        // Control Center overlays for presentation. See
+        // systemPageOverlay: entry is driven by the zoom states
+        // (0.12 / 0 / 44 start frame, then 0.46 s spring-open);
+        // exit shrinks back toward the icon via the transition.
+        .overlay { systemPageOverlay }
+        .animation(.spring(response: 0.46, dampingFraction: 0.85), value: systemPage)
+        // Guest-open zoom window (demo §9, P2-28): the fake expanding
+        // window shown for 0.46 s before a multitask guest scene
+        // opens. See guestZoomOverlay.
+        .overlay { guestZoomOverlay }
+        // Bottom sheets (demo §11.1, P2-25). Each overlay is a
+        // private var below; the .animation next to it drives the
+        // sheet's 0.58 s spring-sheet entry/exit.
+        .overlay { deleteConfirmSheetOverlay }
+        .animation(LCBottomSheet.spring, value: showDeleteConfirm)
+        .overlay { dockRemoveSheetOverlay }
+        .animation(LCBottomSheet.spring, value: showDockRemoveConfirm)
+        .overlay { installReplaceSheetOverlay }
+        .animation(LCBottomSheet.spring, value: installReplaceAlert.show)
+        .overlay { runWhenMultitaskSheetOverlay }
+        .animation(LCBottomSheet.spring, value: runWhenMultitaskAlert.show)
+        .overlay { restoreWallpaperSheetOverlay }
+        .animation(LCBottomSheet.spring, value: showRestoreWallpaperDialog)
+        .overlay { jitSheetOverlay }
+        .animation(LCBottomSheet.spring, value: jitAlert.show)
         // SealBox shell overlays (§10.2 / §13). Both are overlays on
         // the desktop — not fullScreenCovers — so they never fight the
-        // system-page cover for presentation: opening a system page
+        // system-page overlay for presentation: opening a system page
         // from the switcher (or Settings from the control centre) is
         // just two state flips in the same transaction, with no
         // dismiss-then-present race. They sit last, so they cover the
@@ -756,6 +664,9 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
                     },
                     onOpenSystem: { page in
                         showSwitcher = false
+                        // No icon zoom from the switcher: the card
+                        // zoom already played there (openCard).
+                        resetZoomState()
                         systemPage = page
                     }
                 )
@@ -772,10 +683,6 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
                 LCSealBoxControlCenterView(
                     onDismiss: {
                         showControlCenter = false
-                    },
-                    onOpenSettings: {
-                        showControlCenter = false
-                        systemPage = .settings
                     }
                 )
                 // Open/close (demo §6/§11.1): the panel slides in
@@ -790,7 +697,348 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
         }
         .animation(.spring(response: 0.58, dampingFraction: 0.8), value: showControlCenter)
     }
-    
+
+    // MARK: - System page overlay + bottom sheets (P2-25 / P2-28)
+
+    /// System page as an overlay window (demo §9), not a
+    /// fullScreenCover: the cover's slide-up cannot zoom from the
+    /// tapped icon. The three pages each embed their own
+    /// NavigationView, which rules out NavigationLink, and they are
+    /// full app sections, not transient sheets — hence an overlay,
+    /// not a sheet.
+    /// Entry: desktopIconTapped sets the 0.12 / 0 / 44 start frame
+    /// (zoomScale / zoomOpacity / zoomRadius) before setting
+    /// systemPage, then animates to 1 / 1 / 0; opens from the
+    /// switcher / Control Center reset the zoom states instead.
+    /// Exit: the removal transition shrinks back toward the icon
+    /// (scale 0.12, 0.46 s spring-open, fading out).
+    /// Done stays the way back; the left-edge swipe-back is a
+    /// second way back (demo §10): a horizontal drag that STARTS
+    /// within 24pt of the left edge and travels right more
+    /// than 80pt, horizontally dominant, dismisses the page.
+    /// simultaneousGesture so the page's own vertical scrolling
+    /// keeps working; a drag starting anywhere else, or a
+    /// mostly-vertical drag, never dismisses. The gesture lives only
+    /// on this overlay, so a right swipe on the desktop's first page
+    /// can never trigger it, and it is unrelated to the desktop's
+    /// edit-mode icon dragging.
+    /// The page is the front window for the home-bar follow
+    /// (demo §8.3): it shrinks proportionally with the finger
+    /// (scale 1 − p·0.22, slight upward drift, corner radius in 3
+    /// discrete steps) while the desktop is revealed behind it.
+    /// The home-bar strip floats above the page (outside the shrink)
+    /// so it stays put.
+    private var systemPageOverlay: some View {
+        Group {
+            if let page = systemPage {
+                ZStack {
+                    page.view
+                        .simultaneousGesture(
+                            DragGesture(minimumDistance: 30)
+                                .onChanged { value in
+                                    if value.startLocation.x <= 24 {
+                                        edgeSwipeFromLeft = true
+                                    }
+                                }
+                                .onEnded { value in
+                                    defer { edgeSwipeFromLeft = false }
+                                    guard edgeSwipeFromLeft else {
+                                        return
+                                    }
+                                    if value.translation.width > 80
+                                        && value.translation.width > abs(value.translation.height) {
+                                        systemPage = nil
+                                    }
+                                }
+                        )
+                        .toolbar {
+                            ToolbarItem(placement: .topBarTrailing) {
+                                Button("lc.common.done".loc) {
+                                    systemPage = nil
+                                }
+                            }
+                        }
+                        .scaleEffect(homeBarState.windowScale * zoomScale, anchor: zoomAnchor)
+                        .offset(y: homeBarState.windowOffsetY)
+                        .opacity(zoomOpacity)
+                        .apply { content in
+                            let radius = max(homeBarState.windowCornerRadius, zoomRadius)
+                            if radius > 0 {
+                                content.clipShape(RoundedRectangle(cornerRadius: radius))
+                            } else {
+                                content
+                            }
+                        }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .ignoresSafeArea()
+                // The home bar works on system pages too (§11): the
+                // same 36pt strip, bottom-anchored over the page. It
+                // floats above the page content like a real home
+                // indicator; unlocked it does not hit-test, so the
+                // page's own scrolling and taps are untouched.
+                .overlay(alignment: .bottom) {
+                    LCSealBoxHomeIndicatorView(state: homeBarState, isLocked: lockStore.isLocked)
+                }
+                .transition(.asymmetric(
+                    insertion: .identity,
+                    removal: .scale(scale: 0.12, anchor: zoomAnchor).combined(with: .opacity)
+                ))
+            } else {
+                EmptyView()
+            }
+        }
+    }
+
+    /// Fake expanding window for a multitask guest launch (demo §9).
+    /// The real window is a new scene, so the container draws the
+    /// window itself: the app's icon on a full-screen background,
+    /// growing from the tapped icon's centre (scale 0.12 → 1,
+    /// 0.46 s spring-open, opacity 0.18 s, radius 44 → 0 discrete).
+    /// The desktop behind sits at 0.94 / 0.25 and the Dock at
+    /// 0.92 / 0 while it is up (desktopWindowScale /
+    /// dockLayerScale). Dropped once runApp returns (or fails) —
+    /// the scene switch covers the removal.
+    private var guestZoomOverlay: some View {
+        Group {
+            if guestZoomActive, let icon = guestZoomIcon {
+                ZStack {
+                    Color(.systemBackground)
+                    VStack(spacing: 12) {
+                        LCDesktopIconTile(icon: icon, darkModeIcon: darkModeIcon, size: 96)
+                        Text(icon.displayName)
+                            .font(.headline)
+                            .foregroundStyle(.primary)
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .ignoresSafeArea()
+                .scaleEffect(guestZoomScale, anchor: guestZoomAnchor)
+                .opacity(guestZoomOpacity)
+                .apply { content in
+                    if guestZoomRadius > 0 {
+                        content.clipShape(RoundedRectangle(cornerRadius: guestZoomRadius))
+                    } else {
+                        content
+                    }
+                }
+            } else {
+                EmptyView()
+            }
+        }
+    }
+
+    /// Grid "−" delete confirmation (demo §2.6) as a bottom sheet:
+    /// "删除「name」？" + "应用与数据一并清除，不可恢复。", buttons
+    /// 删除应用 (red) / 取消. Confirm runs the real uninstall
+    /// (deleteDesktopApp); scrim / grabber dismiss just closes.
+    private var deleteConfirmSheetOverlay: some View {
+        Group {
+            if showDeleteConfirm {
+                LCBottomSheet(onDismiss: {
+                    showDeleteConfirm = false
+                    appPendingDelete = nil
+                }) {
+                    VStack(spacing: 12) {
+                        Text("lc.appBanner.confirmUninstallTitle".loc)
+                            .font(.headline)
+                            .multilineTextAlignment(.center)
+                        Text("lc.appBanner.confirmUninstallMsg %@".localizeWithFormat(deleteConfirmName))
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                        Divider()
+                        LCBottomSheetActionRow(title: "lc.appBanner.uninstall".loc, role: .destructive) {
+                            if let app = appPendingDelete {
+                                deleteDesktopApp(app)
+                            }
+                            showDeleteConfirm = false
+                        }
+                        LCBottomSheetActionRow(title: "lc.common.cancel".loc, role: .cancel) {
+                            showDeleteConfirm = false
+                            appPendingDelete = nil
+                        }
+                    }
+                }
+                .transition(LCBottomSheet.transition)
+            } else {
+                EmptyView()
+            }
+        }
+    }
+
+    /// Dock "−" confirmation (demo §2.6) as a bottom sheet:
+    /// "将「name」移出 Dock？", buttons 移出 Dock (red) / 取消.
+    /// It only moves the icon back to the grid; the app is never
+    /// deleted here. (Before P2-25 the Dock "−" removed with no
+    /// confirmation at all.)
+    private var dockRemoveSheetOverlay: some View {
+        Group {
+            if showDockRemoveConfirm {
+                LCBottomSheet(onDismiss: {
+                    showDockRemoveConfirm = false
+                    dockRemovePending = nil
+                }) {
+                    VStack(spacing: 12) {
+                        Text("将「\(dockRemovePending?.displayName ?? "")」移出 Dock？")
+                            .font(.headline)
+                            .multilineTextAlignment(.center)
+                        Divider()
+                        LCBottomSheetActionRow(title: "移出 Dock", role: .destructive) {
+                            if let icon = dockRemovePending {
+                                removeIconFromDock(icon)
+                            }
+                            dockRemovePending = nil
+                            showDockRemoveConfirm = false
+                        }
+                        LCBottomSheetActionRow(title: "取消", role: .cancel) {
+                            dockRemovePending = nil
+                            showDockRemoveConfirm = false
+                        }
+                    }
+                }
+                .transition(LCBottomSheet.transition)
+            } else {
+                EmptyView()
+            }
+        }
+    }
+
+    /// Install-replace choice (same options as the old alert, now a
+    /// bottom sheet). Resolves the awaiting installReplaceAlert.open()
+    /// with the chosen option, or nil on cancel / scrim dismiss.
+    private var installReplaceSheetOverlay: some View {
+        Group {
+            if installReplaceAlert.show {
+                LCBottomSheet(onDismiss: {
+                    installReplaceAlert.close(result: nil)
+                }) {
+                    VStack(spacing: 12) {
+                        Text("lc.appList.installation".loc)
+                            .font(.headline)
+                            .multilineTextAlignment(.center)
+                        Text("lc.appList.installReplaceTip".loc)
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                        Divider()
+                        ForEach(installOptions, id: \.self) { installOption in
+                            LCBottomSheetActionRow(
+                                title: installOption.isReplace
+                                    ? installOption.nameOfFolderToInstall
+                                    : "lc.appList.installAsNew".loc,
+                                role: installOption.isReplace ? .destructive : nil
+                            ) {
+                                installReplaceAlert.close(result: installOption)
+                            }
+                        }
+                        LCBottomSheetActionRow(title: "lc.appList.abortInstallation".loc, role: .cancel) {
+                            installReplaceAlert.close(result: nil)
+                        }
+                    }
+                }
+                .transition(LCBottomSheet.transition)
+            } else {
+                EmptyView()
+            }
+        }
+    }
+
+    /// Run-when-multitasking confirmation as a bottom sheet.
+    /// Continue resolves the awaiting open() with true, Cancel /
+    /// scrim dismiss with false.
+    private var runWhenMultitaskSheetOverlay: some View {
+        Group {
+            if runWhenMultitaskAlert.show {
+                LCBottomSheet(onDismiss: {
+                    runWhenMultitaskAlert.close(result: false)
+                }) {
+                    VStack(spacing: 12) {
+                        Text("lc.webView.runApp".loc)
+                            .font(.headline)
+                            .multilineTextAlignment(.center)
+                        Text("lc.appBanner.confirmRunWhenMultitasking".loc)
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                        Divider()
+                        LCBottomSheetActionRow(title: "lc.common.continue".loc, role: .destructive) {
+                            runWhenMultitaskAlert.close(result: true)
+                        }
+                        LCBottomSheetActionRow(title: "lc.common.cancel".loc, role: .cancel) {
+                            runWhenMultitaskAlert.close(result: false)
+                        }
+                    }
+                }
+                .transition(LCBottomSheet.transition)
+            } else {
+                EmptyView()
+            }
+        }
+    }
+
+    /// Restore-default-wallpaper confirmation as a bottom sheet.
+    /// Same copy as the old confirmationDialog.
+    private var restoreWallpaperSheetOverlay: some View {
+        Group {
+            if showRestoreWallpaperDialog {
+                LCBottomSheet(onDismiss: {
+                    showRestoreWallpaperDialog = false
+                }) {
+                    VStack(spacing: 12) {
+                        Text("恢复默认壁纸")
+                            .font(.headline)
+                            .multilineTextAlignment(.center)
+                        Text("将删除自定义壁纸，恢复默认背景。")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                        Divider()
+                        LCBottomSheetActionRow(title: "恢复默认壁纸", role: .destructive) {
+                            wallpaperStore.resetToDefault()
+                            showRestoreWallpaperDialog = false
+                        }
+                        LCBottomSheetActionRow(title: "取消", role: .cancel) {
+                            showRestoreWallpaperDialog = false
+                        }
+                    }
+                }
+                .transition(LCBottomSheet.transition)
+            } else {
+                EmptyView()
+            }
+        }
+    }
+
+    /// JIT modal as a bottom sheet (was a .sheet). The modal's own
+    /// Cancel / Launch-Now buttons resolve jitAlert exactly as
+    /// before; scrim / grabber dismiss resolves false, mirroring
+    /// the old .sheet onDismiss.
+    private var jitSheetOverlay: some View {
+        Group {
+            if jitAlert.show {
+                LCBottomSheet(onDismiss: {
+                    jitAlert.close(result: false)
+                }) {
+                    JITEnablingModal
+                }
+                .transition(LCBottomSheet.transition)
+            } else {
+                EmptyView()
+            }
+        }
+    }
+
+    /// Restores the no-zoom start values (page at full size, no
+    /// radius): used by opens that do not come from a desktop icon
+    /// (switcher card zoom, Control Center).
+    private func resetZoomState() {
+        zoomAnchor = .center
+        zoomScale = 1.0
+        zoomOpacity = 1.0
+        zoomRadius = 0
+    }
+
     var JITEnablingModal : some View {
         NavigationView {
             ScrollViewReader { proxy in
@@ -844,9 +1092,6 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
         for app in sharedModel.apps {
             app.delegate = self
         }
-        for app in sharedModel.hiddenApps {
-            app.delegate = self
-        }
         didAppear = true
     }
     
@@ -868,10 +1113,7 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
         
         if urlToOpen.scheme != "https" && urlToOpen.scheme != "http" {
             var appToLaunch : LCAppModel? = nil
-            var appListsToConsider = [sharedModel.apps]
-            if sharedModel.isHiddenAppUnlocked || !LCUtils.appGroupUserDefault.bool(forKey: "LCStrictHiding") {
-                appListsToConsider.append(sharedModel.hiddenApps)
-            }
+            let appListsToConsider = [sharedModel.apps]
             appLoop:
             for appList in appListsToConsider {
                 for app in appList {
@@ -893,7 +1135,7 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
                 return
             }
             
-            if appToLaunch.appInfo.isLocked && !sharedModel.isHiddenAppUnlocked {
+            if appToLaunch.appInfo.isLocked {
                 do {
                     if !(try await LCUtils.authenticateUser()) {
                         return
@@ -998,29 +1240,8 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
         var outputFolder = LCPath.bundlePath.appendingPathComponent(appRelativePath)
         var appToReplace : LCAppModel? = nil
         // Folder exist! show alert for user to choose which bundle to replace
-        var sameBundleIdApp = sharedModel.apps.filter { app in
+        let sameBundleIdApp = sharedModel.apps.filter { app in
             return app.appInfo.bundleIdentifier()! == newAppInfo.bundleIdentifier()
-        }
-        if sameBundleIdApp.count == 0 {
-            sameBundleIdApp = sharedModel.hiddenApps.filter { app in
-                return app.appInfo.bundleIdentifier()! == newAppInfo.bundleIdentifier()
-            }
-            
-            // we found a hidden app, we need to authenticate before proceeding
-            if sameBundleIdApp.count > 0 && !sharedModel.isHiddenAppUnlocked {
-                do {
-                    if !(try await LCUtils.authenticateUser()) {
-                        self.installprogressVisible = false
-                        return
-                    }
-                } catch {
-                    errorInfo = error.localizedDescription
-                    errorShow = true
-                    self.installprogressVisible = false
-                    return
-                }
-            }
-            
         }
         
         if fm.fileExists(atPath: outputFolder.path) || sameBundleIdApp.count > 0 {
@@ -1123,13 +1344,8 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
             if let appToReplace {
                 let newAppModel = LCAppModel(appInfo: finalNewApp, delegate: self)
                 
-                if appToReplace.uiIsHidden {
-                    sharedModel.hiddenApps.removeAll { $0 == appToReplace }
-                    sharedModel.hiddenApps.append(newAppModel)
-                } else {
-                    sharedModel.apps.removeAll { $0 == appToReplace }
-                    sharedModel.apps.append(newAppModel)
-                }
+                sharedModel.apps.removeAll { $0 == appToReplace }
+                sharedModel.apps.append(newAppModel)
 
             } else {
                 let newAppModel = LCAppModel(appInfo: finalNewApp, delegate: self)
@@ -1352,101 +1568,67 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
         !searchContext.debouncedQuery.isEmpty
     }
 
-    /// All icons that belong on the desktop, unfiltered by search:
-    /// IPA apps (visible + hidden per the hiding rules) + the three
-    /// system icons. Sources / Tweaks are hidden when multiLCStatus == 2,
-    /// mirroring the tab conditions in LCTabView.
-    var desktopAllIconsUnfiltered: [LCDesktopIcon] {
-        var icons: [LCDesktopIcon] = []
-        for app in sortedApps {
-            icons.append(.app(app))
-        }
-        if !LCUtils.appGroupUserDefault.bool(forKey: "LCStrictHiding") || sharedModel.isHiddenAppUnlocked {
-            for app in sortedHiddenApps {
-                icons.append(.app(app))
-            }
-        }
-        for page in LCSystemPage.allCases {
-            if (page == .sources || page == .tweaks) && sharedModel.multiLCStatus == 2 {
-                continue
-            }
-            icons.append(.system(page))
-        }
-        return icons
-    }
-
-    /// All icon ids (unfiltered). Used to sync the persisted order; the
-    /// sync must never see the search filter, or a search would prune
-    /// non-matching apps out of the order.
+    /// All IPA apps, unfiltered by search: the sync source for the
+    /// persisted slot order. System icons are NOT in this list
+    /// (拍板项 1): they are fixed-position icons in their own row,
+    /// never in the slot order, never dragged, never counted in the
+    /// 24/page grid.
     var desktopAllIDs: [String] {
-        desktopAllIconsUnfiltered.map { $0.id }
+        sharedModel.apps.map { LCDesktopIcon.appID(for: $0) }
     }
 
-    /// Icons as the user sees them on the grid: the persisted order,
-    /// filtered by the current search (system icons are hidden while
-    /// searching), excluding Dock members (a Dock icon is not duplicated
-    /// in the grid, iPhone-style).
-    var desktopVisibleIcons: [LCDesktopIcon] {
-        // Search-aware source list.
-        var sourceIcons: [LCDesktopIcon] = []
-        for app in filteredApps {
-            sourceIcons.append(.app(app))
+    /// Sparse grid slots (demo §1.5): one entry per grid slot, `nil` =
+    /// an empty slot that stays empty — nothing auto-fills it, deleting
+    /// or moving an icon frees its slot without shifting the others.
+    /// Built from the persisted slot order; Dock members never appear
+    /// here (they are not in the order). While searching, the matches
+    /// render densely (dragging is disabled while searching, so slot
+    /// positions do not matter then).
+    var desktopVisibleSlots: [LCDesktopIcon?] {
+        if isSearching {
+            return filteredApps.map { LCDesktopIcon.app($0) }
         }
-        if !LCUtils.appGroupUserDefault.bool(forKey: "LCStrictHiding") || sharedModel.isHiddenAppUnlocked {
-            for app in filteredHiddenApps {
-                sourceIcons.append(.app(app))
-            }
-        }
-        if !isSearching {
-            for page in LCSystemPage.allCases {
-                if (page == .sources || page == .tweaks) && sharedModel.multiLCStatus == 2 {
-                    continue
-                }
-                sourceIcons.append(.system(page))
-            }
-        }
-        let byID = Dictionary(uniqueKeysWithValues: sourceIcons.map { ($0.id, $0) })
+        let byID = Dictionary(uniqueKeysWithValues: sharedModel.apps.map { (LCDesktopIcon.appID(for: $0), LCDesktopIcon.app($0)) })
         let dockIDs = Set(desktopDock.dockIDs)
-        var visible = desktopOrder.order.compactMap { byID[$0] }.filter { !dockIDs.contains($0.id) }
+        var slots: [LCDesktopIcon?] = desktopOrder.order.map { id in
+            id.isEmpty ? nil : byID[id]
+        }
         // Icons not yet in the persisted order (e.g. installed before
         // the next sync) go at the end rather than vanishing.
-        for icon in sourceIcons where !desktopOrder.order.contains(icon.id) && !dockIDs.contains(icon.id) {
-            visible.append(icon)
+        for app in sharedModel.apps {
+            let id = LCDesktopIcon.appID(for: app)
+            if !desktopOrder.order.contains(id) && !dockIDs.contains(id) {
+                slots.append(.app(app))
+            }
         }
-        return visible
+        return slots
     }
 
     /// Icons currently in the Dock, in Dock order. Apps only: a
     /// system icon that an older build persisted in the Dock is
     /// dropped here (and purged from the store on launch); it stays
-    /// in the grid.
+    /// in the fixed system row.
     var dockDisplayIcons: [LCDesktopIcon] {
-        let byID = Dictionary(uniqueKeysWithValues: desktopAllIconsUnfiltered.map { ($0.id, $0) })
+        let byID = Dictionary(uniqueKeysWithValues: sharedModel.apps.map { (LCDesktopIcon.appID(for: $0), LCDesktopIcon.app($0)) })
         return desktopDock.dockIDs.compactMap { byID[$0] }.filter { !$0.isSystem }
     }
 
-    /// Ids of imported IPA apps only (no system icons). Used for the
-    /// Dock's initial fill: the Dock never holds system icons.
-    var desktopAppIDs: [String] {
-        desktopAllIconsUnfiltered.compactMap { $0.appModel != nil ? $0.id : nil }
-    }
-
-    var desktopPages: [[LCDesktopIcon]] {
-        let icons = desktopVisibleIcons
-        guard !icons.isEmpty else {
+    var desktopPages: [[LCDesktopIcon?]] {
+        let slots = desktopVisibleSlots
+        guard !slots.isEmpty else {
             return []
         }
-        var pages: [[LCDesktopIcon]] = []
+        var pages: [[LCDesktopIcon?]] = []
         var index = 0
-        while index < icons.count {
-            let end = min(index + Self.desktopIconsPerPage, icons.count)
-            pages.append(Array(icons[index..<end]))
+        while index < slots.count {
+            let end = min(index + Self.desktopIconsPerPage, slots.count)
+            pages.append(Array(slots[index..<end]))
             index = end
         }
         return pages
     }
 
-    /// Live page count: ceil(total icons / 24). Never hardcoded.
+    /// Live page count: ceil(total slots / 24). Never hardcoded.
     /// In edit mode the demo (§1.6) appends an extra trailing blank
     /// page whenever the last page is non-empty, so an icon can always
     /// be dragged onto a fresh page. It disappears on exiting edit
@@ -1455,7 +1637,7 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
     /// the demo's 16/page is not adopted.
     var desktopPageCount: Int {
         let base = max(1, desktopPages.count)
-        if isEditing, let last = desktopPages.last, !last.isEmpty {
+        if isEditing, let last = desktopPages.last, last.contains(where: { $0 != nil }) {
             return base + 1
         }
         return base
@@ -1521,42 +1703,69 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
     }
 
     private func desktopPageGrid(page: Int) -> some View {
-        let icons = page < desktopPages.count ? desktopPages[page] : []
+        // A page always renders all 24 slots (demo §1.5): occupied
+        // slots show their icon, empty slots stay blank and are
+        // droppable. The extra trailing blank page in edit mode has no
+        // stored slots, so it renders 24 empty ones.
+        let slots: [LCDesktopIcon?] = page < desktopPages.count
+            ? desktopPages[page]
+            : Array(repeating: nil, count: Self.desktopIconsPerPage)
         return LazyVGrid(columns: desktopGridColumns, spacing: 18) {
-            ForEach(icons, id: \.id) { icon in
-                LCDesktopGridCell(
-                    icon: icon,
-                    isEditing: isEditing,
-                    isDragged: desktopDrag.draggedID == icon.id,
-                    isDropTarget: desktopDrag.dropTarget == .cell(id: icon.id),
-                    darkModeIcon: darkModeIcon,
-                    theme: desktopTheme,
-                    onTap: {
-                        desktopIconTapped(icon)
-                    },
-                    onDelete: icon.isDeletable ? {
-                        requestDelete(icon)
-                    } : nil
-                )
-                .apply { cell in
-                    // Dragging is disabled while searching: a search
-                    // shows a filtered subset, and reordering a subset
-                    // would corrupt the persisted full order. Otherwise
-                    // the icon carries the long-press → drag gesture
-                    // (demo §1.4): it attaches on pointerdown
-                    // regardless of edit mode, so the finger that
-                    // long-pressed into edit mode can keep moving and
-                    // drag without lifting. SwiftUI's onDrag / onDrop
-                    // cannot do this — onDrag's internal press
-                    // recogniser claims the touch before the long-press
-                    // fires — so the drag is implemented by hand (see
-                    // LCDesktopDrag.swift).
-                    if isSearching {
-                        cell
+            ForEach(Array(slots.enumerated()), id: \.offset) { entry in
+                let slot = page * Self.desktopIconsPerPage + entry.offset
+                Group {
+                    if let icon = entry.element {
+                        LCDesktopGridCell(
+                            icon: icon,
+                            isEditing: isEditing,
+                            isDragged: desktopDrag.draggedID == icon.id,
+                            isDropTarget: desktopDrag.dropTarget == .cell(id: icon.id),
+                            darkModeIcon: darkModeIcon,
+                            theme: desktopTheme,
+                            onTap: {
+                                desktopIconTapped(icon)
+                            },
+                            onDelete: icon.isDeletable ? {
+                                requestDelete(icon)
+                            } : nil
+                        )
+                        .apply { cell in
+                            // Dragging is disabled while searching: a search
+                            // shows a filtered subset, and reordering a subset
+                            // would corrupt the persisted full order. Otherwise
+                            // the icon carries the long-press → drag gesture
+                            // (demo §1.4): it attaches on pointerdown
+                            // regardless of edit mode, so the finger that
+                            // long-pressed into edit mode can keep moving and
+                            // drag without lifting. SwiftUI's onDrag / onDrop
+                            // cannot do this — onDrag's internal press
+                            // recogniser claims the touch before the long-press
+                            // fires — so the drag is implemented by hand (see
+                            // LCDesktopDrag.swift).
+                            if isSearching {
+                                cell
+                            } else {
+                                cell.gesture(desktopIconDragGesture(for: icon, isInDock: false))
+                            }
+                        }
                     } else {
-                        cell.gesture(desktopIconDragGesture(for: icon, isInDock: false))
+                        LCDesktopEmptySlotView(
+                            isDropTarget: desktopDrag.dropTarget == .emptySlot(slot: slot)
+                        )
                     }
                 }
+                // Slot frame for the drag hit-test: every rendered slot
+                // reports its rect in the "desktop" coordinate space,
+                // occupied or empty, so a drag can land exactly on an
+                // empty cell.
+                .background(
+                    GeometryReader { proxy in
+                        Color.clear.preference(
+                            key: LCDesktopSlotFramePreferenceKey.self,
+                            value: [slot: proxy.frame(in: .named("desktop"))]
+                        )
+                    }
+                )
             }
         }
         .padding(.horizontal, 20)
@@ -1574,13 +1783,68 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
         )
     }
 
+    /// The three system-page icons (Sources / Tweaks / Settings) in
+    /// their fixed row (拍板项 1): always in the same place, on every
+    /// page, in the grid's own columns — but never in the slot order,
+    /// never draggable, never counted in the 24/page grid, never in
+    /// the Dock. Sources / Tweaks are hidden when multiLCStatus == 2,
+    /// mirroring the tab conditions in LCTabView. Hidden while
+    /// searching, like the old grid's system icons were. In edit mode
+    /// they do not jiggle and cannot be dragged: tapping one does
+    /// nothing, exactly like tapping a grid icon in edit mode.
+    private var desktopSystemIconsRow: some View {
+        Group {
+            if !isSearching {
+                LazyVGrid(columns: desktopGridColumns, spacing: 18) {
+                    ForEach(LCSystemPage.allCases, id: \.id) { page in
+                        if (page == .sources || page == .tweaks) && sharedModel.multiLCStatus == 2 {
+                            EmptyView()
+                        } else {
+                            systemIconCell(page)
+                        }
+                    }
+                }
+                .padding(.horizontal, 20)
+                .padding(.top, 4)
+            }
+        }
+    }
+
+    private func systemIconCell(_ page: LCSystemPage) -> some View {
+        let icon = LCDesktopIcon.system(page)
+        return VStack(spacing: 4) {
+            LCDesktopIconTile(icon: icon, darkModeIcon: darkModeIcon, size: 60)
+            Text(icon.displayName)
+                .font(.system(size: 12))
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .minimumScaleFactor(0.7)
+                .foregroundStyle(desktopTheme.nameColor)
+                .shadow(color: .black.opacity(0.55), radius: 2, x: 0, y: 1)
+                .frame(maxWidth: 76)
+        }
+        .frame(maxWidth: .infinity)
+        // High-priority tap, like a grid cell: in edit mode the tap is
+        // claimed and does nothing (it must not exit edit mode, and it
+        // must not open the page); outside edit mode it opens the page.
+        .highPriorityGesture(
+            TapGesture().onEnded {
+                guard !isEditing else {
+                    return
+                }
+                systemPage = page
+            }
+        )
+    }
+
     /// Custom page dots (not the system PageTabViewStyle dots: the system
     /// dots' style and position cannot be guaranteed to sit above the
     /// Dock, and they are not tappable). Centred above the Dock; current
     /// page is a bright solid dot, others gray; tappable to jump; hidden
     /// when there is only one page. Demo §3: 8 pt dots, 7 pt gap, each
-    /// dot in a padded tap target (6×2 pt), colour transition 0.3 s
-    /// spring-open. The active dot does not scale in the demo.
+    /// dot in a padded tap target (6×2 pt), active #fff, inactive
+    /// rgba(255,255,255,.45), colour transition 0.3 s spring-open.
+    /// The active dot does not scale in the demo.
     private var desktopPageDots: some View {
         Group {
             if desktopPageCount > 1 {
@@ -1592,7 +1856,7 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
                             }
                         } label: {
                             Circle()
-                                .fill(page == currentPage ? Color.primary : Color.secondary.opacity(0.5))
+                                .fill(page == currentPage ? Color.white : Color.white.opacity(0.45))
                                 .frame(width: 8, height: 8)
                                 .animation(.spring(response: 0.3, dampingFraction: 0.85), value: currentPage)
                         }
@@ -1605,10 +1869,12 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
         }
     }
 
-    /// Edit-mode top capsules (v7): "+" top-left opens the .ipa/.tipa
-    /// importer; "···" top-right opens the menu (wallpaper, theme,
-    /// search, sort, restore default, done). Only visible in edit mode;
-    /// in normal mode the desktop shows no buttons at all.
+    /// Edit-mode top bar (demo §2.3): a 52 pt bar, "+" top-left, "•••"
+    /// top-right, both 38×38 glass circles. Nothing else lives here:
+    /// no title, no status-bar replacement, no other button. The
+    /// status bar itself is hidden in edit mode (demo §2.2, the
+    /// .statusBar(hidden:) on the desktop shell). "+" opens the
+    /// .ipa/.tipa importer; "•••" toggles the menu (demo §2.4).
     private var editModeTopBar: some View {
         HStack {
             Button {
@@ -1616,62 +1882,85 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
             } label: {
                 Text("+")
                     .font(.system(size: 20, weight: .semibold))
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 2)
-                    .background(Capsule().fill(.ultraThinMaterial))
+                    .frame(width: 38, height: 38)
+                    .background(Circle().fill(.ultraThinMaterial))
             }
             Spacer()
-            Menu {
-                Button {
-                    showWallpaperPicker = true
-                } label: {
-                    Label("壁纸", systemImage: "photo")
-                }
-                Picker("主题色", selection: $desktopTheme) {
-                    ForEach(LCDesktopTheme.allCases, id: \.self) { theme in
-                        Text(theme.displayName).tag(theme)
-                    }
-                }
-                Button {
-                    showSearchBar = true
-                } label: {
-                    Label("搜索", systemImage: "magnifyingglass")
-                }
-                Picker("排序", selection: $sharedAppSortManager.appSortType) {
-                    ForEach(AppSortType.allCases, id: \.self) { sortType in
-                        Label(sortType.displayName, systemImage: sortType.systemImage)
-                            .tag(sortType)
-                    }
-                }
-                .onChange(of: sharedAppSortManager.appSortType) { newValue in
-                    if sharedAppSortManager.appSortType == .custom {
-                        customSortViewPresent = true
-                    }
-                }
-                if sharedAppSortManager.appSortType == .custom {
-                    Button {
-                        customSortViewPresent = true
-                    } label: {
-                        Label("lc.appList.sort.customManage".loc, systemImage: "slider.horizontal.3")
-                    }
-                }
-                Divider()
-                Button("恢复默认壁纸", role: .destructive) {
-                    showRestoreWallpaperDialog = true
-                }
-                Button("完成") {
-                    exitEditMode()
+            Button {
+                withAnimation(.spring(response: 0.34, dampingFraction: 0.6)) {
+                    showEditMenu.toggle()
                 }
             } label: {
                 Image(systemName: "ellipsis")
                     .font(.system(size: 17, weight: .semibold))
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 8)
-                    .background(Capsule().fill(.ultraThinMaterial))
+                    .frame(width: 38, height: 38)
+                    .background(Circle().fill(.ultraThinMaterial))
             }
         }
-        .padding(.horizontal, 20)
-        .padding(.top, 12)
+        .padding(.horizontal, 30)
+        .frame(height: 52)
+    }
+
+    /// The edit-mode "•••" menu (demo §2.4): exactly four rows —
+    /// 更换壁纸 ›, 搜索应用 ›, 控制中心 ›, divider, 完成 (bold).
+    /// 218 pt wide, glass, radius 22. Each row closes the menu first,
+    /// then opens its target; "完成" exits edit mode. The theme picker,
+    /// sort picker, custom sort management and restore-default wallpaper
+    /// are NOT here anymore: theme lives in Settings only, sorting is
+    /// deleted (free placement), and restore-default lives in Settings
+    /// only. Opens scale 0.82 + translateY(−8) from the top-right
+    /// (0.34 s spring-pop, see the transition on the overlay).
+    private var editMenuPopover: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            editMenuRow(title: "更换壁纸") {
+                showWallpaperPicker = true
+            }
+            editMenuRow(title: "搜索应用") {
+                showSearchBar = true
+            }
+            editMenuRow(title: "控制中心") {
+                showControlCenter = true
+            }
+            Divider()
+                .padding(.vertical, 4)
+            Button {
+                withAnimation(.spring(response: 0.34, dampingFraction: 0.6)) {
+                    showEditMenu = false
+                }
+                exitEditMode()
+            } label: {
+                Text("完成")
+                    .font(.system(size: 14.5, weight: .bold))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.vertical, 11)
+                    .padding(.horizontal, 12)
+            }
+            .buttonStyle(LCEditMenuRowButtonStyle())
+        }
+        .padding(6)
+        .frame(width: 218)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 22))
+    }
+
+    private func editMenuRow(title: String, action: @escaping () -> Void) -> some View {
+        Button {
+            withAnimation(.spring(response: 0.34, dampingFraction: 0.6)) {
+                showEditMenu = false
+            }
+            action()
+        } label: {
+            HStack {
+                Text(title)
+                    .font(.system(size: 14.5))
+                Spacer()
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.vertical, 11)
+            .padding(.horizontal, 12)
+        }
+        .buttonStyle(LCEditMenuRowButtonStyle())
     }
 
     /// Floating search field, opened from the edit-mode "···" menu.
@@ -1739,11 +2028,12 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
         editingSince = Date()
     }
 
-    /// Exits edit mode: stops jiggling and dragging, hides the search
-    /// field and clears the query.
+    /// Exits edit mode: stops jiggling and dragging, closes the "•••"
+    /// menu, hides the search field and clears the query.
     private func exitEditMode() {
         isEditing = false
         desktopDrag.endDrag()
+        showEditMenu = false
         showSearchBar = false
         searchContext.query = ""
     }
@@ -1772,50 +2062,141 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
         }
     }
 
-    /// Dock initial fill from launch counts. Only while the user has never
-    /// dragged anything: once manually edited, manual order wins and this
-    /// is a no-op. Icons leaving the Dock return to the grid; icons
-    /// entering the Dock leave the grid (no duplication).
-    func refreshDock() {
-        guard !desktopDock.manuallyEdited else {
-            return
-        }
-        let top = LCDesktopLaunchCountStore.topIDs(
-            limit: LCDesktopDockStore.maxDockItems,
-            fallbackOrder: desktopAppIDs
-        )
-        let oldDock = desktopDock.dockIDs
-        desktopDock.autoFill(topIDs: top)
-        for id in oldDock where !desktopDock.dockIDs.contains(id) {
-            if !desktopOrder.order.contains(id) {
-                desktopOrder.insert(id: id, at: desktopOrder.order.count)
-            }
-        }
-        for id in desktopDock.dockIDs {
-            desktopOrder.remove(id: id)
-        }
-    }
-
     func desktopIconTapped(_ icon: LCDesktopIcon) {
+        // Edit mode (demo §2.5 / P2-28): tapping an icon opens it
+        // and exits edit mode — it is no longer a no-op. (The grid
+        // cell and Dock guards that swallowed edit-mode taps are
+        // gone too; the cell's delete badge still suppresses the
+        // tap that hits it, see LCDesktopGridCell.)
+        if isEditing {
+            exitEditMode()
+        }
         switch icon {
         case .app(let model):
-            launchDesktopApp(model)
+            launchDesktopApp(model, zoomFrom: icon)
         case .system(let page):
-            systemPage = page
+            openSystemPage(page, zoomFrom: icon)
         }
     }
 
-    /// Launch a guest app from the grid or the Dock: record the launch
-    /// (feeds the Dock's most-used ranking), show the container's own
-    /// "launching" Live Activity, run, then finish the activity.
-    func launchDesktopApp(_ app: LCAppModel) {
-        let id = LCDesktopIcon.appID(for: app)
-        LCDesktopLaunchCountStore.recordLaunch(id: id)
+    /// Centre of an icon's tile in screen coordinates, from the drag
+    /// hit-test frames (the same "desktop" space the drag ghost
+    /// uses, whose origin is the screen's top-left). Nil before the
+    /// first layout pass reported the frame — the caller then opens
+    /// without a zoom rather than from a guessed point.
+    private func iconCenter(for icon: LCDesktopIcon) -> CGPoint? {
+        if let frame = desktopDrag.cellFrames[icon.id] {
+            return CGPoint(x: frame.midX, y: frame.midY)
+        }
+        if let slot = dockDisplayIcons.firstIndex(where: { $0.id == icon.id }),
+           let frame = desktopDrag.dockSlotFrames[slot] {
+            return CGPoint(x: frame.midX, y: frame.midY)
+        }
+        return nil
+    }
+
+    /// System page open with the icon-zoom transition (demo §9): the
+    /// page starts at scale 0.12 / opacity 0 / radius 44 around the
+    /// tapped icon's centre, then springs to full screen (0.46 s
+    /// spring-open, opacity 0.18 s). The start frame is committed
+    /// first; the animation runs on the next runloop so the 44 pt
+    /// radius shows for one frame before flipping discretely to 0.
+    /// Without a reported frame the page opens with no zoom.
+    private func openSystemPage(_ page: LCSystemPage, zoomFrom icon: LCDesktopIcon) {
+        guard let origin = iconCenter(for: icon) else {
+            resetZoomState()
+            systemPage = page
+            return
+        }
+        let screen = UIScreen.main.bounds
+        zoomAnchor = UnitPoint(x: origin.x / screen.width, y: origin.y / screen.height)
+        // The start frame must commit instantly: the overlay chain
+        // carries .animation(value: systemPage), which would
+        // otherwise animate 1.0 → 0.12 as a shrink before the zoom
+        // even starts. Disable animations for this one transaction;
+        // the zoom itself runs in the async block below.
+        var startTransaction = Transaction()
+        startTransaction.disablesAnimations = true
+        withTransaction(startTransaction) {
+            zoomRadius = 44
+            zoomScale = 0.12
+            zoomOpacity = 0
+            systemPage = page
+        }
+        DispatchQueue.main.async {
+            withAnimation(.spring(response: 0.46, dampingFraction: 0.85)) {
+                self.zoomScale = 1.0
+            }
+            withAnimation(.spring(response: 0.18, dampingFraction: 1.0)) {
+                self.zoomOpacity = 1.0
+            }
+            // Radius flips discretely, one frame after the zoom
+            // starts (demo §9: never interpolated per-frame).
+            DispatchQueue.main.async {
+                self.zoomRadius = 0
+            }
+        }
+    }
+
+    /// True when this launch will open a multitask window (demo §9
+    /// zoom applies): runApp takes the multitask branch only for a
+    /// non-classic app set to launch in multitask mode. A classic
+    /// launch relaunches the process — there is no window to
+    /// animate — and launches that take runApp's other paths (an
+    /// already-multitasking container, a free-LC handoff) get no
+    /// faked zoom either.
+    private func shouldZoomGuestApp(_ app: LCAppModel) -> Bool {
+        app.appInfo.defaultClassicMode == 0 && app.shouldLaunchInMultitaskMode
+    }
+
+    /// Starts the fake expanding window for a multitask guest launch
+    /// (demo §9): the app's icon on a full-screen background,
+    /// growing from the tapped icon's centre. Same motion as the
+    /// system-page zoom (0.46 s spring-open, opacity 0.18 s,
+    /// radius 44 → 0 discrete).
+    private func startGuestZoom(icon: LCDesktopIcon, origin: CGPoint) {
+        let screen = UIScreen.main.bounds
+        guestZoomAnchor = UnitPoint(x: origin.x / screen.width, y: origin.y / screen.height)
+        guestZoomIcon = icon
+        guestZoomRadius = 44
+        guestZoomScale = 0.12
+        guestZoomOpacity = 0
+        guestZoomActive = true
+        DispatchQueue.main.async {
+            withAnimation(.spring(response: 0.46, dampingFraction: 0.85)) {
+                self.guestZoomScale = 1.0
+            }
+            withAnimation(.spring(response: 0.18, dampingFraction: 1.0)) {
+                self.guestZoomOpacity = 1.0
+            }
+            DispatchQueue.main.async {
+                self.guestZoomRadius = 0
+            }
+        }
+    }
+
+    /// Drops the fake zoom window. Called once runApp returns (or
+    /// fails); the scene switch covers the removal, and on failure
+    /// the desktop + error alert are revealed again.
+    private func endGuestZoom() {
+        guestZoomActive = false
+        guestZoomIcon = nil
+    }
+
+    /// Launch a guest app from the grid or the Dock: show the
+    /// container's own "launching" Live Activity, run, then finish
+    /// the activity.
+    /// `zoomFrom` is the tapped icon: when the launch will open a
+    /// multitask window, the fake window zooms from it for 0.46 s
+    /// before runApp opens the scene (P2-28). Classic launches and
+    /// launches without a tapped icon (search rows have no frame)
+    /// keep the existing launch path untouched.
+    func launchDesktopApp(_ app: LCAppModel, zoomFrom icon: LCDesktopIcon? = nil) {
         if #available(iOS 16.2, *) {
             LCContainerLiveActivityManager.startLaunching(appName: app.displayName)
         }
         Task {
-            if app.appInfo.isLocked && !sharedModel.isHiddenAppUnlocked {
+            if app.appInfo.isLocked {
                 do {
                     if !(try await LCUtils.authenticateUser()) {
                         if #available(iOS 16.2, *) {
@@ -1832,17 +2213,28 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
                     return
                 }
             }
+            // Icon-zoom open (demo §9): only for multitask windows,
+            // after auth (so a failed auth never plays a zoom to
+            // nowhere). The zoom window stays up until runApp
+            // returns; it reads as a launch splash if signing takes
+            // a moment.
+            if let icon, shouldZoomGuestApp(app), let origin = iconCenter(for: icon) {
+                await MainActor.run {
+                    startGuestZoom(icon: icon, origin: origin)
+                }
+                try? await Task.sleep(nanoseconds: 460_000_000)
+            }
             do {
                 try await app.runApp()
             } catch {
                 errorInfo = error.localizedDescription
                 errorShow = true
             }
+            await MainActor.run {
+                endGuestZoom()
+            }
             if #available(iOS 16.2, *) {
                 LCContainerLiveActivityManager.finish(statusText: "lc.common.done".loc)
-            }
-            await MainActor.run {
-                refreshDock()
             }
         }
     }
@@ -1887,7 +2279,6 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
         removeApp(app: app)
         desktopOrder.remove(id: id)
         desktopDock.removeEverywhere(id: id)
-        refreshDock()
         appPendingDelete = nil
     }
 
@@ -1930,20 +2321,44 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
         }
     }
 
+    /// True while a front window covers the desktop: a system page
+    /// (overlay now, not a cover) or the guest-open zoom window.
+    private var frontWindowOpen: Bool {
+        systemPage != nil || guestZoomActive
+    }
+
+    /// Desktop layer scale (demo §9 / §8.3): behind a front window
+    /// it sits at 0.94, returning to 1.0 with the home-bar follow as
+    /// the window shrinks; otherwise it follows the finger
+    /// (homeBarState.windowScale, 1.0 at rest).
+    private var desktopWindowScale: CGFloat {
+        if showSwitcher { return 0.92 }
+        if frontWindowOpen { return 0.94 + 0.06 * homeBarState.followProgress }
+        return homeBarState.windowScale
+    }
+
+    /// Desktop layer opacity (demo §9 / §8.3): 0.25 behind a front
+    /// window, returning to 1.0 with the home-bar follow.
+    private var desktopWindowOpacity: Double {
+        if showSwitcher { return 0.5 }
+        if frontWindowOpen { return 0.25 + 0.75 * Double(homeBarState.followProgress) }
+        return 1.0
+    }
+
     /// Dock layer scale for the home-bar follow / switcher (demo
     /// §7.1 / §8.3). The Dock follows the front window down (scale
     /// 0.92 + p·0.08, opacity p) when a system page is open, and
     /// shrinks to 0.96 / 0.55 while the switcher is up.
     private var dockLayerScale: CGFloat {
         if showSwitcher { return 0.96 }
-        if systemPage != nil { return 0.92 + homeBarState.followProgress * 0.08 }
+        if systemPage != nil || guestZoomActive { return 0.92 + homeBarState.followProgress * 0.08 }
         return 1.0
     }
 
     /// Dock layer opacity for the home-bar follow / switcher.
     private var dockLayerOpacity: Double {
         if showSwitcher { return 0.55 }
-        if systemPage != nil { return Double(homeBarState.followProgress) }
+        if systemPage != nil || guestZoomActive { return Double(homeBarState.followProgress) }
         return 1.0
     }
 
@@ -1953,7 +2368,7 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
     /// for grid icons (mirroring the cell).
     private func desktopDragGhost(for icon: LCDesktopIcon) -> some View {
         let lift = max(0, min(1, (desktopDrag.ghostScale - 1) / 0.15))
-        let tileSize: CGFloat = desktopDrag.draggedFromDock ? 56 : 60
+        let tileSize: CGFloat = desktopDrag.draggedFromDock ? 60 : 58
         return VStack(spacing: 4) {
             LCDesktopIconTile(icon: icon, darkModeIcon: darkModeIcon, size: tileSize)
             if !desktopDrag.draggedFromDock {
@@ -1966,7 +2381,8 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
             }
         }
         .scaleEffect(desktopDrag.ghostScale)
-        .shadow(color: .black.opacity(0.3 * lift), radius: 12 * lift, x: 0, y: 8 * lift)
+        // Drag lift shadow (demo §1.4): 0 22px 40px rgba(5,10,26,.5).
+        .shadow(color: Color(red: 5 / 255, green: 10 / 255, blue: 26 / 255).opacity(0.5 * lift), radius: 40 * lift, x: 0, y: 22 * lift)
         .position(x: desktopDrag.ghostCenter.x, y: desktopDrag.ghostCenter.y)
     }
 
@@ -1998,9 +2414,9 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
                 // preference change landed): centre the ghost on the
                 // finger rather than offsetting it.
                 startFrame = CGRect(
-                    x: value.startLocation.x - 28,
-                    y: value.startLocation.y - 28,
-                    width: 56, height: 56
+                    x: value.startLocation.x - 30,
+                    y: value.startLocation.y - 30,
+                    width: 60, height: 60
                 )
                 startCenter = value.startLocation
             }
@@ -2011,9 +2427,9 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
                 startCenter = CGPoint(x: frame.midX, y: frame.midY)
             } else {
                 startFrame = CGRect(
-                    x: value.startLocation.x - 30,
-                    y: value.startLocation.y - 39.5,
-                    width: 60, height: 79
+                    x: value.startLocation.x - 29,
+                    y: value.startLocation.y - 38.5,
+                    width: 58, height: 77
                 )
                 startCenter = value.startLocation
             }
@@ -2072,10 +2488,19 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
             }
             return .dockAppend
         }
-        let icons = currentPage < desktopPages.count ? desktopPages[currentPage] : []
-        for icon in icons {
-            if let frame = desktopDrag.cellFrames[icon.id], frame.contains(point) {
-                return .cell(id: icon.id)
+        // Grid slots first: every rendered slot (occupied or empty)
+        // hit-tests from its slot frame. The extra trailing blank page
+        // in edit mode renders 24 empty slots, so it hit-tests too.
+        let slots: [LCDesktopIcon?] = currentPage < desktopPages.count
+            ? desktopPages[currentPage]
+            : Array(repeating: nil, count: Self.desktopIconsPerPage)
+        for (offset, icon) in slots.enumerated() {
+            let slot = currentPage * Self.desktopIconsPerPage + offset
+            if let frame = desktopDrag.slotFrames[slot], frame.contains(point) {
+                if let icon {
+                    return .cell(id: icon.id)
+                }
+                return .emptySlot(slot: slot)
             }
         }
         if let gridFrame = desktopDrag.gridFrames[currentPage], gridFrame.contains(point) {
@@ -2120,6 +2545,13 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
                 return (true, CGPoint(x: frame.midX, y: frame.midY))
             }
             return (true, originCenter)
+        case .emptySlot(let slot):
+            // Drop on an empty cell: the icon stays exactly there
+            // (demo §1.5).
+            if let frame = desktopDrag.slotFrames[slot] {
+                return (true, CGPoint(x: frame.midX, y: frame.midY))
+            }
+            return (true, originCenter)
         case .dockSlot(let index, let iconID):
             guard iconID != draggedID, !fromDock, !LCDesktopIcon.isSystemID(draggedID) else { return (false, originCenter) }
             if let frame = desktopDrag.dockSlotFrames[index] {
@@ -2134,15 +2566,24 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
             }
             return (true, CGPoint(x: desktopDrag.dockFrame.midX, y: desktopDrag.dockFrame.midY))
         case .pageEnd(let page):
-            let icons = page < desktopPages.count ? desktopPages[page] : []
-            if icons.last?.id == draggedID { return (false, originCenter) }
-            if let lastID = icons.last?.id, let frame = desktopDrag.cellFrames[lastID] {
+            // Blank area of a page: land at the end of that page
+            // (demo §1.5) — the slot just past the page's last occupied
+            // icon. No change if the dragged icon already is that
+            // last icon.
+            let slots = page < desktopPages.count ? desktopPages[page] : []
+            let lastOccupied = slots.enumerated().reversed().first(where: { $0.element != nil })
+            if lastOccupied?.element?.id == draggedID { return (false, originCenter) }
+            let slot = pageEndTargetSlot(page: page)
+            if let frame = desktopDrag.slotFrames[slot] {
+                return (true, CGPoint(x: frame.midX, y: frame.midY))
+            }
+            if let lastID = lastOccupied?.element?.id, let frame = desktopDrag.cellFrames[lastID] {
                 // The icon lands in the next slot after the last one:
                 // one column to the right, or the first column of the
                 // next row if the row is full. The column width is the
                 // cell width + the 12 pt column spacing; the row
                 // height is the cell height + the 18 pt row spacing.
-                let col = (icons.count - 1) % 4
+                let col = (lastOccupied?.offset ?? 0) % 4
                 let cellW = frame.width
                 let cellH = frame.height
                 if col < 3 {
@@ -2166,9 +2607,10 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
         }
     }
 
-    /// Commits a drop at handoff (demo §1.5 swap semantics). Called
-    /// after the ghost's landing flight, inside the landing spring's
-    /// animation so the swapped icons glide to their new slots.
+    /// Commits a drop at handoff (demo §1.5 swap / free-placement
+    /// semantics). Called after the ghost's landing flight, inside the
+    /// landing spring's animation so the moved icons glide to their
+    /// new slots.
     private func commitDrop(draggedID: String, target: LCDesktopDropTarget, fromDock: Bool, originIndex: Int?) {
         let spring = Animation.spring(response: LCDesktopDragState.landingDuration, dampingFraction: 1.0)
         switch target {
@@ -2180,24 +2622,35 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
                 withAnimation(spring) {
                     desktopDock.removeFromDock(id: draggedID)
                     desktopOrder.replace(id: targetID, with: draggedID)
-                    desktopOrder.insert(id: targetID, at: desktopOrder.order.count)
+                    desktopOrder.placeInFirstFreeSlot(id: targetID)
                 }
             } else {
                 withAnimation(spring) {
                     desktopOrder.swap(id: draggedID, withID: targetID)
                 }
             }
+        case .emptySlot(let slot):
+            // Drop on an empty cell: the icon stays exactly there
+            // (demo §1.5). The old slot is freed; nothing else moves.
+            withAnimation(spring) {
+                if fromDock {
+                    desktopDock.removeFromDock(id: draggedID)
+                }
+                desktopOrder.moveToSlot(id: draggedID, slot: slot)
+            }
         case .dockSlot(let index, let iconID):
             guard iconID != draggedID, !fromDock, !LCDesktopIcon.isSystemID(draggedID) else { return }
             // Grid → occupied Dock slot: swap. The Dock icon returns
-            // to the dragged icon's original grid cell.
+            // to the dragged icon's original grid cell — a direct
+            // slot assignment, not an insert (inserting would shift
+            // every icon after it).
             withAnimation(spring) {
                 desktopOrder.remove(id: draggedID)
                 desktopDock.replaceDockIcon(at: index, with: draggedID)
-                if let originIndex, originIndex <= desktopOrder.order.count {
-                    desktopOrder.insert(id: iconID, at: originIndex)
+                if let originIndex {
+                    desktopOrder.moveToSlot(id: iconID, slot: originIndex)
                 } else {
-                    desktopOrder.insert(id: iconID, at: desktopOrder.order.count)
+                    desktopOrder.placeInFirstFreeSlot(id: iconID)
                 }
             }
         case .dockAppend:
@@ -2210,6 +2663,21 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
         }
     }
 
+    /// The slot a blank-area drop on `page` lands in (demo §1.5: the
+    /// end of that page): just past the page's last occupied icon; the
+    /// first slot of an empty page; the end of the order if the page
+    /// is full (a fresh slot, on a new page if needed).
+    private func pageEndTargetSlot(page: Int) -> Int {
+        let slots = page < desktopPages.count ? desktopPages[page] : []
+        guard let lastOffset = slots.enumerated().reversed().first(where: { $0.element != nil })?.offset else {
+            return page * Self.desktopIconsPerPage
+        }
+        if lastOffset == Self.desktopIconsPerPage - 1 {
+            return desktopOrder.order.count
+        }
+        return page * Self.desktopIconsPerPage + lastOffset + 1
+    }
+
     /// Drop on a page's blank area: land at the end of that page.
     func moveIconToPageEnd(draggedID: String, page: Int) {
         // Landing spring (demo §1.7): 0.42 s, no overshoot.
@@ -2217,19 +2685,16 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
             if desktopDock.dockIDs.contains(draggedID) {
                 desktopDock.removeFromDock(id: draggedID)
             }
-            let pageIcons = page < desktopPages.count ? desktopPages[page] : []
-            if let lastID = pageIcons.last?.id, let lastIndex = desktopOrder.order.firstIndex(of: lastID) {
-                desktopOrder.insert(id: draggedID, at: lastIndex + 1)
-            } else {
-                desktopOrder.insert(id: draggedID, at: desktopOrder.order.count)
-            }
+            desktopOrder.moveToSlot(id: draggedID, slot: pageEndTargetSlot(page: page))
         }
     }
 
     /// Drop an icon onto the Dock. If the Dock is full, the last Dock
-    /// icon is evicted back to the grid (never lost, never deleted).
+    /// icon is evicted back to the grid (first free slot — never lost,
+    /// never deleted).
     func dropIconOnDock(_ draggedID: String) {
-        // System icons never enter the Dock: they live in the grid.
+        // System icons never enter the Dock: they live in the fixed
+        // system row.
         guard !draggedID.isEmpty, !desktopDock.dockIDs.contains(draggedID),
               !LCDesktopIcon.isSystemID(draggedID) else {
             return
@@ -2239,51 +2704,41 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
             let evicted = desktopDock.addToDock(id: draggedID)
             desktopOrder.remove(id: draggedID)
             if let evicted {
-                desktopOrder.insert(id: evicted, at: desktopOrder.order.count)
+                desktopOrder.placeInFirstFreeSlot(id: evicted)
             }
         }
     }
 
     /// Dock "−": remove the icon from the Dock only; it returns to the
-    /// grid (at the end). The app itself is NOT deleted.
+    /// grid (first free slot). The app itself is NOT deleted.
     func removeIconFromDock(_ icon: LCDesktopIcon) {
         desktopDock.removeFromDock(id: icon.id)
-        desktopOrder.insert(id: icon.id, at: desktopOrder.order.count)
+        desktopOrder.placeInFirstFreeSlot(id: icon.id)
     }
     func removeApp(app: LCAppModel) {
         DispatchQueue.main.async {
             sharedModel.apps.removeAll { now in
                 return app == now
             }
-            sharedModel.hiddenApps.removeAll { now in
-                return app == now
-            }
-            
         }
     }
     
     func changeAppVisibility(app: LCAppModel) {
+        // Hidden apps are gone (the demo has no such concept): every
+        // app lives in the visible list. This stays only because
+        // LCAppModelDelegate requires it — LCAppModel calls it when an
+        // app's hidden flag flips, e.g. the auth-pass path that clears
+        // a stale hidden state. That flip now just makes sure the app
+        // is in the visible list.
         DispatchQueue.main.async {
-            if app.appInfo.isHidden {
-                sharedModel.apps.removeAll { now in
-                    return app == now
-                }
-                if !sharedModel.hiddenApps.contains(app) {
-                    sharedModel.hiddenApps.append(app)
-                }
-                UserDefaults.lcShared().mutableArrayValue(forKey: "LCGuestURLSchemes")
-                    .removeObjects(in: app.appInfo.urlSchemes() as! [Any])
-            } else {
-                sharedModel.hiddenApps.removeAll { now in
-                    return app == now
-                }
-                if !sharedModel.apps.contains(app) {
-                    sharedModel.apps.append(app)
-                }
-                UserDefaults.lcShared().mutableArrayValue(forKey: "LCGuestURLSchemes")
-                    .addObjects(from: app.appInfo.urlSchemes() as! [Any])
+            sharedModel.hiddenApps.removeAll { now in
+                return app == now
             }
-            
+            if !sharedModel.apps.contains(app) {
+                sharedModel.apps.append(app)
+            }
+            UserDefaults.lcShared().mutableArrayValue(forKey: "LCGuestURLSchemes")
+                .addObjects(from: app.appInfo.urlSchemes() as! [Any])
         }
     }
     
@@ -2302,21 +2757,12 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
                 break
             }
         }
-        if appFound == nil && !LCUtils.appGroupUserDefault.bool(forKey: "LCStrictHiding") {
-            for app in sharedModel.hiddenApps {
-                if app.appInfo.relativeBundlePath == bundleId {
-                    appFound = app
-                    isFoundAppLocked = true
-                    break
-                }
-            }
-        }
         
         if appFound == nil && bundleId == "builtinSideStore" {
             appFound = LCAppModel(appInfo: BuiltInSideStoreAppInfo.shared)
         }
         
-        if isFoundAppLocked && !sharedModel.isHiddenAppUnlocked {
+        if isFoundAppLocked {
             do {
                 let result = try await LCUtils.authenticateUser()
                 if !result {
@@ -2335,7 +2781,6 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
             return
         }
 
-        LCDesktopLaunchCountStore.recordLaunch(id: LCDesktopIcon.appID(for: appFound))
         if #available(iOS 16.2, *) {
             LCContainerLiveActivityManager.startLaunching(appName: appFound.displayName)
         }
@@ -2349,18 +2794,6 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
             LCContainerLiveActivityManager.finish(statusText: "lc.common.done".loc)
         }
         
-    }
-    
-    func authenticateUser() async {
-        do {
-            if !(try await LCUtils.authenticateUser()) {
-                return
-            }
-        } catch {
-            errorInfo = error.localizedDescription
-            errorShow = true
-            return
-        }
     }
     
     func jitLaunch(appName: String, classicMode: UInt) async {
@@ -2444,31 +2877,14 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
     func showRunWhenMultitaskAlert() async -> Bool? {
         return await runWhenMultitaskAlert.open()
     }
-    
-    func installMdm(data: Data) {
-        safariViewURL = URL(string:"data:application/x-apple-aspen-config;base64,\(data.base64EncodedString())")!
-        safariViewOpened = true
-    }
-    
-    func openNavigationView(view: AnyView) {
-        navigateTo = view
-        isNavigationActive = true
-    }
-    
-    func promptForGeneratedIconStyle() async -> GeneratedIconStyle? {
-        if #available(iOS 18.0, *) {
-            return await generatedIconStyleSelector.open()
-        } else {
-            return .Light
-        }
-        
-    }
-    
+
+    /// LCAppModelDelegate requirement (called by LCAppModel.toggleHidden):
+    /// there is no banner navigation stack anymore — the desktop has no
+    /// NavigationLink to close — so this is a no-op. Kept because the
+    /// protocol (engine side) still calls it.
     func closeNavigationView() {
-        isNavigationActive = false
-        navigateTo = nil
     }
-    
+
     func copyError() {
         UIPasteboard.general.string = errorInfo
     }
@@ -2543,4 +2959,14 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
 
 extension View {
     func apply<V: View>(@ViewBuilder _ block: (Self) -> V) -> some View { block(self) }
+}
+
+/// Menu-row button style for the edit-mode "•••" popover (demo §2.4):
+/// a pressed row gets a white 0.16 background, 14 pt radius.
+private struct LCEditMenuRowButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .background(configuration.isPressed ? Color.white.opacity(0.16) : Color.clear)
+            .clipShape(RoundedRectangle(cornerRadius: 14))
+    }
 }

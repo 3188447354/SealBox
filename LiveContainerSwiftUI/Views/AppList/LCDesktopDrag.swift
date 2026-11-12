@@ -20,11 +20,12 @@
 //    demo's swap semantics (see below).
 //  - Reorder semantics (demo §1.5, free placement, no auto-fill): drop
 //    on an occupied cell SWAPS with that one cell only; all other icons
-//    stay put. Drop on an empty cell / a page's blank area lands at the
-//    end of that page. Dock → occupied grid cell: the occupant moves to
-//    the first free slot (the end of the order); the dragged icon takes
-//    the cell. Grid → Dock icon: swap — that app returns to the dragged
-//    app's original grid cell. Grid → empty Dock space: appends to the
+//    stay put. Drop on an empty cell moves the icon to exactly that
+//    slot. Drop on a page's blank area lands at the end of that page.
+//    Dock → occupied grid cell: the occupant moves to the first free
+//    slot (the end of the order); the dragged icon takes the cell.
+//    Grid → Dock icon: swap — that app returns to the dragged app's
+//    original grid cell. Grid → empty Dock space: appends to the
 //    Dock (evicting the last Dock icon if full). Dock → Dock: no change
 //    (the demo flies back).
 //  - NO live reflow: the demo does not shift icons during hover. Its
@@ -53,6 +54,10 @@ import SwiftUI
 enum LCDesktopDropTarget: Equatable {
     /// A grid cell: drop swaps with the icon in this cell.
     case cell(id: String)
+    /// An empty grid slot: drop moves the icon to exactly this slot
+    /// (demo §1.5 — the slot stays empty until then, nothing
+    /// auto-fills it).
+    case emptySlot(slot: Int)
     /// A Dock slot occupied by `iconID`: drop swaps with that app.
     case dockSlot(index: Int, iconID: String)
     /// On the Dock bar but not on an occupied slot: drop appends.
@@ -85,6 +90,17 @@ struct LCDesktopCellFramePreferenceKey: PreferenceKey {
 /// Reported by each page's grid; a drag over a page's blank area lands
 /// at the end of that page.
 struct LCDesktopGridFramePreferenceKey: PreferenceKey {
+    static var defaultValue: [Int: CGRect] = [:]
+    static func reduce(value: inout [Int: CGRect], nextValue: () -> [Int: CGRect]) {
+        value.merge(nextValue()) { $1 }
+    }
+}
+
+/// Slot frames in the "desktop" coordinate space, keyed by global slot
+/// index (page × 24 + cell). Reported by every rendered grid slot —
+/// occupied cells and empty slots alike — so a drag can hit-test an
+/// empty cell and land exactly there (demo §1.5).
+struct LCDesktopSlotFramePreferenceKey: PreferenceKey {
     static var defaultValue: [Int: CGRect] = [:]
     static func reduce(value: inout [Int: CGRect], nextValue: () -> [Int: CGRect]) {
         value.merge(nextValue()) { $1 }
@@ -155,6 +171,7 @@ final class LCDesktopDragState: ObservableObject {
     /// preference keys above).
     @Published var cellFrames: [String: CGRect] = [:]
     @Published var gridFrames: [Int: CGRect] = [:]
+    @Published var slotFrames: [Int: CGRect] = [:]
     @Published var dockFrame: CGRect = .zero
     @Published var dockSlotFrames: [Int: CGRect] = [:]
 

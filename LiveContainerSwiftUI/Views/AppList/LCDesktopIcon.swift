@@ -2,21 +2,27 @@
 //  LCDesktopIcon.swift
 //  LiveContainerSwiftUI
 //
-//  Desktop grid v1: one unified icon identity for imported IPA apps and the
-//  three system pages (Sources / Tweaks / Settings), plus the UserDefaults
-//  stores for desktop order, Dock membership and launch counts.
+//  Desktop grid v1: one unified icon identity for imported IPA apps,
+//  plus the UserDefaults stores for desktop order and Dock membership.
 //
-//  Persistence (all in the App Group defaults, same store LCAppSortManager
-//  uses for "LCCustomSortOrder"; no new database):
-//    "LCDesktopIconOrder"          [String] unified icon order, IPA ids are
-//                                  "bundleId:relativePath" (same format as
-//                                  LCAppSortManager.getUniqueIdentifier),
-//                                  system icons are "sys:sources" /
-//                                  "sys:tweaks" / "sys:settings"
+//  Desktop position model (demo §1.5, free placement, no auto-fill):
+//  every app owns a fixed slot in the persisted order and slots stay
+//  empty — deleting or moving an icon frees its slot without shifting
+//  any other icon. The order is a sparse slot list: "" is an empty
+//  slot. The three system pages (Sources / Tweaks / Settings) are NOT
+//  in this order at all: they are fixed-position icons rendered in
+//  their own row, never dragged, never counted in the 24/page grid.
+//
+//  Persistence (all in the App Group defaults):
+//    "LCDesktopIconOrder"          [String] sparse slot order, IPA ids
+//                                  are "bundleId:relativePath"; ""
+//                                  is an empty slot. No trailing ""
+//                                  entries are kept.
 //    "LCDesktopDockOrder"          [String] Dock member ids, in Dock order
-//    "LCDesktopDockManuallyEdited" Bool, true once the user drags anything
-//                                  into / out of the Dock by hand
-//    "LCDesktopLaunchCounts"       [String: Int] launches per icon id
+//
+//  The Dock starts empty (demo §4: seedDock = []): only icons the user
+//  drags in are ever in it. There is no auto-fill and no launch-count
+//  ranking.
 //
 //  TODO(BundleID): nothing here depends on the Bundle ID. The signing /
 //  Bundle ID work (new ID for the standalone app) is still pending MJ's
@@ -88,7 +94,10 @@ enum LCSystemPage: String, CaseIterable, Identifiable {
 // MARK: - Unified desktop icon
 
 /// One icon on the desktop grid / in the Dock. IPA apps and system pages
-/// share the same ordering, drag and Dock logic and the same order store.
+/// share the tile; only IPA apps take part in the slot order, drag and
+/// Dock logic. System pages are fixed-position icons in their own row
+/// (see the desktop view): they are never dragged, never in the order,
+/// never in the Dock.
 enum LCDesktopIcon: Hashable, Identifiable {
     case app(LCAppModel)
     case system(LCSystemPage)
@@ -135,7 +144,8 @@ enum LCDesktopIcon: Hashable, Identifiable {
     }
 
     /// True for the three system-page icons (Sources / Tweaks /
-    /// Settings). They live in the grid; they never enter the Dock.
+    /// Settings). They live in the fixed system row; they never enter
+    /// the Dock or the slot order.
     var isSystem: Bool {
         if case .system = self { return true }
         return false
@@ -147,9 +157,13 @@ enum LCDesktopIcon: Hashable, Identifiable {
         id.hasPrefix("sys:")
     }
 
+    /// Unique id for an app model: "bundleId:relativePath". (Was
+    /// LCAppSortManager.getUniqueIdentifier; moved here when the sort
+    /// system was deleted — the desktop slot order is the only user.)
     static func appID(for model: LCAppModel) -> String {
-        if let uniqueID = LCAppSortManager.shared.getUniqueIdentifier(for: model) {
-            return uniqueID
+        if let bundleId = model.appInfo.bundleIdentifier(),
+           let relativePath = model.appInfo.relativeBundlePath {
+            return "\(bundleId):\(relativePath)"
         }
         // Fallback for models without a bundle id / relative path yet.
         return model.appInfo.relativeBundlePath ?? model.displayName
@@ -158,13 +172,14 @@ enum LCDesktopIcon: Hashable, Identifiable {
 
 // MARK: - Desktop order store
 
-/// Persists the dragged order of every desktop icon. Newly installed apps
-/// (and the three system icons on first run) are appended at the end;
-/// removed apps are pruned. The order is independent of
-/// LCAppSortManager.appSortType: on the desktop, the manual order is what
-/// the user sees. (Known limitation, see DESKTOP_GRID_V1.md: the desktop
-/// order and the list sorter's custom order are two stores; the desktop
-/// does not write back into "LCCustomSortOrder".)
+/// Persists the dragged order of every desktop icon as a sparse slot
+/// list (demo §1.5): each app owns a fixed slot, "" is an empty slot,
+/// and slots stay empty — nothing auto-fills them, nothing re-sorts
+/// them. Newly installed apps take the first free slot; removed apps
+/// free their slot (they do not shift the icons after them). The
+/// order holds IPA apps only: system-page icons are fixed-position
+/// and never enter it, and Dock members are not in it either (an icon
+/// is either in the grid or in the Dock, never both).
 final class LCDesktopOrderStore: ObservableObject {
     static let orderKey = "LCDesktopIconOrder"
 
@@ -178,32 +193,41 @@ final class LCDesktopOrderStore: ObservableObject {
         LCUtils.appGroupUserDefault.set(order, forKey: Self.orderKey)
     }
 
-    /// Prune ids that no longer exist, append new ids at the end.
+    /// Drop trailing empty slots: the order ends at the last occupied
+    /// slot, so trailing gaps never create phantom pages.
+    private func trimTrailingEmpty(_ slots: [String]) -> [String] {
+        var result = slots
+        while result.last == "" {
+            result.removeLast()
+        }
+        return result
+    }
+
+    /// First free slot (the first ""), or the end of the order if
+    /// there is none — i.e. where a new / returning icon lands.
+    func firstFreeSlot() -> Int {
+        return order.firstIndex(of: "") ?? order.count
+    }
+
+    /// Sync with the installed apps: ids that no longer exist free
+    /// their slot (they become "" — the icons after them do not move),
+    /// and new ids take the first free slot each. Ids the caller
+    /// excluded (Dock members) are freed the same way.
     func sync(allIDs: [String]) {
         let known = Set(allIDs)
-        var newOrder = order.filter { known.contains($0) }
+        var newOrder = order.map { known.contains($0) ? $0 : "" }
         for id in allIDs where !newOrder.contains(id) {
-            newOrder.append(id)
+            if let free = newOrder.firstIndex(of: "") {
+                newOrder[free] = id
+            } else {
+                newOrder.append(id)
+            }
         }
+        newOrder = trimTrailingEmpty(newOrder)
         if newOrder != order {
             order = newOrder
             save()
         }
-    }
-
-    /// Move `id` to just before `targetID` (the displaced icons make
-    /// room). No-op if either id is missing or they are the same.
-    func move(id: String, beforeID targetID: String) {
-        guard id != targetID, order.contains(id), order.contains(targetID) else {
-            return
-        }
-        var newOrder = order.filter { $0 != id }
-        guard let targetIndex = newOrder.firstIndex(of: targetID) else {
-            return
-        }
-        newOrder.insert(id, at: targetIndex)
-        order = newOrder
-        save()
     }
 
     /// Swap two icons' positions (demo §1.5: a drop on an occupied cell
@@ -219,8 +243,8 @@ final class LCDesktopOrderStore: ObservableObject {
     }
 
     /// Replace one id with another at the same position (Dock → grid:
-    /// the dragged icon takes the cell; the caller appends the
-    /// displaced id at the end, the first free slot).
+    /// the dragged icon takes the cell; the caller puts the displaced
+    /// id in the first free slot).
     func replace(id: String, with newID: String) {
         guard let i = order.firstIndex(of: id) else {
             return
@@ -231,45 +255,67 @@ final class LCDesktopOrderStore: ObservableObject {
         save()
     }
 
-    /// Insert at a global index (used when dropping onto a page).
-    func insert(id: String, at index: Int) {
-        var newOrder = order.filter { $0 != id }
-        let clamped = max(0, min(index, newOrder.count))
-        newOrder.insert(id, at: clamped)
-        order = newOrder
+    /// Move `id` to exactly `slot` (demo §1.5: drop on an empty cell —
+    /// the icon stays exactly there). The old slot is freed; slots
+    /// between are left as they are (padded with "" if the slot is
+    /// past the end, e.g. a drop on the extra blank page in edit
+    /// mode). This is a direct slot assignment, never an insert:
+    /// inserting would shift every icon after the slot.
+    func moveToSlot(id: String, slot: Int) {
+        guard !id.isEmpty, slot >= 0 else {
+            return
+        }
+        var newOrder = order
+        if let old = newOrder.firstIndex(of: id) {
+            newOrder[old] = ""
+        }
+        while newOrder.count <= slot {
+            newOrder.append("")
+        }
+        newOrder[slot] = id
+        order = trimTrailingEmpty(newOrder)
         save()
     }
 
+    /// Put `id` in the first free slot (new installs, Dock evictions,
+    /// Dock "−", Dock → grid occupant). Appends at the end if there
+    /// is no free slot.
+    func placeInFirstFreeSlot(id: String) {
+        moveToSlot(id: id, slot: firstFreeSlot())
+    }
+
+    /// Free `id`'s slot (delete, or leaving for the Dock). The slot
+    /// becomes "" — the icons after it do not shift.
     func remove(id: String) {
-        guard order.contains(id) else {
+        guard let i = order.firstIndex(of: id) else {
             return
         }
-        order.removeAll { $0 == id }
+        var newOrder = order
+        newOrder[i] = ""
+        order = trimTrailingEmpty(newOrder)
         save()
     }
 }
 
 // MARK: - Dock store
 
-/// Persists Dock membership and order. Manual order wins once the user has
-/// dragged anything: launch counts only do the initial fill.
+/// Persists Dock membership and order. The Dock starts empty (demo
+/// §4: seedDock = []): only icons the user drags in are ever in it.
+/// There is no auto-fill — no launch-count ranking, no initial fill.
 final class LCDesktopDockStore: ObservableObject {
     static let dockKey = "LCDesktopDockOrder"
-    static let manuallyEditedKey = "LCDesktopDockManuallyEdited"
     static let maxDockItems = 4
 
     @Published private(set) var dockIDs: [String]
-    @Published private(set) var manuallyEdited: Bool
 
     init() {
         // The Dock holds imported apps only. An older build's Dock
         // fill included the three system icons, so any persisted
-        // "sys:" ids are dropped here on launch; the order sync puts
-        // them back in the grid.
+        // "sys:" ids are dropped here on launch; those icons live in
+        // the fixed system row.
         let stored = LCUtils.appGroupUserDefault.array(forKey: Self.dockKey) as? [String] ?? []
         let cleaned = stored.filter { !LCDesktopIcon.isSystemID($0) }
         self.dockIDs = cleaned
-        self.manuallyEdited = LCUtils.appGroupUserDefault.bool(forKey: Self.manuallyEditedKey)
         if cleaned.count != stored.count {
             LCUtils.appGroupUserDefault.set(cleaned, forKey: Self.dockKey)
         }
@@ -277,19 +323,6 @@ final class LCDesktopDockStore: ObservableObject {
 
     private func save() {
         LCUtils.appGroupUserDefault.set(dockIDs, forKey: Self.dockKey)
-        LCUtils.appGroupUserDefault.set(manuallyEdited, forKey: Self.manuallyEditedKey)
-    }
-
-    /// Initial fill from launch counts. Never called once manuallyEdited.
-    func autoFill(topIDs: [String]) {
-        guard !manuallyEdited else {
-            return
-        }
-        let filled = Array(topIDs.prefix(Self.maxDockItems))
-        if filled != dockIDs {
-            dockIDs = filled
-            save()
-        }
     }
 
     /// Drop an icon into the Dock (demo §4: appends to the Dock; if the
@@ -299,7 +332,8 @@ final class LCDesktopDockStore: ObservableObject {
     /// replaceDockIcon(at:with:).
     @discardableResult
     func addToDock(id: String) -> String? {
-        // System icons never enter the Dock: they live in the grid.
+        // System icons never enter the Dock: they live in the fixed
+        // system row.
         guard !LCDesktopIcon.isSystemID(id) else {
             return nil
         }
@@ -310,7 +344,6 @@ final class LCDesktopDockStore: ObservableObject {
         }
         newDock.append(id)
         dockIDs = newDock
-        manuallyEdited = true
         save()
         return evicted
     }
@@ -327,7 +360,6 @@ final class LCDesktopDockStore: ObservableObject {
         var newDock = dockIDs
         newDock[index] = id
         dockIDs = newDock
-        manuallyEdited = true
         save()
     }
 
@@ -338,12 +370,10 @@ final class LCDesktopDockStore: ObservableObject {
             return
         }
         dockIDs.removeAll { $0 == id }
-        manuallyEdited = true
         save()
     }
 
-    /// Remove an icon everywhere (app deleted from the grid). If the Dock
-    /// was never manually edited, the caller refills it via autoFill.
+    /// Remove an icon everywhere (app deleted from the grid).
     func removeEverywhere(id: String) {
         guard dockIDs.contains(id) else {
             return
@@ -380,33 +410,5 @@ struct LCDesktopIconTile: View {
             }
         }
         .frame(width: size, height: size)
-    }
-}
-
-// MARK: - Launch counts
-
-/// Simple UserDefaults launch counter. Only used for the Dock's initial
-/// fill (most-used first) and as a tiebreak; never a database.
-enum LCDesktopLaunchCountStore {
-    static let countsKey = "LCDesktopLaunchCounts"
-
-    static func recordLaunch(id: String) {
-        var counts = LCUtils.appGroupUserDefault.dictionary(forKey: countsKey) as? [String: Int] ?? [:]
-        counts[id, default: 0] += 1
-        LCUtils.appGroupUserDefault.set(counts, forKey: countsKey)
-    }
-
-    static func counts() -> [String: Int] {
-        return LCUtils.appGroupUserDefault.dictionary(forKey: countsKey) as? [String: Int] ?? [:]
-    }
-
-    /// Ids sorted by launch count, most launched first. Ids with no launches
-    /// sort last, in the order given by `fallbackOrder`.
-    static func topIDs(limit: Int, fallbackOrder: [String]) -> [String] {
-        let counts = counts()
-        let ranked = fallbackOrder.sorted { lhs, rhs in
-            (counts[lhs] ?? 0) > (counts[rhs] ?? 0)
-        }
-        return Array(ranked.prefix(limit))
     }
 }
