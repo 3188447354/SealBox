@@ -95,18 +95,9 @@ struct LCSettingsView: View {
     @AppStorage("LCSwitchAppWithoutAsking") var silentSwitchApp = false
     @AppStorage("LCOpenWebPageWithoutAsking") var silentOpenWebPage = false
     @AppStorage("LCDontSignApp", store: LCUtils.appGroupUserDefault) var dontSignApp = false
-    @AppStorage("LCStrictHiding", store: LCUtils.appGroupUserDefault) var strictHiding = false
     @AppStorage("dynamicColors", store: LCUtils.appGroupUserDefault) var dynamicColors = true
     @AppStorage("darkModeIcon", store: LCUtils.appGroupUserDefault) var darkModeIcon = false
     @AppStorage("LCDesktopTheme", store: LCUtils.appGroupUserDefault) var desktopTheme = LCDesktopTheme.system
-
-    @AppStorage("LCLoadTweaksToSelf") var injectToLCItelf = false
-    @AppStorage("LCIgnoreJITOnLaunch") var ignoreJITOnLaunch = false
-    @AppStorage("LCSelected32BitEmulator", store: LCUtils.appGroupUserDefault) var selected32BitEmulator : String = ""
-    @AppStorage("LCKeepSelectedWhenQuit") var keepSelectedWhenQuit = false
-    @AppStorage("LCWaitForDebugger") var waitForDebugger = false
-    @AppStorage("LCSharePrivateDataWithLiveProcess") var sharePrivateDataWithLiveProcess = false
-    @AppStorage("BKNoWatchdogs") var disableLiveProcessWatchdog = false
 
     @EnvironmentObject private var sharedModel : SharedModel
     @Environment(\.dismiss) private var dismiss
@@ -246,6 +237,9 @@ struct LCSettingsView: View {
         // There is no reliable JIT status signal exposed to Swift
         // (checkJITEnabled() is a static C function in LCBootstrap.m),
         // so the status stays neutral "unknown" instead of claiming on.
+        // No diagnose page: the JIT-less diagnose view was a
+        // LiveContainer leftover and is deleted; the certificate rows
+        // above already show the same real certificate state.
         result.append(SBSettingsSection(
             id: "jit",
             title: "JIT",
@@ -257,13 +251,6 @@ struct LCSettingsView: View {
                     title: "lc.settings.sealbox.jitStatus".loc, icon: "bolt.fill", color: .yellow,
                     value: "lc.common.unknown".loc
                 ),
-                sbNavRow(
-                    id: "jit-diagnose",
-                    searchText: "lc.settings.jitlessDiagnose".loc,
-                    title: "lc.settings.jitlessDiagnose".loc, icon: "stethoscope", color: .yellow
-                ) {
-                    LCJITLessDiagnoseView()
-                },
             ]
         ))
 
@@ -283,24 +270,12 @@ struct LCSettingsView: View {
         ) {
             LCDataManagementView()
         })
-        let showMultiLC = (store != .Unknown && store != .ADP) || LCUtils.isAppGroupAltStoreLike()
-        if showMultiLC {
-            let multiTitle = sharedModel.multiLCStatus == 2
-                ? "lc.settings.multiLCIsSecond".loc
-                : "lc.settings.multiLC".loc
-            containerRows.append(sbNavRow(
-                id: "multi-lc",
-                searchText: multiTitle,
-                title: multiTitle, icon: "square.stack.3d.up.fill", color: .green,
-                disabled: sharedModel.multiLCStatus == 2
-            ) {
-                LCMultiLCManagementView()
-            })
-        }
+        // SealBox is a single app: there is no multi-LiveContainer
+        // management page (deleted with LCMultiLCManagementView).
         result.append(SBSettingsSection(
             id: "containers",
             title: "lc.settings.sealbox.containers".loc,
-            footer: showMultiLC ? "lc.settings.multiLCDesc".loc : nil,
+            footer: nil,
             rows: containerRows
         ))
 
@@ -421,20 +396,6 @@ struct LCSettingsView: View {
         // is shown either — a row with nothing real to export would
         // be a fake feature.
         var advancedRows: [SBSettingsRow] = []
-        advancedRows.append(SBSettingsRow(
-            id: "emulator",
-            searchText: "lc.settings.selected32BitEmulator".loc,
-            content: AnyView(
-                Picker(selection: $selected32BitEmulator) {
-                    Text("lc.common.none".loc).tag("")
-                    ForEach(sharedModel.arm32EmuApps, id: \.self) { app in
-                        Text(app.appInfo.displayName()).tag(app.appInfo.relativeBundlePath!)
-                    }
-                } label: {
-                    sbLabel("lc.settings.selected32BitEmulator".loc, icon: "cpu.fill", color: .gray)
-                }
-            )
-        ))
         advancedRows.append(sbToggleRow(
             id: "silent-switch",
             searchText: "lc.settings.silentSwitchApp".loc,
@@ -447,14 +408,6 @@ struct LCSettingsView: View {
             title: "lc.settings.silentOpenWebPage".loc, icon: "globe", color: .gray,
             isOn: $silentOpenWebPage
         ))
-        if sharedModel.isHiddenAppUnlocked {
-            advancedRows.append(sbToggleRow(
-                id: "strict-hiding",
-                searchText: "lc.settings.strictHiding".loc,
-                title: "lc.settings.strictHiding".loc, icon: "eye.slash.fill", color: .gray,
-                isOn: $strictHiding
-            ))
-        }
         advancedRows.append(sbButtonRow(
             id: "clear-notifications",
             searchText: "lc.settings.clearNotifications".loc,
@@ -484,9 +437,6 @@ struct LCSettingsView: View {
                             Spacer()
                             Text(appVersionText)
                                 .foregroundStyle(.secondary)
-                        }
-                        .onTapGesture(count: 5) {
-                            sharedModel.developerMode = true
                         }
                     )
                 ),
@@ -635,63 +585,6 @@ struct LCSettingsView: View {
                     }
                 }
 
-                if sharedModel.developerMode && searchText.trimmingCharacters(in: .whitespaces).isEmpty {
-                    Section {
-                        Toggle(isOn: $injectToLCItelf) {
-                            Text("lc.settings.injectLCItself".loc)
-                        }
-                        Toggle(isOn: $ignoreJITOnLaunch) {
-                            Text("Ignore JIT on Launching App")
-                        }
-                        Toggle(isOn: $keepSelectedWhenQuit) {
-                            Text("Keep Selected App when Quit")
-                        }
-                        Toggle(isOn: $waitForDebugger) {
-                            Text("Wait For Debugger")
-                        }
-                        Toggle(isOn: $sharePrivateDataWithLiveProcess) {
-                            Text("Allow Private Data access from LiveProcess")
-                        }
-                        Toggle(isOn: $disableLiveProcessWatchdog) {
-                            Text("Disable LiveProcess watchdog termination")
-                        }
-                        Button {
-                            export()
-                        } label: {
-                            Text("Export Cert")
-                        }
-                        Button {
-                            exportDyld()
-                        } label: {
-                            Text("Export Dyld")
-                        }
-                        Button {
-                            Task { await nukeSideStore() }
-                        } label: {
-                            Text("Nuke SideStore")
-                        }
-                        Button {
-                            exportMainBundle()
-                        } label: {
-                            Text("Export Main Bundle")
-                        }
-                        Button {
-                            resetSymbolOffsets()
-                        } label: {
-                            Text("Reset Symbol Offsets")
-                        }
-                        Button {
-                            presentFLEXOverlay()
-                        } label: {
-                            Text("Show FLEX Overlay")
-                        }
-                        .disabled(NSClassFromString("FLEXManager") == nil)
-                    } header: {
-                        Text("Developer Settings")
-                    } footer: {
-                        Text("lc.settings.injectLCItselfDesc".loc)
-                    }
-                }
             }
             .listStyle(.insetGrouped)
             .navigationTitle("lc.tabView.settings".loc)
@@ -787,7 +680,7 @@ struct LCSettingsView: View {
                 // Only the certificate callback belongs to Settings.
                 // Install links are consumed by the desktop (LCAppListView);
                 // never nil them here.
-                guard sharedModel.selectedTab == .settings, let link, link.host == "certificate" else { return }
+                guard sharedModel.requestedSystemPage == .settings, let link, link.host == "certificate" else { return }
                 sharedModel.deepLink = nil
                 handleURL(url: link)
             }
@@ -801,7 +694,7 @@ struct LCSettingsView: View {
         refreshCertificateInfo()
         refreshTweakCount()
         if !isViewAppeared {
-            if sharedModel.selectedTab == .settings, let link = sharedModel.deepLink, link.host == "certificate" {
+            if sharedModel.requestedSystemPage == .settings, let link = sharedModel.deepLink, link.host == "certificate" {
                 sharedModel.deepLink = nil
                 handleURL(url: link)
             }
@@ -852,12 +745,12 @@ struct LCSettingsView: View {
     }
 
     /// Hands an IPA file to the desktop install flow: dismiss Settings,
-    /// go back to the desktop tab, then deliver the install deep link
+    /// go back to the desktop, then deliver the install deep link
     /// for LCAppListView to consume.
     private func handOffInstall(targetURL: URL) {
         guard let installURL = sealBoxInstallDeepLink(for: targetURL) else { return }
         dismiss()
-        sharedModel.selectedTab = .apps
+        sharedModel.requestedSystemPage = nil
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
             sharedModel.deepLink = installURL
         }
@@ -876,73 +769,6 @@ struct LCSettingsView: View {
         } else {
             UIApplication.shared.applicationIconBadgeNumber = 0
         }
-    }
-
-    func export() {
-        let fileManager = FileManager.default
-        let documentsURL = fileManager.urls(for: .documentDirectory, in: .userDomainMask).first!
-
-        // 1. Copy embedded.mobileprovision from the main bundle to Documents
-        if let embeddedURL = Bundle.main.url(forResource: "embedded", withExtension: "mobileprovision") {
-            let destinationURL = documentsURL.appendingPathComponent("embedded.mobileprovision")
-            do {
-                try fileManager.copyItem(at: embeddedURL, to: destinationURL)
-                print("Successfully copied embedded.mobileprovision to Documents.")
-            } catch {
-                print("Error copying embedded.mobileprovision: \(error)")
-            }
-        } else {
-            print("embedded.mobileprovision not found in the main bundle.")
-        }
-
-        // 2. Read "certData" from UserDefaults and save to cert.p12 in Documents
-        if let certData = LCUtils.certificateData() {
-            let certFileURL = documentsURL.appendingPathComponent("cert.p12")
-            do {
-                try certData.write(to: certFileURL)
-                print("Successfully wrote certData to cert.p12 in Documents.")
-            } catch {
-                print("Error writing certData to cert.p12: \(error)")
-            }
-        } else {
-            print("certData not found in UserDefaults.")
-        }
-
-        // 3. Read "certPassword" from UserDefaults and save to pass.txt in Documents
-        if let certPassword = LCSharedUtils.certificatePassword() {
-            let passwordFileURL = documentsURL.appendingPathComponent("pass.txt")
-            do {
-                try certPassword.write(to: passwordFileURL, atomically: true, encoding: .utf8)
-                print("Successfully wrote certPassword to pass.txt in Documents.")
-            } catch {
-                print("Error writing certPassword to pass.txt: \(error)")
-            }
-        } else {
-            print("certPassword not found in UserDefaults.")
-        }
-    }
-
-    func exportMainBundle() {
-        let url = Bundle.main.bundleURL
-        let fileManager = FileManager.default
-        let documentsURL = fileManager.urls(for: .documentDirectory, in: .userDomainMask).first!
-        do {
-            let destinationURL = documentsURL.appendingPathComponent(url.lastPathComponent)
-            try fileManager.copyItem(at: url, to: destinationURL)
-            print("Successfully copied main bundle to Documents.")
-        } catch {
-            print("Error copying main bundle \(error)")
-        }
-    }
-
-    func resetSymbolOffsets() {
-        LCUtils.appGroupUserDefault.removeObject(forKey: "symbolOffsetCache")
-    }
-
-    func presentFLEXOverlay() {
-        let manager = (NSClassFromString("FLEXManager") as? NSObject.Type)?.perform(NSSelectorFromString("sharedManager"))
-            .takeUnretainedValue() as? NSObject
-        manager?.perform(NSSelectorFromString("showExplorer"))
     }
 
     func importCertificate() async {
@@ -1075,33 +901,6 @@ struct LCSettingsView: View {
         UserDefaults.standard.set(nil, forKey: "LCAppGroupID")
     }
 
-    func nukeSideStore() async {
-        guard let doRemove = await certificateRemoveAlert.open(), doRemove else {
-            return
-        }
-        do {
-            let fm = FileManager.default
-            let sidestoreAppGroupURL = LCPath.lcGroupDocPath.deletingLastPathComponent()
-            try fm.removeItem(at: sidestoreAppGroupURL.appendingPathComponent("Database"))
-            try fm.removeItem(at: sidestoreAppGroupURL.appendingPathComponent("Apps"))
-        } catch {
-            print("wtf \(error)")
-        }
-    }
-
-    func exportDyld() {
-        let url = URL(fileURLWithPath: "/usr/lib/dyld")
-        let fileManager = FileManager.default
-        let documentsURL = fileManager.urls(for: .documentDirectory, in: .userDomainMask).first!
-        do {
-            let destinationURL = documentsURL.appendingPathComponent(url.lastPathComponent)
-            try fileManager.copyItem(at: url, to: destinationURL)
-            print("Successfully copied dyld to Documents.")
-        } catch {
-            print("Error copying dyld \(error)")
-        }
-    }
-
     func handleURL(url: URL) {
         if url.host == "certificate" {
             if let components = URLComponents(url: url, resolvingAgainstBaseURL: false) {
@@ -1160,7 +959,7 @@ struct SBInstallFromLinkView: View {
             return
         }
         dismiss()
-        sharedModel.selectedTab = .apps
+        sharedModel.requestedSystemPage = nil
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
             sharedModel.deepLink = installURL
         }
