@@ -53,11 +53,15 @@ struct LCPath {
 }
 
 class SharedModel: ObservableObject {
-    @Published var selectedTab: LCTabIdentifier = .apps
+    /// System page a deep link asked for (.settings / .sources), or
+    /// nil for "stay on the desktop". Replaces the old Tab selection
+    /// (selectedTab / LCTabIdentifier, deleted with the Tab root):
+    /// LCAppListView opens this page as a full-screen cover, and the
+    /// page itself consumes SharedModel.deepLink.
+    @Published var requestedSystemPage: LCSystemPage? = nil
     @Published var deepLink: URL?
     
     @Published var isHiddenAppUnlocked = false
-    @Published var developerMode = false
     // 0 = current liveContainer is the primary one,
     // 2 = current liveContainer is not the primary one
     @Published var multiLCStatus = 0
@@ -69,7 +73,6 @@ class SharedModel: ObservableObject {
     @Published var tweakFolderNames: [String] = []
     
     @Published var apps : [LCAppModel] = []
-    @Published var arm32EmuApps : [LCAppModel] = []
     @Published var hiddenApps : [LCAppModel] = []
     
     @Published var pidCallback : ((NSNumber, Error?) -> Void)? = nil
@@ -307,14 +310,6 @@ struct JITStreamerEBMountResponse : Codable {
 extension NSNotification {
     static let InstallAppNotification = Notification.Name.init("InstallAppNotification")
 }
-
-public enum LCTabIdentifier: Hashable {
-    case sources
-    case apps
-    case tweaks
-    case settings
-}
-
 
 enum BatchMoveError: LocalizedError {
     case emptySource(URL)

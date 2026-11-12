@@ -46,33 +46,8 @@ extension View {
         self.modifier(DocModifier(isPresented: isPresented, types: types, multiple: multiple, callback: callback, onDismiss: onDismiss))
     }
     
-    func onBackground(_ f: @escaping () -> Void) -> some View {
-        self.onReceive(
-            NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification),
-            perform: { _ in f() }
-        )
-    }
-    
-    func onForeground(_ f: @escaping () -> Void) -> some View {
-        self.onReceive(
-            NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification),
-            perform: { _ in f() }
-        )
-    }
-    
-    func rainbow() -> some View {
-        self.modifier(RainbowAnimation())
-    }
-    
-    func navigationBarProgressBar(show: Binding<Bool>, progress: Binding<Float>) -> some View {
-        self.modifier(NavigationBarProgressModifier(show: show, progress: progress))
-    }
-    
-    func modifier<ModifiedContent: View>(@ViewBuilder body: (_ content: Self) -> ModifiedContent
-    ) -> ModifiedContent {
-        body(self)
-    }
 }
+
 
 /// Walk the presented-view-controller chain to the topmost controller.
 fileprivate func topmostViewController(from root: UIViewController?) -> UIViewController? {
@@ -228,113 +203,6 @@ public struct TextFieldAlertModifier: ViewModifier {
 
 }
 
-struct NavigationBarProgressModifier: ViewModifier {
-    @Binding var show: Bool
-    @Binding var progress: Float
-
-    func body(content: Content) -> some View {
-        content
-            .background(NavigationBarProgressView(show: $show, progress: $progress))
-    }
-}
-
-private struct NavigationBarProgressView: UIViewControllerRepresentable {
-    @Binding var show: Bool
-    @Binding var progress: Float
-
-    func makeUIViewController(context: Context) -> ProgressInjectorViewController {
-        ProgressInjectorViewController(progress: progress)
-    }
-
-    func updateUIViewController(_ uiViewController: ProgressInjectorViewController, context: Context) {
-        uiViewController.updateProgress(!show, progress)
-    }
-
-    class ProgressInjectorViewController: UIViewController {
-        private var progressView: UIProgressView?
-
-        init(progress: Float) {
-            super.init(nibName: nil, bundle: nil)
-        }
-
-        required init?(coder: NSCoder) {
-            fatalError("init(coder:) has not been implemented")
-        }
-
-        override func viewDidAppear(_ animated: Bool) {
-            super.viewDidAppear(animated)
-            injectProgressView()
-        }
-
-        func updateProgress(_ hidden: Bool, _ progress: Float) {
-            progressView?.setProgress(progress, animated: false)
-            progressView?.isHidden = hidden
-        }
-
-        private func injectProgressView() {
-            guard let navigationBar = self.navigationController?.navigationBar, progressView == nil else { return }
-
-            let barProgress = UIProgressView(progressViewStyle: .bar)
-            barProgress.translatesAutoresizingMaskIntoConstraints = false
-            var contentView : UIView? = nil
-            for curView in navigationBar.subviews {
-                if NSStringFromClass(curView.classForCoder) == "_UINavigationBarContentView" ||
-                    NSStringFromClass(curView.classForCoder) == "UIKit.NavigationBarContentView" {
-                    contentView = curView
-                    break
-                }
-            }
-            if let contentView {
-                contentView.addSubview(barProgress)
-                NSLayoutConstraint.activate([
-                    barProgress.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
-                    barProgress.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
-                    barProgress.bottomAnchor.constraint(equalTo: contentView.bottomAnchor)
-                ])
-            }
-            self.progressView = barProgress
-        }
-
-    }
-}
-
-// https://kieranb662.github.io/blog/2020/04/15/Rainbow
-struct RainbowAnimation: ViewModifier {
-    // 1
-    @State var isOn: Bool = false
-    let hueColors = stride(from: 0, to: 1, by: 0.01).map {
-        Color(hue: $0, saturation: 1, brightness: 1)
-    }
-    // 2
-    var duration: Double = 4
-    var animation: Animation {
-        Animation
-            .linear(duration: duration)
-            .repeatForever(autoreverses: false)
-    }
-
-    func body(content: Content) -> some View {
-    // 3
-        let gradient = LinearGradient(gradient: Gradient(colors: hueColors+hueColors), startPoint: .leading, endPoint: .trailing)
-        return content.overlay(GeometryReader { proxy in
-            ZStack {
-                gradient
-    // 4
-                    .frame(width: 2*proxy.size.width)
-    // 5
-                    .offset(x: self.isOn ? -proxy.size.width : 0)
-            }
-        })
-    // 6
-        .onAppear {
-            withAnimation(self.animation) {
-                self.isOn = true
-            }
-        }
-        .mask(content)
-    }
-}
-
 struct BasicButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
@@ -350,17 +218,6 @@ struct ActivityViewController: UIViewControllerRepresentable {
     }
 
     func updateUIViewController(_ uiViewController: UIActivityViewController, context: UIViewControllerRepresentableContext<ActivityViewController>) {}
-}
-
-private class SizedHostingController<Content: View>: UIHostingController<Content> {
-    override func viewDidLayoutSubviews() {
-        super.viewDidLayoutSubviews()
-
-        let size = sizeThatFits(in: UIView.layoutFittingCompressedSize)
-        if preferredContentSize != size {
-            preferredContentSize = size
-        }
-    }
 }
 
 struct IconImageView: View {
