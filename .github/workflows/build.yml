@@ -1,10 +1,8 @@
 name: Xcode - Build
 
-
 on: 
   push:
   pull_request:
-
 
 jobs:
   build:
@@ -70,3 +68,13 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.archive_path }}.xcarchive.tar
+          path: ${{ env.archive_path }}.xcarchive.tar
+      - name: Create IPA
+        run: |
+          sh .github/build_github.sh
+
+      - name: Upload a Build Artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.scheme }}.ipa
+          path: ${{ env.scheme }}.ipa
