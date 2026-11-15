@@ -71,10 +71,6 @@ final class LCStorageManagementModel: ObservableObject {
             allApps = apps
         }
         
-        if UserDefaults.sideStoreExist() {
-            allApps.append(LCAppModel(appInfo: BuiltInSideStoreAppInfo.shared))
-        }
-
         // Show per-app bundle usage only when every installed app has a reliable bundle path.
         let appItems = try await calculateAppItems(
             from: allApps
@@ -92,13 +88,8 @@ final class LCStorageManagementModel: ObservableObject {
         sizesByCategory[.appBundle] = 0
         sizesByCategory[.containers] = 0
         
-        var sideStoreContainerSize: Int64 = 0
         for appItem in appItems {
-            if !(appItem.appModel.appInfo is BuiltInSideStoreAppInfo) {
-                sizesByCategory[.appBundle]! += appItem.bundleSize ?? 0
-            } else {
-                sideStoreContainerSize = appItem.containersSize
-            }
+            sizesByCategory[.appBundle]! += appItem.bundleSize ?? 0
             
             for containerDetail in appItem.containerDetails {
                 if containerDetail.isExternalContainer {
@@ -194,11 +185,7 @@ final class LCStorageManagementModel: ObservableObject {
         }
         
         let totalSize: Int64
-        if input.appInfo is BuiltInSideStoreAppInfo {
-            totalSize = containersSize
-        } else {
-            totalSize = (bundleSize ?? 0) + containersSize
-        }
+        totalSize = (bundleSize ?? 0) + containersSize
 
         return LCAppStorageItem(
             id: UUID(),

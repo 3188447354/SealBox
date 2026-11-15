@@ -1,3 +1,15 @@
+//
+//  ShareExtensionViews.swift
+//  ShareExtension
+//
+//  SealBox 0.0.3 rebuild — share-to-install sheet only
+//  (implementation #2).
+//
+//  One card: the .ipa file (name + size) or the remote direct link,
+//  an "安装到 SealBox" button, and Cancel. No app grid, no container
+//  picker, no SideStore entry — the extension no longer launches guest
+//  apps, it only hands an IPA to the host for install.
+
 import SwiftUI
 import UIKit
 
@@ -5,259 +17,102 @@ struct ShareExtensionRootView: View {
     @ObservedObject var viewModel: ShareExtensionViewModel
     let extensionContext: NSExtensionContext?
 
-    private let columns = [
-        GridItem(.adaptive(minimum: 58, maximum: 70), spacing: 10)
-    ]
-
     var body: some View {
-        NavigationStack {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-                    let suggested = viewModel.suggestedApps()
-                    suggestedSection(apps: suggested, showsInstallAction: viewModel.shouldShowInstallAction())
-
-                    let regular = viewModel.regularApps()
-                    let hiddenApps = viewModel.hiddenRegularApps()
-                    let showHiddenUnlockButton = viewModel.shouldShowHiddenUnlockButton()
-
-                    if regular.isEmpty && !showHiddenUnlockButton && !(viewModel.hiddenUnlocked && !hiddenApps.isEmpty) {
-                        VStack(spacing: 8) {
-                            Image(systemName: "app")
-                                .font(.system(size: 28))
-                            Text("lc.appList.manageInPrimaryTip".loc)
-                        }
-                        .foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 32)
+        NavigationView {
+            VStack(spacing: 20) {
+                switch viewModel.payload.kind {
+                case .loading:
+                    ProgressView("正在读取…")
+                        .padding(.top, 40)
+                case .file:
+                    if viewModel.isWorking && viewModel.staged == nil {
+                        ProgressView("正在准备文件…")
+                            .padding(.top, 40)
+                    } else if let staged = viewModel.staged {
+                        installCard(
+                            title: staged.originalName,
+                            subtitle: ByteCountFormatter.string(fromByteCount: staged.size, countStyle: .file)
+                        )
                     } else {
-                        appGridSection(title: "lc.tabView.apps".loc, apps: regular, includesHiddenUnlockButton: showHiddenUnlockButton)
+                        ProgressView("正在准备文件…")
+                            .padding(.top, 40)
                     }
-
-                    if viewModel.hiddenUnlocked && !hiddenApps.isEmpty {
-                        appGridSection(title: "lc.appList.hiddenApps".loc, apps: hiddenApps)
+                case .remoteIPA(let url):
+                    installCard(
+                        title: url.lastPathComponent,
+                        subtitle: url.host ?? url.absoluteString
+                    )
+                case .empty:
+                    Text("没有可安装的文件。\n请分享一个 .ipa 文件。")
+                        .multilineTextAlignment(.center)
+                        .foregroundStyle(.secondary)
+                        .padding(.top, 40)
+                case .failed(let message):
+                    VStack(spacing: 12) {
+                        Image(systemName: "exclamationmark.triangle")
+                            .font(.system(size: 36))
+                            .foregroundStyle(.orange)
+                        Text(message)
+                            .multilineTextAlignment(.center)
+                            .foregroundStyle(.secondary)
                     }
+                    .padding(.top, 40)
                 }
-                .padding(.horizontal, 18)
-                .padding(.vertical, 14)
+                if viewModel.didOpenHost {
+                    Text("已在 SealBox 中打开，正在安装…")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
             }
+            .padding(20)
+            .navigationTitle("SealBox")
+            .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("lc.common.cancel".loc) {
+                    Button("取消") {
                         viewModel.cancelRequest()
                     }
                 }
             }
-            .alert("lc.common.error".loc, isPresented: Binding(
+            .alert("错误", isPresented: Binding(
                 get: { viewModel.errorMessage != nil },
                 set: { if !$0 { viewModel.errorMessage = nil } }
             )) {
-                Button("lc.common.ok".loc) { viewModel.errorMessage = nil }
+                Button("好", role: .cancel) { viewModel.errorMessage = nil }
             } message: {
                 Text(viewModel.errorMessage ?? "")
             }
-            .navigationTitle(Text("SealBox"))
-            .navigationBarTitleDisplayMode(.inline)
         }
     }
 
-    private func suggestedSection(apps: [ShareApp], showsInstallAction: Bool) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("lc.common.suggested".loc)
-                .font(.headline)
-            LazyVGrid(columns: columns, alignment: .leading, spacing: 12) {
-                if showsInstallAction {
-                    ShareInstallGridEntry(viewModel: viewModel, extensionContext: extensionContext)
-                }
-                if apps.isEmpty && !showsInstallAction {
-                    ShareSuggestedPlaceholderLabel()
-                } else {
-                    ForEach(apps) { app in
-                        ShareAppGridEntry(app: app, viewModel: viewModel, extensionContext: extensionContext)
-                    }
-                }
-            }
-        }
-    }
-
-    private func appGridSection(title: String, apps: [ShareApp], includesHiddenUnlockButton: Bool = false) -> some View {
-        let regularApps = apps.filter { !$0.isBuiltInSideStore }
-        let sideStoreApps = apps.filter { $0.isBuiltInSideStore }
-        return VStack(alignment: .leading, spacing: 10) {
-            Text(title)
-                .font(.headline)
-            LazyVGrid(columns: columns, alignment: .leading, spacing: 12) {
-                ForEach(regularApps) { app in
-                    ShareAppGridEntry(app: app, viewModel: viewModel, extensionContext: extensionContext)
-                }
-                ForEach(sideStoreApps) { app in
-                    ShareAppGridEntry(app: app, viewModel: viewModel, extensionContext: extensionContext)
-                }
-                if includesHiddenUnlockButton {
-                    ShareHiddenUnlockGridEntry(viewModel: viewModel)
-                }
-            }
-        }
-    }
-}
-
-private struct ShareSuggestedPlaceholderLabel: View {
-    var body: some View {
-        VStack(spacing: 7) {
-            RoundedRectangle(cornerRadius: 52 * 0.2667, style: .continuous)
-                .fill(Color(.secondarySystemBackground))
-                .overlay {
-                    Image(systemName: "app.dashed")
-                        .font(.system(size: 26))
-                        .foregroundStyle(.tertiary)
-                }
-                .frame(width: 52, height: 52)
-            Text(" ")
-                .font(.caption)
-                .frame(width: 64, height: 32, alignment: .top)
-        }
-        .frame(width: 64)
-        .accessibilityHidden(true)
-    }
-}
-
-private struct ShareHiddenUnlockGridEntry: View {
-    @ObservedObject var viewModel: ShareExtensionViewModel
-
-    var body: some View {
-        Button {
-            Task { await viewModel.unlockHiddenApps() }
-        } label: {
-            VStack(spacing: 7) {
-                Image(systemName: "ellipsis")
-                    .font(.system(size: 26, weight: .semibold))
-                    .frame(width: 52, height: 52)
-                    .background(Color(.secondarySystemBackground))
-                    .clipShape(RoundedRectangle(cornerRadius: 52 * 0.2667, style: .continuous))
-                Text(" ")
-                    .font(.caption)
-                    .lineLimit(1)
-                    .foregroundStyle(.primary)
-                    .frame(width: 64, height: 32, alignment: .top)
-            }
-            .frame(width: 64)
-        }
-        .buttonStyle(.plain)
-    }
-}
-
-private struct ShareAppGridEntry: View {
-    let app: ShareApp
-    @ObservedObject var viewModel: ShareExtensionViewModel
-    let extensionContext: NSExtensionContext?
-
-    var body: some View {
-        if app.containers.count > 1 {
-            NavigationLink {
-                ShareContainerSelectionView(app: app, viewModel: viewModel, extensionContext: extensionContext)
-            } label: {
-                ShareAppGridLabel(app: app)
-            }
-            .buttonStyle(.plain)
-        } else {
-            Button {
-                Task { await viewModel.launch(app: app, context: extensionContext) }
-            } label: {
-                ShareAppGridLabel(app: app)
-            }
-            .buttonStyle(.plain)
-        }
-    }
-}
-
-private struct ShareAppGridLabel: View {
-    let app: ShareApp
-
-    var body: some View {
-        VStack(spacing: 7) {
-            ShareAppIconView(iconURL: app.iconURL)
-                .frame(width: 52, height: 52)
-            Text(app.displayName)
-                .font(.caption)
-                .multilineTextAlignment(.center)
-                .lineLimit(2)
-                .foregroundStyle(.primary)
-                .frame(width: 64, height: 32, alignment: .top)
-        }
-        .frame(width: 64)
-    }
-}
-
-private struct ShareInstallGridEntry: View {
-    @ObservedObject var viewModel: ShareExtensionViewModel
-    let extensionContext: NSExtensionContext?
-
-    var body: some View {
-        Button {
-            Task { await viewModel.installSharedFileInLiveContainer(context: extensionContext) }
-        } label: {
-            VStack(spacing: 7) {
-                Image(systemName: "square.and.arrow.down")
-                    .font(.system(size: 25, weight: .semibold))
-                    .frame(width: 52, height: 52)
-                    .foregroundStyle(.primary)
-                    .background(Color(.secondarySystemBackground))
-                    .clipShape(RoundedRectangle(cornerRadius: 52 * 0.2667, style: .continuous))
-                Text("lc.common.install".loc)
-                    .font(.caption)
-                    .multilineTextAlignment(.center)
+    private func installCard(title: String, subtitle: String) -> some View {
+        VStack(spacing: 16) {
+            Image(systemName: "doc.fill")
+                .font(.system(size: 44))
+                .foregroundStyle(.secondary)
+                .padding(.top, 24)
+            VStack(spacing: 4) {
+                Text(title)
+                    .font(.headline)
                     .lineLimit(2)
-                    .foregroundStyle(.primary)
-                    .frame(width: 64, height: 32, alignment: .top)
-            }
-            .frame(width: 64)
-        }
-        .buttonStyle(.plain)
-    }
-}
-
-private struct ShareAppIconView: View {
-    let iconURL: URL?
-
-    var body: some View {
-        GeometryReader { geometry in
-            if let iconURL, let image = UIImage(contentsOfFile: iconURL.path) {
-                Image(uiImage: image)
-                    .resizable()
-                    .aspectRatio(contentMode: .fit)
-                    .clipShape(RoundedRectangle(cornerRadius: geometry.size.width * 0.2667, style: .continuous))
-            } else {
-                Image(systemName: "app")
-                    .font(.system(size: geometry.size.width * 0.56))
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .multilineTextAlignment(.center)
+                Text(subtitle)
+                    .font(.subheadline)
                     .foregroundStyle(.secondary)
-                    .background(Color(.secondarySystemBackground))
-                    .clipShape(RoundedRectangle(cornerRadius: geometry.size.width * 0.2667, style: .continuous))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
             }
-        }
-    }
-}
-
-private struct ShareContainerSelectionView: View {
-    let app: ShareApp
-    @ObservedObject var viewModel: ShareExtensionViewModel
-    let extensionContext: NSExtensionContext?
-
-    var body: some View {
-        List {
-            ForEach(app.containers) { container in
-                Button {
-                    Task { await viewModel.launch(app: app, container: container, context: extensionContext) }
-                } label: {
-                    HStack(spacing: 12) {
-                        ShareAppIconView(iconURL: app.iconURL)
-                            .frame(width: 36, height: 36)
-                        Text(container.name)
-                            .foregroundStyle(.primary)
-                        Spacer()
-                    }
+            Button("安装到 SealBox") {
+                Task {
+                    await viewModel.install(context: extensionContext)
                 }
             }
+            .buttonStyle(.borderedProminent)
+            .disabled(viewModel.isWorking)
+            Text("将直接进入安装，不用再选文件。")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
         }
-        .navigationTitle(app.displayName)
     }
 }

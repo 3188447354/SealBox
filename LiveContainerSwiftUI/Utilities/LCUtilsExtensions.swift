@@ -427,10 +427,6 @@ extension LCUtils {
                 onServerMessage?("JIT acquisition will continue in StikDebug.")
             }
             await UIApplication.shared.open(launchURL)
-        } else if jitEnabler == .SideStore {
-            onServerMessage?("JIT acquisition will continue in SideStore.")
-            let launchURL = URL(string: "sidestore://enable-jit?bundle-id=\(Bundle.main.bundleIdentifier!)")!
-            await UIApplication.shared.open(launchURL)
         }
         return false
     }
@@ -529,12 +525,36 @@ extension LCUtils {
             }
         }
     }
-    
-    static func openSideStore(delegate: LCAppModelDelegate? = nil, urlStr: String? = nil) {
-        let sideStoreApp = LCAppModel(appInfo: BuiltInSideStoreAppInfo.shared, delegate: delegate)
-        
-        Task {
-            try await sideStoreApp.runApp(bundleIdOverride: "builtinSideStore", urlStr: urlStr)
+}
+
+// MARK: - JITEnablerType
+//
+// Moved here from the deleted LCSettingsView.swift (0.0.3 rebuild):
+// LCUtilsExtensions.askForJIT is the only remaining user of this enum,
+// and the enum must survive the settings-page deletion. The `.SideStore`
+// case is gone with SideStoreSupport; its old raw value (4) is left
+// unassigned on purpose, so a stored 4 now fails the failable init and
+// askForJIT returns false instead of silently picking another enabler.
+// NOTE: a missing "LCJITEnablerType" key still reads as 0
+// (.SideJITServer) via integer(forKey:) — the known display bug; the
+// new Settings page (#2) must not display the raw value as a choice.
+enum JITEnablerType: Int, CaseIterable, Identifiable {
+    var id: Int { rawValue }
+    case SideJITServer = 0
+    case StikJIT = 1
+    case JITStreamerEBLegacy = 2
+    case StikJITLC = 3
+    case StosDebug = 5
+    case StosDebugLC = 6
+
+    var displayName: String {
+        switch self {
+        case .StikJIT: "StikDebug"
+        case .StikJITLC: "StikDebug (Another SealBox/Multitask)"
+        case .StosDebug: "StosDebug"
+        case .StosDebugLC: "StosDebug (Another SealBox/Multitask)"
+        case .JITStreamerEBLegacy: "JitStreamer-EB (Relaunch)"
+        case .SideJITServer: "SideJITServer/JITStreamer 2.0"
         }
     }
 }

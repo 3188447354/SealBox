@@ -1,54 +1,81 @@
+//
+//  ShareExtensionViewModel.swift
+//  ShareExtension
+//
+//  SealBox 0.0.3 rebuild — share-to-install only (implementation #2).
+//
+//  Flow (research §3 step 1, entry B):
+//  1. Load the shared item. A local .ipa / .tipa file is staged into
+//     the App Group shared directory
+//     (<appGroup>/LiveContainer/ShareInbox/<uuid>-<name>.ipa); a remote
+//     direct .ipa link needs no staging.
+//  2. The user taps "安装到 SealBox".
+//  3. The extension opens the host with sealbox://install?url=<...>
+//     via LCShareExtensionLauncher (the LSApplicationWorkspace chain
+//     the old flow already used) and completes the request. The host's
+//     RootView routes host "install" to InstallFlow, which installs
+//     the file — step 3 of the install flow, skipping file picking.
+//  4. The host deletes the staged file after a successful install and
+//     clears the marker keys (see InstallFlow).
+//
+//  Why a URL scheme, not just a UserDefaults marker: the extension
+//  cannot wake the host — only opening a URL can. The App Group
+//  directory is the transport (the extension's own container is not
+//  readable by the host); the marker keys
+//  (LCShareInboxFileName / LCShareInboxOriginalName / LCShareInboxDate)
+//  are only a record of what was staged, so a staged file is never
+//  anonymous litter. The scheme URL is the trigger; the directory is
+//  where the file lives.
+//
+//  What is NOT here any more: the guest-app list, container picker,
+//  per-app launch, hidden-app unlock, built-in SideStore launch, and
+//  the LCLaunchExtensionFileBookmark handoff (the staged file lives in
+//  the App Group, so the host can read it without a bookmark).
+
 import Combine
 import Foundation
-import LocalAuthentication
 
 @MainActor
 final class ShareExtensionViewModel: ObservableObject {
     @Published var payload = SharePayload()
-    @Published var visibleApps: [ShareApp] = []
-    @Published var hiddenApps: [ShareApp] = []
-    @Published var recommendedBundleIDs: [String] = []
-    @Published var hiddenUnlocked = false
-    @Published var isLaunching = false
+    @Published var staged: StagedIPA?
+    @Published var isWorking = false
     @Published var errorMessage: String?
+    @Published var didOpenHost = false
 
-    var allApps: [ShareApp] = []
-    var sharedDefaults: UserDefaults?
-    var privateDocURL: URL?
-    var privateDocAccessing = false
-    var appGroupRootURL: URL?
     weak var currentContext: NSExtensionContext?
+    private var hasLoaded = false
 
-    init() {
-        sharedDefaults = UserDefaults(suiteName: LCSharedUtils.appGroupID())
-        appGroupRootURL = LCSharedUtils.appGroupPath()?.appendingPathComponent("LiveContainer")
-        privateDocURL = Self.resolvePrivateDocURL(sharedDefaults: sharedDefaults)
-        privateDocAccessing = privateDocURL != nil
-        reloadApps()
+    private var sharedDefaults: UserDefaults? {
+        UserDefaults(suiteName: LCSharedUtils.appGroupID())
     }
 
-    deinit {
-        if privateDocAccessing {
-            privateDocURL?.stopAccessingSecurityScopedResource()
-        }
+    /// The App Group staging directory both targets agree on:
+    /// <appGroup>/LiveContainer/ShareInbox. The host derives the same
+    /// path from LCPath.lcGroupDocPath.
+    static var inboxDirectory: URL? {
+        LCSharedUtils.appGroupPath()?
+            .appendingPathComponent("LiveContainer")
+            .appendingPathComponent("ShareInbox")
     }
+
+    // MARK: - Load + stage
 
     func loadPayload(from context: NSExtensionContext?) {
         if let context {
             currentContext = context
         }
+        // beginRequest and viewDidLoad both call this; load once.
+        guard !hasLoaded else { return }
+        hasLoaded = true
         Task {
             do {
                 let loaded = try await SharePayload.load(from: context)
                 await MainActor.run {
                     self.payload.kind = loaded
                 }
-                if let url = await MainActor.run(body: { self.payload.sharedURL }) {
-                    await refreshRecommendation(for: url)
-                } else {
-                    await MainActor.run {
-                        self.recommendedBundleIDs = []
-                    }
+                if case .file(let fileURL) = loaded {
+                    await stageSharedFile(fileURL)
                 }
             } catch {
                 await MainActor.run {
@@ -58,553 +85,95 @@ final class ShareExtensionViewModel: ObservableObject {
         }
     }
 
-    func cancelRequest() {
-        currentContext?.cancelRequest(withError: ShareExtensionError("Cancelled"))
-    }
-
-    func unlockHiddenApps() async {
+    /// Copy the shared .ipa into the App Group inbox (background copy;
+    /// IPAs can be hundreds of MB) and record the marker keys.
+    private func stageSharedFile(_ fileURL: URL) async {
+        isWorking = true
+        defer { isWorking = false }
         do {
-            guard try await Self.authenticateUser() else {
-                return
-            }
-            hiddenUnlocked = true
-            rebuildVisibleApps()
+            let stagedResult = try await Task.detached {
+                let accessing = fileURL.startAccessingSecurityScopedResource()
+                defer {
+                    if accessing { fileURL.stopAccessingSecurityScopedResource() }
+                }
+                guard let inbox = Self.inboxDirectory else {
+                    throw ShareExtensionError("无法找到共享目录。")
+                }
+                let fm = FileManager.default
+                try fm.createDirectory(at: inbox, withIntermediateDirectories: true)
+                let originalName = fileURL.lastPathComponent
+                let safeName = originalName
+                    .components(separatedBy: CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_.")))
+                    .filter { !$0.isEmpty }
+                    .joined()
+                let fileName = "\(UUID().uuidString)-\(safeName.isEmpty ? "app.ipa" : safeName)"
+                let destination = inbox.appendingPathComponent(fileName)
+                if fm.fileExists(atPath: destination.path) {
+                    try fm.removeItem(at: destination)
+                }
+                try fm.copyItem(at: fileURL, to: destination)
+                let size = (try? fm.attributesOfItem(atPath: destination.path)[.size] as? Int64) ?? 0
+                return StagedIPA(stagedURL: destination, originalName: originalName, size: size)
+            }.value
+            self.staged = stagedResult
+            sharedDefaults?.set(stagedResult.stagedURL.lastPathComponent, forKey: ShareInboxKeys.fileName)
+            sharedDefaults?.set(stagedResult.originalName, forKey: ShareInboxKeys.originalName)
+            sharedDefaults?.set(Date(), forKey: ShareInboxKeys.date)
         } catch {
             errorMessage = error.localizedDescription
+            payload.kind = .failed(error.localizedDescription)
         }
     }
 
-    func recommendedApps() -> [ShareApp] {
-        let candidates = hiddenUnlocked ? visibleApps + hiddenApps : visibleApps
-        guard !recommendedBundleIDs.isEmpty else {
-            return []
-        }
+    // MARK: - Hand off to the host
 
-        var rank: [String: Int] = [:]
-        for bundleID in recommendedBundleIDs {
-            let normalizedID = bundleID.lowercased()
-            if rank[normalizedID] == nil {
-                rank[normalizedID] = rank.count
-            }
-        }
-        return candidates
-            .filter { rank[$0.bundleIdentifier.lowercased()] != nil }
-            .sorted { (rank[$0.bundleIdentifier.lowercased()] ?? Int.max) < (rank[$1.bundleIdentifier.lowercased()] ?? Int.max) }
-    }
-
-    func suggestedApps() -> [ShareApp] {
-        var apps = recommendedApps()
-        if shouldShowInstallAction(),
-           let sideStoreApp = visibleApps.first(where: { $0.isBuiltInSideStore }),
-           !apps.contains(where: { $0.id == sideStoreApp.id }) {
-            apps.append(sideStoreApp)
-        }
-        return apps
-    }
-
-    func regularApps() -> [ShareApp] {
-        visibleApps
-    }
-
-    func hiddenRegularApps() -> [ShareApp] {
-        hiddenApps
-    }
-
-    func shouldShowHiddenUnlockButton() -> Bool {
-        !hiddenUnlocked && !hiddenApps.isEmpty && !(sharedDefaults?.bool(forKey: "LCStrictHiding") ?? false)
-    }
-
-    private func refreshRecommendation(for url: URL) async {
-        guard url.scheme?.lowercased() == "https", let host = url.host?.lowercased() else {
-            recommendedBundleIDs = []
+    /// Install the staged file (or the remote direct link) in the host.
+    func install(context: NSExtensionContext?) async {
+        if isWorking {
             return
         }
-        let bundleIDs = await AssociatedDomainResolver.bundleIDs(for: host)
-        await MainActor.run {
-            self.recommendedBundleIDs = bundleIDs
-        }
-    }
+        isWorking = true
+        defer { isWorking = false }
 
-    static func authenticateUser() async throws -> Bool {
-        let context = LAContext()
-        var error: NSError?
-        guard context.canEvaluatePolicy(.deviceOwnerAuthentication, error: &error) else {
-            if let error = error as? LAError, error.code == .passcodeNotSet {
-                return true
-            }
-            if let error {
-                throw error
-            }
-            return false
-        }
-
-        return try await withCheckedThrowingContinuation { continuation in
-            context.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: "lc.utils.requireAuthentication".loc) { success, evaluationError in
-                if let evaluationError = evaluationError as? LAError, evaluationError.code == .userCancel || evaluationError.code == .appCancel {
-                    continuation.resume(returning: false)
-                } else if let evaluationError {
-                    continuation.resume(throwing: evaluationError)
-                } else {
-                    continuation.resume(returning: success)
-                }
-            }
-        }
-    }
-    
-    func reloadApps() {
-        var apps: [ShareApp] = []
-        if let privateDocURL {
-            apps.append(contentsOf: loadApps(root: privateDocURL, isShared: false))
-        }
-        if let appGroupRootURL {
-            apps.append(contentsOf: loadApps(root: appGroupRootURL, isShared: true))
-        }
-        if let builtInSideStore = loadBuiltInSideStoreApp() {
-            apps.append(builtInSideStore)
-        }
-
-        allApps = apps
-        rebuildVisibleApps()
-    }
-
-    func rebuildVisibleApps() {
-        let sorted = sortApps(allApps)
-        visibleApps = sorted.filter { !$0.isHidden }
-        hiddenApps = sorted.filter { $0.isHidden }
-    }
-
-    private func sortApps(_ apps: [ShareApp]) -> [ShareApp] {
-        let regularApps = apps.filter { !$0.isBuiltInSideStore }
-        let sideStoreApps = apps.filter { $0.isBuiltInSideStore }
-        let sortType = sharedDefaults?.string(forKey: "LCAppSortType") ?? "default"
-        let sorted: [ShareApp]
-
-        switch sortType {
-        case "alphabetical":
-            sorted = regularApps.sorted { $0.displayName.localizedStandardCompare($1.displayName) == .orderedAscending }
-        case "reverse_alphabetical":
-            sorted = regularApps.sorted { $0.displayName.localizedStandardCompare($1.displayName) == .orderedDescending }
-        case "last_launched":
-            let dated = regularApps.compactMap { app -> (ShareApp, Date)? in
-                guard let lastLaunched = app.lastLaunched else {
-                    return nil
-                }
-                return (app, lastLaunched)
-            }
-            .sorted { $0.1 > $1.1 }
-            .map { $0.0 }
-            let undated = regularApps.filter { $0.lastLaunched == nil }
-            sorted = dated + undated
-        case "installationDate":
-            let dated = regularApps.compactMap { app -> (ShareApp, Date)? in
-                guard let installationDate = app.installationDate else {
-                    return nil
-                }
-                return (app, installationDate)
-            }
-            .sorted { $0.1 > $1.1 }
-            .map { $0.0 }
-            let undated = regularApps.filter { $0.installationDate == nil }
-            sorted = dated + undated
-        case "custom":
-            sorted = sortByCustomOrder(regularApps)
-        default:
-            sorted = regularApps
-        }
-
-        return sorted + sideStoreApps
-    }
-
-    private func sortByCustomOrder(_ apps: [ShareApp]) -> [ShareApp] {
-        guard let customSortOrder = sharedDefaults?.array(forKey: "LCCustomSortOrder") as? [String],
-              !customSortOrder.isEmpty else {
-            return apps.sorted { $0.displayName.localizedStandardCompare($1.displayName) == .orderedAscending }
-        }
-
-        var sortedApps: [ShareApp] = []
-        var remainingApps = apps
-        for uniqueID in customSortOrder {
-            if let index = remainingApps.firstIndex(where: { uniqueID == uniqueIdentifier(for: $0) }) {
-                sortedApps.append(remainingApps.remove(at: index))
-            }
-        }
-
-        remainingApps.sort { $0.displayName.localizedStandardCompare($1.displayName) == .orderedAscending }
-        sortedApps.append(contentsOf: remainingApps)
-        return sortedApps
-    }
-
-    private func uniqueIdentifier(for app: ShareApp) -> String {
-        "\(app.bundleIdentifier):\(app.relativeBundlePath)"
-    }
-
-    private func loadApps(root: URL, isShared: Bool) -> [ShareApp] {
-        let applicationsURL = root.appendingPathComponent("Applications")
-        guard let appDirs = try? FileManager.default.contentsOfDirectory(at: applicationsURL, includingPropertiesForKeys: nil) else {
-            return []
-        }
-
-        return appDirs.compactMap { appURL in
-            guard appURL.pathExtension == "app" else {
-                return nil
-            }
-            return loadApp(appURL: appURL, root: root, isShared: isShared)
-        }
-    }
-
-    private func loadApp(appURL: URL, root: URL, isShared: Bool) -> ShareApp? {
-        guard
-            let infoPlist = NSDictionary(contentsOf: appURL.appendingPathComponent("Info.plist")) as? [String: Any]
-        else {
-            return nil
-        }
-        let appInfo = (NSDictionary(contentsOf: appURL.appendingPathComponent("LCAppInfo.plist")) as? [String: Any]) ?? [:]
-        let relativeBundlePath = appURL.lastPathComponent
-        let displayName = (infoPlist["CFBundleDisplayName"] as? String)
-            ?? (infoPlist["CFBundleName"] as? String)
-            ?? (infoPlist["CFBundleExecutable"] as? String)
-            ?? relativeBundlePath
-        let bundleIdentifier: String
-        if appInfo["doUseLCBundleId"] as? Bool == true, let original = appInfo["LCOrignalBundleIdentifier"] as? String {
-            bundleIdentifier = original
-        } else {
-            bundleIdentifier = (infoPlist["CFBundleIdentifier"] as? String) ?? "Unknown"
-        }
-
-        let containers = loadContainers(appInfo: appInfo, root: root, isShared: isShared)
-        let usableContainers = containers.isEmpty ? fallbackContainers(appInfo: appInfo, root: root, isShared: isShared) : containers
-        guard !usableContainers.isEmpty else {
-            return nil
-        }
-
-        return ShareApp(
-            id: "\(isShared ? "shared" : "private")|\(relativeBundlePath)",
-            relativeBundlePath: relativeBundlePath,
-            displayName: displayName,
-            bundleIdentifier: bundleIdentifier,
-            isShared: isShared,
-            isHidden: appInfo["isHidden"] as? Bool ?? false,
-            isLocked: appInfo["isLocked"] as? Bool ?? false,
-            isJITNeeded: appInfo["isJITNeeded"] as? Bool ?? false,
-            containers: usableContainers,
-            iconURL: iconURL(for: appURL),
-            lastLaunched: appInfo["lastLaunched"] as? Date,
-            installationDate: appInfo["installationDate"] as? Date,
-            isBuiltInSideStore: false
-        )
-    }
-
-    private func loadBuiltInSideStoreApp() -> ShareApp? {
-        let sideStoreFrameworkURL = Bundle.main.bundleURL
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .appendingPathComponent("Frameworks/SideStoreApp.framework")
-        guard FileManager.default.fileExists(atPath: sideStoreFrameworkURL.path) else {
-            return nil
-        }
-
-        let container = ShareContainer(
-            id: "builtinSideStore",
-            folderName: "builtinSideStore",
-            name: "SideStore",
-            isShared: false,
-        )
-
-        return ShareApp(
-            id: "builtinSideStore",
-            relativeBundlePath: "builtinSideStore",
-            displayName: "SideStore",
-            bundleIdentifier: "builtinSideStore",
-            isShared: false,
-            isHidden: false,
-            isLocked: false,
-            isJITNeeded: false,
-            containers: [container],
-            iconURL: builtInSideStoreIconURL(),
-            lastLaunched: nil,
-            installationDate: nil,
-            isBuiltInSideStore: true
-        )
-    }
-
-    private func builtInSideStoreIconURL() -> URL? {
-        guard let privateDocURL else {
-            return nil
-        }
-        let iconCacheURL = privateDocURL
-            .appendingPathComponent("SideStore/Library/Caches", isDirectory: true)
-            .appendingPathComponent("BuiltInSideStoreIconCache", isDirectory: true)
-        return preferredIconURL(in: iconCacheURL)
-    }
-
-    private func iconURL(for appURL: URL) -> URL? {
-        preferredIconURL(in: appURL)
-    }
-
-    private func preferredIconURL(in directory: URL) -> URL? {
-        let lightIconURL = directory.appendingPathComponent("LCAppIconLight.png")
-        let darkIconURL = directory.appendingPathComponent("LCAppIconDark.png")
-
-        let preferredIconURL: URL
-        let fallbackIconURL: URL
-        if #available(iOS 18.0, *), sharedDefaults?.bool(forKey: "darkModeIcon") == true {
-            preferredIconURL = darkIconURL
-            fallbackIconURL = lightIconURL
-        } else {
-            preferredIconURL = lightIconURL
-            fallbackIconURL = darkIconURL
-        }
-
-        if FileManager.default.fileExists(atPath: preferredIconURL.path) {
-            return preferredIconURL
-        }
-        if FileManager.default.fileExists(atPath: fallbackIconURL.path) {
-            return fallbackIconURL
-        }
-        return nil
-    }
-
-    private func loadContainers(appInfo: [String: Any], root: URL, isShared: Bool) -> [ShareContainer] {
-        guard let containerInfo = appInfo["LCContainers"] as? [[String: Any]] else {
-            return []
-        }
-        return containerInfo.compactMap { dict in
-            guard let folderName = dict["folderName"] as? String else {
-                return nil
-            }
-            let name = (dict["name"] as? String) ?? folderName
-            return ShareContainer(
-                id: "\(isShared ? "shared" : "private")|\(folderName)",
-                folderName: folderName,
-                name: name,
-                isShared: isShared,
-            )
-        }
-    }
-
-    private func fallbackContainers(appInfo: [String: Any], root: URL, isShared: Bool) -> [ShareContainer] {
-        guard let folderName = appInfo["LCDataUUID"] as? String else {
-            return []
-        }
-        return [
-            ShareContainer(
-                id: "\(isShared ? "shared" : "private")|\(folderName)",
-                folderName: folderName,
-                name: folderName,
-                isShared: isShared,
-            )
-        ]
-    }
-    
-    func launch(app: ShareApp, context: NSExtensionContext?) async {
-        guard let container = app.primaryContainer else {
-            errorMessage = "lc.shareExtension.error.noContainer".loc
-            return
-        }
-        await launch(app: app, container: container, context: context)
-    }
-
-    func launch(app: ShareApp, container: ShareContainer, context: NSExtensionContext?) async {
-        if isLaunching {
-            return
-        }
-        isLaunching = true
-        defer { isLaunching = false }
-
-        do {
-            if (app.isLocked || app.isHidden) && !hiddenUnlocked {
-                guard try await Self.authenticateUser() else {
-                    return
-                }
-            }
-
-            if app.isBuiltInSideStore {
-                try launchBuiltInSideStore(context: context)
-                return
-            }
-
-            let item = ShareLaunchItem(app: app, container: container)
-            let launchURLString = try preparePayloadForLaunch()
-            guard let launchURL = buildLaunchURL(for: item, launchURLString: launchURLString) else {
-                throw ShareExtensionError("Unable to build launch URL.")
-            }
-
-            LCShareExtensionLauncher.openURL(fromShareExtension: launchURL)
-            (context ?? currentContext)?.completeRequest(returningItems: nil, completionHandler: nil)
-        } catch {
-            errorMessage = error.localizedDescription
-        }
-    }
-
-    func shouldShowInstallAction() -> Bool {
-        guard case .file(let fileURL) = payload.kind else {
-            return false
-        }
-        let ext = fileURL.pathExtension.lowercased()
-        return ext == "ipa" || ext == "tipa"
-    }
-
-    func installSharedFileInLiveContainer(context: NSExtensionContext?) async {
-        if isLaunching {
-            return
-        }
-        guard case .file(let fileURL) = payload.kind else {
-            return
-        }
-        isLaunching = true
-        defer { isLaunching = false }
-
-        do {
-            try storeBookmark(for: fileURL)
-            guard var components = URLComponents(string: "sealbox://install") else {
-                throw ShareExtensionError("Unable to build install URL.")
-            }
-            components.queryItems = [
-                URLQueryItem(name: "url", value: fileURL.absoluteString)
-            ]
-            guard let installURL = components.url else {
-                throw ShareExtensionError("Unable to build install URL.")
-            }
-
-            LCShareExtensionLauncher.openURL(fromShareExtension: installURL)
-            (context ?? currentContext)?.completeRequest(returningItems: nil, completionHandler: nil)
-        } catch {
-            errorMessage = error.localizedDescription
-        }
-    }
-
-    private func preparePayloadForLaunch() throws -> String? {
+        let installURLString: String?
         switch payload.kind {
-        case .url(let url):
-            return url.absoluteString
-        case .file(let fileURL):
-            try storeBookmark(for: fileURL)
-            return fileURL.absoluteString
-        case .empty:
-            return nil
-        case .loading:
-            throw ShareExtensionError("The shared item is still loading.")
+        case .file:
+            guard let staged else {
+                errorMessage = "文件还在准备中，请稍候再试。"
+                return
+            }
+            installURLString = staged.stagedURL.absoluteString
+        case .remoteIPA(let url):
+            installURLString = url.absoluteString
         case .failed(let message):
-            throw ShareExtensionError(message)
-        }
-    }
-
-    private func launchBuiltInSideStore(context: NSExtensionContext?) throws {
-        let launchURLString = try preparePayloadForLaunch()
-
-        sharedDefaults?.set("sealbox", forKey: "LCLaunchExtensionScheme")
-        sharedDefaults?.set("builtinSideStore", forKey: "LCLaunchExtensionBundleID")
-        if let launchURLString {
-            sharedDefaults?.set(launchURLString, forKey: "LCLaunchExtensionLaunchURL")
-        }
-        sharedDefaults?.set(Date(), forKey: "LCLaunchExtensionLaunchDate")
-
-        guard var components = URLComponents(string: "sealbox://sealbox-launch") else {
-            throw ShareExtensionError("Unable to build SideStore launch URL.")
-        }
-        var queryItems = [
-            URLQueryItem(name: "bundle-name", value: "builtinSideStore")
-        ]
-        if let launchURLString {
-            queryItems.append(URLQueryItem(name: "open-url", value: Data(launchURLString.utf8).base64EncodedString()))
-        }
-        components.queryItems = queryItems
-        guard let launchURL = components.url else {
-            throw ShareExtensionError("Unable to build SideStore launch URL.")
+            errorMessage = message
+            return
+        default:
+            errorMessage = "没有可安装的文件。"
+            return
         }
 
-        LCShareExtensionLauncher.openURL(fromShareExtension: launchURL)
+        guard let installURLString,
+              var components = URLComponents(string: "sealbox://install") else {
+            errorMessage = "无法构建安装链接。"
+            return
+        }
+        components.queryItems = [URLQueryItem(name: "url", value: installURLString)]
+        guard let installURL = components.url else {
+            errorMessage = "无法构建安装链接。"
+            return
+        }
+
+        // Opens the host (LSApplicationWorkspace chain in main.m);
+        // RootView routes host "install" to InstallFlow. (The launcher
+        // reports true unconditionally in main.m; the result is not a
+        // reliable open confirmation.)
+        _ = LCShareExtensionLauncher.openURL(fromShareExtension: installURL)
+        didOpenHost = true
         (context ?? currentContext)?.completeRequest(returningItems: nil, completionHandler: nil)
     }
 
-    private func storeBookmark(for fileURL: URL) throws {
-        let accessed = fileURL.startAccessingSecurityScopedResource()
-        defer {
-            if accessed {
-                fileURL.stopAccessingSecurityScopedResource()
-            }
-        }
-
-        let bookmark = try fileURL.bookmarkData(
-            options: URL.BookmarkCreationOptions(rawValue: 1 << 11),
-            includingResourceValuesForKeys: nil,
-            relativeTo: nil
-        )
-        sharedDefaults?.set(bookmark, forKey: "LCLaunchExtensionFileBookmark")
-    }
-
-    private func buildLaunchURL(for item: ShareLaunchItem, launchURLString: String?) -> URL? {
-        var schemeToLaunch = "sealbox"
-        var newLaunch = false
-
-        if var runningLC = LCSharedUtils.getContainerUsingLCScheme(withFolderName: item.container.folderName) {
-            if runningLC.hasSuffix("liveprocess") {
-                runningLC = (runningLC as NSString).deletingPathExtension
-            }
-            schemeToLaunch = runningLC
-        } else {
-            newLaunch = true
-            schemeToLaunch = item.app.isShared ? (firstFreeInstalledLC() ?? "sealbox") : "sealbox"
-        }
-
-        if newLaunch && !item.app.isHidden && !item.app.isLocked && !item.app.isJITNeeded {
-            sharedDefaults?.set(schemeToLaunch, forKey: "LCLaunchExtensionScheme")
-            sharedDefaults?.set(item.app.relativeBundlePath, forKey: "LCLaunchExtensionBundleID")
-            sharedDefaults?.set(item.container.folderName, forKey: "LCLaunchExtensionContainerName")
-            if let launchURLString {
-                sharedDefaults?.set(launchURLString, forKey: "LCLaunchExtensionLaunchURL")
-            }
-            sharedDefaults?.set(Date(), forKey: "LCLaunchExtensionLaunchDate")
-        }
-
-        var components = URLComponents()
-        components.scheme = schemeToLaunch
-        components.host = "sealbox-launch"
-        var queryItems = [
-            URLQueryItem(name: "bundle-name", value: item.app.relativeBundlePath),
-            URLQueryItem(name: "container-folder-name", value: item.container.folderName)
-        ]
-        if let launchURLString {
-            queryItems.append(URLQueryItem(name: "open-url", value: Data(launchURLString.utf8).base64EncodedString()))
-        }
-        components.queryItems = queryItems
-        return components.url
-    }
-
-    private func firstFreeInstalledLC() -> String? {
-        for scheme in LCSharedUtils.lcUrlSchemes() {
-            guard
-                let url = URL(string: "\(scheme)://"),
-                LCShareExtensionLauncher.canOpenURL(fromShareExtension: url)
-            else {
-                continue
-            }
-            if LCSharedUtils.isLCScheme(inUse: scheme) {
-                continue
-            }
-            return scheme
-        }
-        return nil
-    }
-    
-    static func resolvePrivateDocURL(sharedDefaults: UserDefaults?) -> URL? {
-        guard let bookmarkData = sharedDefaults?.data(forKey: "LCLaunchExtensionPrivateDocBookmark") else {
-            return nil
-        }
-        guard let url = resolveBookmarkURL(bookmarkData) else {
-            sharedDefaults?.set(nil, forKey: "LCLaunchExtensionPrivateDocBookmark")
-            return nil
-        }
-        _ = url.startAccessingSecurityScopedResource()
-        return url
-    }
-
-    private static func resolveBookmarkURL(_ bookmarkData: Data) -> URL? {
-        do {
-            var isStale = false
-            return try URL(resolvingBookmarkData: bookmarkData, bookmarkDataIsStale: &isStale)
-        } catch {
-            return nil
-        }
+    func cancelRequest() {
+        (currentContext)?.completeRequest(returningItems: nil, completionHandler: nil)
     }
 }

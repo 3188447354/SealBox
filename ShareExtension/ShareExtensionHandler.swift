@@ -1,3 +1,15 @@
+//
+//  ShareExtensionHandler.swift
+//  ShareExtension
+//
+//  SealBox 0.0.3 rebuild — hosting shell (implementation #2).
+//
+//  Unchanged in shape from the old handler: a UIHostingController for
+//  the SwiftUI root view, with the payload load kicked off from
+//  beginRequest (the share-extension entry point). The ViewModel
+//  guards against a double load — viewDidLoad and beginRequest both
+//  call it.
+
 import SwiftUI
 import UIKit
 

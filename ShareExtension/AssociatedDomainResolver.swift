@@ -1,105 +1,47 @@
+//
+//  AssociatedDomainResolver.swift
+//  ShareExtension
+//
+//  SealBox 0.0.3 rebuild — direct-IPA link resolution only
+//  (implementation #2).
+//
+//  What this file used to do — fetch apple-app-site-association files
+//  to match a shared link to a guest app ("Open in App") — is gone
+//  with the Open-in-App UI. What remains is the one question the new
+//  install flow needs: is this shared link a DIRECT .ipa link?
+//
+//  - The URL itself ends in .ipa / .tipa → it is direct.
+//  - Otherwise one HEAD request follows the redirects; the final URL
+//    ends in .ipa / .tipa → it is direct.
+//  - Anything else → nil (the caller shows "不是 IPA 直链").
+//  There is no SideStore branch here (and none in the old file either
+//  — the SideStore code lived in the deleted ViewModel's built-in
+//  SideStore launch path, not in this resolver).
+
 import Foundation
 
 enum AssociatedDomainResolver {
-    static func bundleIDs(for host: String) async -> [String] {
-        var hosts = [host]
-        if host.hasPrefix("www.") {
-            hosts.append(String(host.dropFirst(4)))
+    /// Returns the direct .ipa / .tipa URL for a shared link, or nil.
+    static func directIPALink(from url: URL) async -> URL? {
+        if isDirectIPALink(url) {
+            return url
         }
-
-        for host in hosts {
-            let bundleIDs = await fetchBundleIDs(for: host)
-            if !bundleIDs.isEmpty {
-                return bundleIDs
-            }
-        }
-        return []
-    }
-
-    private static func fetchBundleIDs(for host: String) async -> [String] {
-        let urls = [
-            URL(string: "https://\(host)/apple-app-site-association"),
-            URL(string: "https://\(host)/.well-known/apple-app-site-association")
-        ].compactMap { $0 }
-
-        return await withTaskGroup(of: [String].self) { group in
-            for url in urls {
-                group.addTask {
-                    await fetchBundleIDs(from: url)
-                }
-            }
-
-            var result: [String] = []
-            for await ids in group {
-                for id in ids where !result.contains(id) {
-                    result.append(id)
-                }
-            }
-            return result
-        }
-    }
-
-    private static func fetchBundleIDs(from url: URL) async -> [String] {
+        // Follow redirects once and re-check the landing URL.
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 15)
+        request.httpMethod = "HEAD"
         do {
-            let (data, _) = try await URLSession.shared.data(from: url)
-            let association = try JSONDecoder().decode(SiteAssociation.self, from: data)
-            return association.applinks?.details.flatMap { $0.bundleIDs } ?? []
-        } catch {
-            return []
-        }
-    }
-}
-
-private struct SiteAssociation: Decodable {
-    let applinks: AppLinks?
-}
-
-private struct AppLinks: Decodable {
-    let details: [SiteAssociationDetailItem]
-
-    enum CodingKeys: String, CodingKey {
-        case details
-    }
-
-    init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        if let array = try? container.decode([SiteAssociationDetailItem].self, forKey: .details) {
-            details = array
-            return
-        }
-        if let dictionary = try? container.decode([String: SiteAssociationDetailItem].self, forKey: .details) {
-            details = dictionary.map { appID, item in
-                var item = item
-                if item.appID == nil {
-                    item.appID = appID
-                }
-                return item
+            let (_, response) = try await URLSession.shared.data(for: request)
+            guard let finalURL = response.url, isDirectIPALink(finalURL) else {
+                return nil
             }
-            return
+            return finalURL
+        } catch {
+            return nil
         }
-        details = []
-    }
-}
-
-private struct SiteAssociationDetailItem: Decodable {
-    var appID: String?
-    let appIDs: [String]?
-
-    var bundleIDs: [String] {
-        var result: [String] = []
-        if let appID {
-            result.append(Self.bundleID(from: appID))
-        }
-        if let appIDs {
-            result.append(contentsOf: appIDs.map(Self.bundleID(from:)))
-        }
-        return result.filter { !$0.isEmpty }
     }
 
-    private static func bundleID(from appID: String) -> String {
-        guard let dot = appID.firstIndex(of: ".") else {
-            return ""
-        }
-        return String(appID[appID.index(after: dot)...])
+    static func isDirectIPALink(_ url: URL) -> Bool {
+        let ext = url.pathExtension.lowercased()
+        return ext == "ipa" || ext == "tipa"
     }
 }
