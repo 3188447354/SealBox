@@ -359,21 +359,10 @@ struct SettingsView: View {
         pendingP12Data = nil
         pendingP12Name = nil
         certificateImported = true
-        // Best-effort display values straight from the .p12 (no ZSign
-        // round-trip): expiry + organisation unit for the rows above.
-        // validateCertificate below refreshes the same rows from the
-        // stored certificate either way.
-        if let helper = try? LCP12CertHelper(p12Data: p12Data, password: certPassword) {
-            if let expiry = try? helper.getNotValidityNotAfter() {
-                let formatter = DateFormatter()
-                formatter.dateStyle = .short
-                formatter.timeStyle = .medium
-                certValidUntil = formatter.string(from: expiry)
-            }
-            if let ou = try? helper.getOrgnizationUnit() {
-                certOrgUnit = ou
-            }
-        }
+        // Expiry + org unit are filled by refreshCertificateInfo() below
+        // (validateCertificate via ZSigner). The direct p12 helper was
+        // removed: its SecCertificate APIs are not declared for iOS
+        // in this SDK, so it could not compile.
         refreshCertificateInfo()
         // Let RootView's gate through (and re-check on next activation).
         NotificationCenter.default.post(name: Notification.Name("SealBoxCertificateImported"), object: nil)

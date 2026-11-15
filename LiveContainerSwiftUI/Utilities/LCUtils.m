@@ -3,7 +3,6 @@
 @import UIKit;
 @import UniformTypeIdentifiers;
 @import Security;
-#import <Security/SecCertificate.h> // SecCertificateCopyValues + kSecOIDX509V1*/kSecPropertyKey*: @import Security alone does not expose SecCertificate.h on this SDK (round 5: 10 undeclared-identifier errors, LCUtils.m:515-548).
 #import <IOKit/IOKitLib.h>
 
 #import "LCUtils.h"
@@ -461,97 +460,5 @@
     return [url bookmarkDataWithOptions:(1<<11) includingResourceValuesForKeys:0 relativeToURL:0 error:0];
 }
 
-
-@end
-
-#pragma mark - LCP12CertHelper
-
-/// Parses a .p12 with Security's SecPKCS12Import. The class is declared
-/// in LCUtils.h but never had an implementation anywhere (not even in
-/// 0.0.2 — nothing used it, so the linker never noticed). SettingsView
-/// 0.0.3 uses it for the best-effort expiry / org-unit display after a
-/// real p12 import, which made the missing symbol a link error
-/// (Undefined symbols _OBJC_CLASS_$_LCP12CertHelper, round 3).
-@implementation LCP12CertHelper {
-    SecCertificateRef _certificate;
-}
-
-- (instancetype)initWithP12Data:(NSData*)p12Data password:(NSString*)password error:(NSError**)error {
-    self = [super init];
-    if (!self) return nil;
-    if (!p12Data) {
-        if (error) *error = [NSError errorWithDomain:NSOSStatusErrorDomain code:errSecParam userInfo:nil];
-        return nil;
-    }
-    NSDictionary *options = @{(__bridge id)kSecImportExportPassphrase: password ?: @""};
-    CFArrayRef items = NULL;
-    OSStatus status = SecPKCS12Import((__bridge CFDataRef)p12Data, (__bridge CFDictionaryRef)options, &items);
-    if (status != errSecSuccess || !items || CFArrayGetCount(items) == 0) {
-        if (error) *error = [NSError errorWithDomain:NSOSStatusErrorDomain code:status userInfo:nil];
-        if (items) CFRelease(items);
-        return nil;
-    }
-    NSDictionary *item = (__bridge NSDictionary *)CFArrayGetValueAtIndex(items, 0);
-    SecIdentityRef identity = (__bridge SecIdentityRef)item[(__bridge id)kSecImportItemIdentity];
-    SecCertificateRef cert = NULL;
-    if (!identity || SecIdentityCopyCertificate(identity, &cert) != errSecSuccess || !cert) {
-        if (error) *error = [NSError errorWithDomain:NSOSStatusErrorDomain code:errSecItemNotFound userInfo:nil];
-        CFRelease(items);
-        return nil;
-    }
-    _certificate = cert; // +1 from Copy; released in dealloc.
-    CFRelease(items);
-    return self;
-}
-
-- (void)dealloc {
-    if (_certificate) CFRelease(_certificate);
-}
-
-- (NSDate*)getNotValidityNotAfterWithError:(NSError**)error {
-    if (!_certificate) {
-        if (error) *error = [NSError errorWithDomain:NSOSStatusErrorDomain code:errSecItemNotFound userInfo:nil];
-        return nil;
-    }
-    CFDictionaryRef values = SecCertificateCopyValues(_certificate, (__bridge CFArrayRef)@[(id)kSecOIDX509V1ValidityNotAfter], NULL);
-    if (!values) {
-        if (error) *error = [NSError errorWithDomain:NSOSStatusErrorDomain code:errSecItemNotFound userInfo:nil];
-        return nil;
-    }
-    NSDictionary *allValues = (__bridge NSDictionary *)values;
-    NSDictionary *entry = allValues[(id)kSecOIDX509V1ValidityNotAfter];
-    NSDate *date = entry[(id)kSecPropertyKeyValue];
-    CFRelease(values);
-    if (![date isKindOfClass:[NSDate class]]) {
-        if (error) *error = [NSError errorWithDomain:NSOSStatusErrorDomain code:errSecItemNotFound userInfo:nil];
-        return nil;
-    }
-    return date;
-}
-
-- (NSString*)getOrgnizationUnitWithError:(NSError**)error {
-    if (!_certificate) {
-        if (error) *error = [NSError errorWithDomain:NSOSStatusErrorDomain code:errSecItemNotFound userInfo:nil];
-        return nil;
-    }
-    CFDictionaryRef values = SecCertificateCopyValues(_certificate, (__bridge CFArrayRef)@[(id)kSecOIDX509V1SubjectName], NULL);
-    if (!values) {
-        if (error) *error = [NSError errorWithDomain:NSOSStatusErrorDomain code:errSecItemNotFound userInfo:nil];
-        return nil;
-    }
-    NSDictionary *allValues = (__bridge NSDictionary *)values;
-    NSDictionary *entry = allValues[(id)kSecOIDX509V1SubjectName];
-    NSArray *subject = entry[(id)kSecPropertyKeyValue];
-    CFRelease(values);
-    for (id component in subject) {
-        if (![component isKindOfClass:[NSDictionary class]]) continue;
-        if ([component[(id)kSecPropertyKeyLabel] isEqualToString:@"OU"]) {
-            NSString *ou = component[(id)kSecPropertyKeyValue];
-            if ([ou isKindOfClass:[NSString class]]) return ou;
-        }
-    }
-    if (error) *error = [NSError errorWithDomain:NSOSStatusErrorDomain code:errSecItemNotFound userInfo:nil];
-    return nil;
-}
 
 @end

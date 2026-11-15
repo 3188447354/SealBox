@@ -53,14 +53,6 @@ uint32_t dyld_get_sdk_version(const struct mach_header* mh);
 + (bool)sideStoreExist;
 @end
 
-@interface LCP12CertHelper : NSObject
-
-- (instancetype)initWithP12Data:(NSData*)p12Data password:(NSString*)password error:(NSError**)error;
-- (NSDate*)getNotValidityNotAfterWithError:(NSError**)error;
-- (NSString*)getOrgnizationUnitWithError:(NSError**)error;
-
-@end
-
 typedef NS_ENUM(NSInteger, GeneratedIconStyle){
     Original = -1,
     Light = 0,
