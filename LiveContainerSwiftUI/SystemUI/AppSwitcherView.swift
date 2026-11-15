@@ -107,7 +107,7 @@ struct AppSwitcherView: View {
                     onTap: { openCard(app) },
                     onCloseTap: { closeCard(app) }
                 )
-                .zIndex(flyingOutID == id ? 1000 : 100 + index * 4)
+                .zIndex(Double(flyingOutID == id ? 1000 : 100 + index * 4))
             }
         }
         // Centre the focused card: shift the whole track left by

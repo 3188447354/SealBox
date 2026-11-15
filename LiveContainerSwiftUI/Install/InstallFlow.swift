@@ -595,8 +595,14 @@ final class InstallFlow: ObservableObject {
         finalNewApp.installationDate = Date.now
 
         installObserver.invalidate()
+        // Snapshot the two vars before the concurrent closure: both were
+        // last written far above (lines ~524-525) and only read below, but
+        // capturing a var in MainActor.run's @Sendable body is a Swift 6
+        // data-race diagnostic (CI warned on both).
+        let replacement = appToReplace
+        let relativePath = appRelativePath
         await MainActor.run {
-            if let appToReplace {
+            if let appToReplace = replacement {
                 let newAppModel = LCAppModel(appInfo: finalNewApp, delegate: SealBoxLaunchCoordinator.shared)
                 sharedModel.apps.removeAll { $0 == appToReplace }
                 sharedModel.apps.append(newAppModel)
@@ -610,7 +616,7 @@ final class InstallFlow: ObservableObject {
                         .addObjects(from: urlSchemes as! [Any])
                 }
             }
-            installedAppIDs.append("\(newBundleId):\(appRelativePath)")
+            installedAppIDs.append("\(newBundleId):\(relativePath)")
         }
     }
 

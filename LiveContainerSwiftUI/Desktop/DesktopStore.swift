@@ -56,6 +56,21 @@ enum LCSystemPage: String, CaseIterable, Identifiable {
             return "gearshape.fill"
         }
     }
+
+    /// Solid tint used for the icon tile, in the style of a system app icon.
+    /// (Restored from 0.0.2 LCDesktopIcon.swift: the enum moved here in
+    /// the 0.0.3 rebuild but the tint was dropped while DesktopGridCell
+    /// still uses page.tint — CI Archive failed on the missing member.)
+    var tint: Color {
+        switch self {
+        case .sources:
+            return .blue
+        case .tweaks:
+            return .orange
+        case .settings:
+            return .gray
+        }
+    }
 }
 
 // MARK: - Unified desktop icon
