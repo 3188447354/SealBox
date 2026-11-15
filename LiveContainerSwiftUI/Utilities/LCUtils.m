@@ -3,6 +3,7 @@
 @import UIKit;
 @import UniformTypeIdentifiers;
 @import Security;
+#import <Security/SecCertificate.h> // SecCertificateCopyValues + kSecOIDX509V1*/kSecPropertyKey*: @import Security alone does not expose SecCertificate.h on this SDK (round 5: 10 undeclared-identifier errors, LCUtils.m:515-548).
 #import <IOKit/IOKitLib.h>
 
 #import "LCUtils.h"
