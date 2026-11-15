@@ -91,13 +91,16 @@ final class ShareExtensionViewModel: ObservableObject {
         isWorking = true
         defer { isWorking = false }
         do {
+            // Resolve on the main actor first: inboxDirectory is
+            // MainActor-isolated (class is @MainActor), so the detached
+            // copy below must not touch it — it only captures this URL.
+            guard let inbox = Self.inboxDirectory else {
+                throw ShareExtensionError("无法找到共享目录。")
+            }
             let stagedResult = try await Task.detached {
                 let accessing = fileURL.startAccessingSecurityScopedResource()
                 defer {
                     if accessing { fileURL.stopAccessingSecurityScopedResource() }
-                }
-                guard let inbox = Self.inboxDirectory else {
-                    throw ShareExtensionError("无法找到共享目录。")
                 }
                 let fm = FileManager.default
                 try fm.createDirectory(at: inbox, withIntermediateDirectories: true)
