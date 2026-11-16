@@ -109,7 +109,7 @@ final class SealBoxLaunchCoordinator: LCAppModelDelegate {
                         $0.appInfo.urlSchemes().contains("stosdebug") &&
                         (DataManager.shared.model.multiLCStatus != 2 || $0.appInfo.isShared)
                     }) else {
-                        InstallFlow.shared.errorMessage = "StosDebug is not found. Please install it first and switch it to shared app."
+                        InstallFlow.shared.errorMessage = "找不到 StosDebug，请先安装并把它设为共享应用。"
                         return
                     }
                     if let url = URL(string: "stosdebug://enableJIT?bundleId=\(Bundle.main.bundleIdentifier!)&appName=\(appName)&pid=\(pid)&relaunchApp=false&forcePID=true\(encoded)") {
@@ -128,7 +128,7 @@ final class SealBoxLaunchCoordinator: LCAppModelDelegate {
                         $0.appInfo.urlSchemes().contains("stikjit") &&
                         (DataManager.shared.model.multiLCStatus != 2 || $0.appInfo.isShared)
                     }) else {
-                        InstallFlow.shared.errorMessage = "StikDebug is not found. Please install it first and switch it to shared app."
+                        InstallFlow.shared.errorMessage = "找不到 StikDebug，请先安装并把它设为共享应用。"
                         return
                     }
                 }
@@ -369,7 +369,7 @@ final class InstallFlow: ObservableObject {
                     installUrl = resolvedURL
                     didStartAccessing = resolvedURL.startAccessingSecurityScopedResource()
                 } catch {
-                    await reportError("Failed to resolve shared IPA bookmark: \(error.localizedDescription)")
+                    await reportError("解析共享 IPA 书签失败：\(error.localizedDescription)")
                     return
                 }
             }

@@ -329,31 +329,31 @@ enum BatchMoveError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .emptySource(let url):
-            return "Source URL is invalid: \(url)"
+            return "源地址无效：\(url)"
         case .sourceDoesNotExist(let url):
-            return "Source does not exist: \(url.path)"
+            return "源不存在：\(url.path)"
         case .sourceIsNotReachable(let url, let error):
-            return "Source is not reachable: \(url.path). \(error)"
+            return "源不可达：\(url.path)。\(error)"
         case .sourceParentIsNotWritable(let url):
-            return "Source parent is not writable: : \(url.path)"
+            return "源的上级目录不可写：\(url.path)"
         case .destinationAlreadyExists(let url):
-            return "Destination already exists: \(url.path). Delete or rename this file/folder to continue."
+            return "目标已存在：\(url.path)，请删除或重命名后再试。"
         case .destinationParentDoesNotExist(let url):
-            return "Destination parent directory does not exist: \(url.path)"
+            return "目标的上级目录不存在：\(url.path)"
         case .destinationParentIsNotDirectory(let url):
-            return "Destination parent is not a directory: \(url.path)"
+            return "目标的上级不是目录：\(url.path)"
         case .destinationParentIsNotWritable(let url):
-            return "Destination parent is not writable: \(url.path)"
+            return "目标的上级目录不可写：\(url.path)"
         case .duplicateSource(let url):
-            return "Duplicate source URL in move list: \(url.path)"
+            return "移动列表里有重复的源：\(url.path)"
         case .duplicateDestination(let url):
-            return "Duplicate destination URL in move list: \(url.path)"
+            return "移动列表里有重复的目标：\(url.path)"
         case .sourceEqualsDestination(let url):
-            return "Source and destination are the same: \(url.path)"
+            return "源和目标相同：\(url.path)"
         case .moveWouldPlaceDirectoryInsideItself(let source, let destination):
-            return "Cannot move directory \(source.path) inside itself at \(destination.path)"
+            return "不能把目录 \(source.path) 移到它自己里面（\(destination.path)）"
         case .moveFailed(let source, let destination, let error):
-            return "Failed to move \(source.path) to \(destination.path). \(error)"
+            return "移动失败：\(source.path) → \(destination.path)。\(error)"
         }
     }
 

@@ -133,6 +133,16 @@ static void UIKitGuestHooksInit() {
     swizzle(UIApplication.class, @selector(openURL:options:completionHandler:), @selector(hook_openURL:options:completionHandler:));
     swizzle(UIApplication.class, @selector(canOpenURL:), @selector(hook_canOpenURL:));
     swizzle(UIApplication.class, @selector(setDelegate:), @selector(hook_setDelegate:));
+    // SealBox 0.0.4: left-edge swipe-back inside guest apps (see the
+    // UINavigationController hook at the end of this file). Only the
+    // two stack-mutating methods owned by UINavigationController
+    // itself are swizzled — the shared swizzle() helper is a direct
+    // method_exchangeImplementations, so an inherited method such as
+    // viewDidAppear: would be swapped on UIViewController itself and
+    // hit every view controller in the guest. push/setViewControllers
+    // cover every way a stack can gain depth > 1.
+    swizzle(UINavigationController.class, @selector(pushViewController:animated:), @selector(hook_pushViewController:animated:));
+    swizzle(UINavigationController.class, @selector(setViewControllers:animated:), @selector(hook_setViewControllers:animated:));
     swizzle(UIScene.class, @selector(scene:didReceiveActions:fromTransitionContext:), @selector(hook_scene:didReceiveActions:fromTransitionContext:));
     swizzle(UIScene.class, @selector(openURL:options:completionHandler:), @selector(hook_openURL:options:completionHandler:));
     NSInteger LCOrientationLockDirection = [NSUserDefaults.guestAppInfo[@"LCOrientationLock"] integerValue];
@@ -902,4 +912,40 @@ static LCControlAppURLHandling LCHandleControlAppURL(NSURL *url, NSString** modi
         }
     }
 }
+@end
+
+// MARK: - SealBox 0.0.4: left-edge swipe-back inside guest apps
+//
+// Why: a guest's interactivePopGestureRecognizer is its own UIKit
+// behaviour, but inside the container it is regularly found disabled
+// — the guest's own code, a hidden navigation bar, or the hosted
+// scene of a multitask window leaves it off — and no host-side
+// gesture can reach into the guest's navigation stack (classic
+// guests own the process; multitask guests run in the LiveProcess
+// extension). The only code that runs inside the guest in both
+// paths is TweakLoader, so the fix lives here: whenever the stack
+// gains depth, force the pop gesture on.
+//
+// Deliberately minimal: only .enabled is touched, never the delegate
+// (an app may have set its own), and only when there is a page to
+// pop back to (depth > 1). At depth 1 the gesture stays exactly as
+// UIKit left it. If the guest has no navigation stack at all this
+// is a no-op — no swipe, no accidental return to the desktop (that
+// stays on the Home Bar swipe-up).
+@implementation UINavigationController (LiveContainerHook)
+
+- (void)hook_pushViewController:(UIViewController *)viewController animated:(BOOL)animated {
+    [self hook_pushViewController:viewController animated:animated];
+    if (self.viewControllers.count > 1) {
+        self.interactivePopGestureRecognizer.enabled = YES;
+    }
+}
+
+- (void)hook_setViewControllers:(NSArray<UIViewController *> *)viewControllers animated:(BOOL)animated {
+    [self hook_setViewControllers:viewControllers animated:animated];
+    if (self.viewControllers.count > 1) {
+        self.interactivePopGestureRecognizer.enabled = YES;
+    }
+}
+
 @end

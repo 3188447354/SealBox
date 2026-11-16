@@ -249,7 +249,7 @@ struct RootView: View {
 
         let task = SecTaskCreateFromSelf(nil)
         guard let value = SecTaskCopyValueForEntitlement(task, "application-identifier" as CFString, nil), let appIdentifier = value.takeRetainedValue() as? String else {
-            errorInfo = "Unable to determine application-identifier"
+            errorInfo = "无法确定应用标识（application-identifier）"
             errorShow = true
             return
         }
@@ -289,7 +289,7 @@ struct RootView: View {
         }
 
         guard let bookmark = LCUtils.bookmark(for: LCPath.docPath) else {
-            errorInfo = "Failed to create bookmark for Documents folder?"
+            errorInfo = "无法为 Documents 文件夹创建书签？"
             errorShow = true
             return
         }

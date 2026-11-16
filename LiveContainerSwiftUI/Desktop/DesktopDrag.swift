@@ -53,6 +53,19 @@ enum DesktopDrop {
     case none
 }
 
+/// Per-frame finger position, observed ONLY by the drag ghost.
+///
+/// 0.0.4: this lives outside LCDesktopDragState's @Published set on
+/// purpose. The desktop observes that object, so a per-frame write
+/// there re-renders every page's grid and the ghost drops frames.
+/// The ghost is one icon + one label, so it alone follows the finger
+/// at 60 fps. LCDesktopDragState owns the single instance and writes
+/// it from updateDrag; the desktop never reads it in its own body —
+/// it only passes the reference through to the ghost.
+final class LCDesktopDragPosition: ObservableObject {
+    @Published var location: CGPoint = .zero
+}
+
 final class LCDesktopDragState: ObservableObject {
     /// Long-press duration. Constant 0.45 s — never conditional on edit state.
     static let longPressDuration: TimeInterval = 0.45
@@ -70,8 +83,19 @@ final class LCDesktopDragState: ObservableObject {
     static let dragLiftScale: CGFloat = 1.15
 
     @Published var draggedID: String?
-    @Published var dragLocation: CGPoint = .zero
-    @Published var dragTranslation: CGSize = .zero
+    /// The ghost's position object (see LCDesktopDragPosition): the
+    /// only per-frame write in this state machine goes here, never
+    /// into a @Published the desktop observes.
+    let position = LCDesktopDragPosition()
+    /// Last finger location (desktop space), for drop resolution and
+    /// edge-flip checks. Plain var, not @Published: it is written
+    /// every frame and only read from gesture handlers, never from a
+    /// view body — publishing it would re-render the whole desktop
+    /// per frame (0.0.4 follow fix).
+    var dragLocation: CGPoint = .zero
+    /// Last gesture translation. Written, never read anywhere (kept
+    /// for the drag math's symmetry); plain var so the write is free.
+    var dragTranslation: CGSize = .zero
     @Published var hoverIconID: String?
     @Published var hoverDockSlot: Int?
     /// Mirrors the edit state: the edit-mode drag gesture reads it mid-touch.
@@ -99,6 +123,7 @@ final class LCDesktopDragState: ObservableObject {
         guard !isSearchActive else { return }
         draggedID = id
         dragLocation = location
+        position.location = location
         dragTranslation = .zero
         hoverIconID = nil
         hoverDockSlot = nil
@@ -114,8 +139,15 @@ final class LCDesktopDragState: ObservableObject {
     func updateDrag(translation: CGSize, location: CGPoint) {
         dragTranslation = translation
         dragLocation = location
-        hoverIconID = iconID(at: location)
-        hoverDockSlot = dockSlotIndex(at: location)
+        // Only the ghost follows per frame (its own position object).
+        position.location = location
+        // Hover is the only @Published write here, and only on change:
+        // assigning the same cell id every frame would still notify
+        // and re-render the desktop per frame.
+        let newHoverIcon = iconID(at: location)
+        if newHoverIcon != hoverIconID { hoverIconID = newHoverIcon }
+        let newHoverDock = dockSlotIndex(at: location)
+        if newHoverDock != hoverDockSlot { hoverDockSlot = newHoverDock }
     }
 
     /// Update a drag from a gesture translation: the absolute finger
@@ -145,6 +177,7 @@ final class LCDesktopDragState: ObservableObject {
     func endDrag() {
         draggedID = nil
         dragTranslation = .zero
+        position.location = .zero
         hoverIconID = nil
         hoverDockSlot = nil
         lastEdgeFlipDate = nil
@@ -227,10 +260,13 @@ struct SlotFrameKey: PreferenceKey {
 
 /// The floating ghost: the dragged icon at 1.15× with a shadow,
 /// following the finger. Shown by the desktop while a drag is active.
+/// It observes ONLY the drag position object (LCDesktopDragPosition),
+/// so per-frame finger movement re-renders this one icon + label and
+/// nothing else — the desktop body is not re-run for the ghost.
 struct DesktopDragGhost: View {
     let icon: LCDesktopIcon
     let displayName: String
-    let location: CGPoint
+    @ObservedObject var position: LCDesktopDragPosition
 
     var body: some View {
         VStack(spacing: 4) {
@@ -246,7 +282,7 @@ struct DesktopDragGhost: View {
         }
         .scaleEffect(LCDesktopDragState.dragLiftScale)
         .shadow(color: .black.opacity(0.35), radius: 12, x: 0, y: 8)
-        .position(location)
+        .position(position.location)
         .allowsHitTesting(false)
     }
 }

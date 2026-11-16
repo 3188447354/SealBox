@@ -107,6 +107,36 @@ struct DesktopView: View {
     /// normally empty — and an empty switcher says so instead of
     /// inventing cards.
     private func openSwitcher() {
+        // 0.0.4: the switcher lists the windows that are actually
+        // running. isAppRunning is only true while a launch is in
+        // flight (runApp clears it in defer), so the old filter
+        // showed an empty switcher as soon as the launch finished.
+        // Multitask windows live in MultitaskDockManager.apps —
+        // registered by DecoratedAppSceneViewController when the
+        // window is created, removed when it terminates — so map
+        // each registered window back to its model by container
+        // folderName (DockAppModel.appUUID), in registry (launch)
+        // order. Hidden apps are included: a running hidden app
+        // still needs a way back. Tapping a card still goes through
+        // launchDesktopApp -> runApp, which brings an already-running
+        // multitask window to front instead of relaunching.
+        // iOS 15 has no registry (MultitaskDockManager is iOS 16+):
+        // keep the old filter there.
+        if #available(iOS 16.0, *) {
+            let running = MultitaskDockManager.shared.apps
+            if !running.isEmpty {
+                var seen = Set<ObjectIdentifier>()
+                switcherApps = running.compactMap { dockApp in
+                    guard let model = (sharedModel.apps + sharedModel.hiddenApps).first(where: {
+                        $0.appInfo.containers.contains { $0.folderName == dockApp.appUUID }
+                    }) else { return nil as LCAppModel? }
+                    guard seen.insert(ObjectIdentifier(model)).inserted else { return nil as LCAppModel? }
+                    return model
+                }
+                showSwitcher = true
+                return
+            }
+        }
         switcherApps = sharedModel.apps.filter { $0.isAppRunning }
         showSwitcher = true
     }
@@ -490,13 +520,16 @@ struct DesktopView: View {
                 .animation(.easeOut(duration: 0.5), value: installFlow.isInstalling)
             }
 
-            // Drag ghost, following the finger.
+            // Drag ghost, following the finger. It reads its own
+            // position object (dragState.position), so per-frame
+            // finger movement re-renders only the ghost, not this
+            // body — see LCDesktopDragPosition.
             if let draggedID = dragState.draggedID,
                let icon = modelByID[draggedID].map({ LCDesktopIcon.app($0) }) {
                 DesktopDragGhost(
                     icon: icon,
                     displayName: metaStore.displayName(for: draggedID, fallback: icon.displayName),
-                    location: dragState.dragLocation
+                    position: dragState.position
                 )
             }
 
@@ -756,7 +789,13 @@ struct DesktopView: View {
             }
         )
         if editState.isEditing {
-            cell.gesture(editDragGesture(for: icon))
+            // 0.0.4: high-priority so the icon drag wins over the
+            // TabView's paging gesture — with a plain .gesture a
+            // horizontal drag could page the desktop instead and the
+            // drag-start point went stale under the moving page.
+            // A page swipe can still start from any blank area, and
+            // the edge hot zones still flip pages mid-drag.
+            cell.highPriorityGesture(editDragGesture(for: icon))
         } else {
             cell.desktopAppContextMenu(
                 icon,

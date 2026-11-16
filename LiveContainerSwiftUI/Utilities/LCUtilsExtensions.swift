@@ -178,7 +178,7 @@ extension LCUtils {
         case .ADP:
             return "ADP"
         default:
-            return "Unknown Store"
+            return "未知商店"
         }
     }
     
@@ -242,20 +242,20 @@ extension LCUtils {
                 return false
             }
             
-            onServerMessage?("Please make sure the VPN is connected if the server is not in your local network.")
+            onServerMessage?("如果服务器不在本地网络，请确认 VPN 已连接。")
             
             do {
                 let launchJITUrlStr = "\(sideJITServerAddress)/\(deviceUDID)/\(Bundle.main.bundleIdentifier ?? "")"
                 guard let launchJITUrl = URL(string: launchJITUrlStr) else { return false }
                 let session = URLSession.shared
                 
-                onServerMessage?("Contacting SideJITServer at \(sideJITServerAddress)...")
+                onServerMessage?("正在连接 SideJITServer（\(sideJITServerAddress)）…")
                 let request = URLRequest(url: launchJITUrl)
                 let (data, _) = try await session.data(for: request)
                 onServerMessage?(String(decoding: data, as: UTF8.self))
                 
             } catch {
-                onServerMessage?("Failed to contact SideJITServer: \(error)")
+                onServerMessage?("连接 SideJITServer 失败：\(error)")
             }
             
             return false
@@ -265,11 +265,11 @@ extension LCUtils {
                 JITStresmerEBAddress = "http://[fd00::]:9172"
             }
             
-            onServerMessage?("Please make sure the VPN is connected if the server is not in your local network.")
+            onServerMessage?("如果服务器不在本地网络，请确认 VPN 已连接。")
             
             do {
                 
-                onServerMessage?("Contacting JitStreamer-EB server at \(JITStresmerEBAddress)...")
+                onServerMessage?("正在连接 JitStreamer-EB 服务器（\(JITStresmerEBAddress)）…")
                 
                 let session = URLSession.shared
                 let decoder = JSONDecoder()
@@ -279,16 +279,16 @@ extension LCUtils {
                 let mountRequest = URLRequest(url: mountStatusUrl)
                 
                 // check mount status
-                onServerMessage?("Checking mount status...")
+                onServerMessage?("正在检查挂载状态…")
                 let (mountData, _) = try await session.data(for: mountRequest)
                 let mountResponseObj = try decoder.decode(JITStreamerEBMountResponse.self, from: mountData)
                 guard mountResponseObj.ok else {
-                    onServerMessage?(mountResponseObj.error ?? "Mounting failed with unknown error.")
+                    onServerMessage?(mountResponseObj.error ?? "挂载失败，未知错误。")
                     return false
                 }
                 if mountResponseObj.mounting {
-                    onServerMessage?("Your device is currently mounting the developer disk image. Leave your device on and connected. Once this finishes, you can run JitStreamer again.")
-                    onServerMessage?("Check \(JITStresmerEBAddress)/mount_status for mounting status.")
+                    onServerMessage?("设备正在挂载开发者磁盘映像，请保持开机并连接。完成后可再次运行 JitStreamer。")
+                    onServerMessage?("挂载状态见 \(JITStresmerEBAddress)/mount_status。")
                     if let mountStatusUrl = URL(string: "\(JITStresmerEBAddress)/mount_status") {
                         await UIApplication.shared.open(mountStatusUrl)
                     }
@@ -297,17 +297,17 @@ extension LCUtils {
                 
                 // open safari to use /launch_app api
                 if let mountStatusUrl = URL(string: "\(JITStresmerEBAddress)/launch_app/\(Bundle.main.bundleIdentifier!)") {
-                    onServerMessage?("JIT acquisition will continue in the default browser.")
+                    onServerMessage?("JIT 获取将在默认浏览器中继续。")
                     await UIApplication.shared.open(mountStatusUrl)
                 }
                 return false
                 
                 
             } catch {
-                onServerMessage?("Failed to contact JitStreamer-EB server: \(error)")
+                onServerMessage?("连接 JitStreamer-EB 服务器失败：\(error)")
             }
         } else if jitEnabler == .StosDebug || jitEnabler == .StosDebugLC {
-            guard let appName else { onServerMessage?("Unable to get App Name, Please try again."); return false }
+            guard let appName else { onServerMessage?("无法获取 App 名称，请重试。"); return false }
             var launchURLStr = "stosdebug://enableJIT?bundleId=\(Bundle.main.bundleIdentifier!)&appName=\(appName)"
             
             if let script = script, !script.isEmpty {
@@ -332,12 +332,12 @@ extension LCUtils {
                     }
                 }
                 guard let appToLaunch else {
-                    onServerMessage?("StosDebug is not installed in SealBox.")
+                    onServerMessage?("SealBox 里没有安装 StosDebug。")
                     return false
                 }
                 
                 if !appToLaunch.uiIsShared {
-                    onServerMessage?("StosDebug is installed in SealBox, but is not a shared app. Convert it to a shared app to continue.")
+                    onServerMessage?("StosDebug 已安装在 SealBox 里，但不是共享应用，请先把它转为共享应用。")
                     return false
                 }
                 // check if stosdebug is already running
@@ -351,7 +351,7 @@ extension LCUtils {
                     }
                 }
                 guard let freeScheme else {
-                    onServerMessage?("No free SealBox is available. Please either: \n(1)close one, \n(2)install a new one, \n(3)choose another method to enable JIT.")
+                    onServerMessage?("没有空闲的 SealBox，请：（1）关闭一个；（2）再装一个；（3）换一种开启 JIT 的方式。")
                     return false
                 }
                 
@@ -359,11 +359,11 @@ extension LCUtils {
                 LCUtils.appGroupUserDefault.set(freeScheme, forKey: "LCLaunchExtensionScheme")
                 LCUtils.appGroupUserDefault.set(appToLaunch.appInfo.relativeBundlePath, forKey: "LCLaunchExtensionBundleID")
                 LCUtils.appGroupUserDefault.set(Date.now, forKey: "LCLaunchExtensionLaunchDate")
-                onServerMessage?("JIT acquisition will continue in another SealBox.")
+                onServerMessage?("JIT 获取将在另一个 SealBox 中继续。")
                 
                 await UIApplication.shared.open(launchURL)
             } else {
-                onServerMessage?("JIT acquisition will continue in StosDebug.")
+                onServerMessage?("JIT 获取将在 StosDebug 中继续。")
                 
                 await UIApplication.shared.open(URL(string: launchURLStr)!)
             }
@@ -393,12 +393,12 @@ extension LCUtils {
                     }
                 }
                 guard let appToLaunch else {
-                    onServerMessage?("StikDebug is not installed in SealBox.")
+                    onServerMessage?("SealBox 里没有安装 StikDebug。")
                     return false
                 }
                 
                 if !appToLaunch.uiIsShared {
-                    onServerMessage?("StikDebug is installed in SealBox, but is not a shared app. Convert it to a shared app to continue.")
+                    onServerMessage?("StikDebug 已安装在 SealBox 里，但不是共享应用，请先把它转为共享应用。")
                     return false
                 }
                 // check if stikdebug is already running
@@ -412,7 +412,7 @@ extension LCUtils {
                     }
                 }
                 guard let freeScheme else {
-                    onServerMessage?("No free SealBox is available. Please either: \n(1)close one, \n(2)install a new one, \n(3)choose another method to enable JIT.")
+                    onServerMessage?("没有空闲的 SealBox，请：（1）关闭一个；（2）再装一个；（3）换一种开启 JIT 的方式。")
                     return false
                 }
                 
@@ -420,11 +420,11 @@ extension LCUtils {
                 LCUtils.appGroupUserDefault.set(freeScheme, forKey: "LCLaunchExtensionScheme")
                 LCUtils.appGroupUserDefault.set(appToLaunch.appInfo.relativeBundlePath, forKey: "LCLaunchExtensionBundleID")
                 LCUtils.appGroupUserDefault.set(Date.now, forKey: "LCLaunchExtensionLaunchDate")
-                onServerMessage?("JIT acquisition will continue in another SealBox.")
+                onServerMessage?("JIT 获取将在另一个 SealBox 中继续。")
                 
             } else {
                 launchURL = URL(string: launchURLStr)!
-                onServerMessage?("JIT acquisition will continue in StikDebug.")
+                onServerMessage?("JIT 获取将在 StikDebug 中继续。")
             }
             await UIApplication.shared.open(launchURL)
         }
@@ -550,10 +550,10 @@ enum JITEnablerType: Int, CaseIterable, Identifiable {
     var displayName: String {
         switch self {
         case .StikJIT: "StikDebug"
-        case .StikJITLC: "StikDebug (Another SealBox/Multitask)"
+        case .StikJITLC: "StikDebug（另一个 SealBox/多任务）"
         case .StosDebug: "StosDebug"
-        case .StosDebugLC: "StosDebug (Another SealBox/Multitask)"
-        case .JITStreamerEBLegacy: "JitStreamer-EB (Relaunch)"
+        case .StosDebugLC: "StosDebug（另一个 SealBox/多任务）"
+        case .JITStreamerEBLegacy: "JitStreamer-EB（重新启动）"
         case .SideJITServer: "SideJITServer/JITStreamer 2.0"
         }
     }

@@ -486,7 +486,7 @@ struct SettingsView: View {
                 storageRow("应用本体", size: breakdown.appBundleSize)
                 storageRow("应用数据", size: breakdown.containersSize)
                 storageRow("临时文件", size: breakdown.temporaryFilesSize)
-                storageRow("App Group", size: breakdown.appGroupSize)
+                storageRow("应用组", size: breakdown.appGroupSize)
                 storageRow("插件", size: breakdown.tweaksSize)
                 storageRow("其他", size: breakdown.otherSize)
                 ForEach(breakdown.appItems) { item in

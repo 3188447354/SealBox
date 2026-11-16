@@ -26,6 +26,19 @@ struct SealBoxApp: SwiftUI.App {
     @UIApplicationDelegateAdaptor(SealBoxAppDelegate.self) var appDelegate
 
     init() {
+        // 0.0.4: the whole UI is Chinese. Force the app language
+        // before ANY localized string is read (NSLocalizedString
+        // resolves against AppleLanguages at first use; on MJ's
+        // phone the lookup was falling through to the en bundle and
+        // the UI showed English). This only affects SealBox's own
+        // strings — guest apps run in their own process/defaults.
+        UserDefaults.standard.set(["zh-Hans"], forKey: "AppleLanguages")
+        // 0.0.4: multitasking is the default. register() only fills
+        // keys the user never set, so an explicit later choice still
+        // wins; classic-mode apps (classicMode != 0) still launch
+        // non-multitask by design (LCAppModel.shouldLaunchInMultitaskMode).
+        UserDefaults.standard.register(defaults: ["LCLaunchInMultitaskMode": true])
+
         let fm = FileManager()
         var tempAppDataFolderNames: [String] = []
         var tempTweakFolderNames: [String] = []
