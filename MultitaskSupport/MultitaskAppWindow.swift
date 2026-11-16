@@ -19,10 +19,43 @@ struct MultitaskAppInfo {
     }
 }
 
+/// Weak holder so a window registry never keeps a dead window alive.
+final class WeakWindowBox {
+    weak var window: UIWindow?
+    init(_ window: UIWindow?) { self.window = window }
+}
+
 @available(iOS 16.1, *)
 @objc class MultitaskWindowManager: NSObject {
     @Environment(\.openWindow) static var openWindow
     static var appDict: [String: MultitaskAppInfo] = [:]
+
+    /// The live window of each native app scene, keyed by dataUUID.
+    /// The switcher snapshots these for its cards (GuestSceneSnapshot).
+    /// Registered by MultitaskAppWindow on appear, removed on
+    /// disappear / scene disconnect.
+    static var sceneWindows: [String: WeakWindowBox] = [:]
+
+    @objc class func registerSceneWindow(dataUUID: String, window: UIWindow?) {
+        guard let window else { return }
+        sceneWindows[dataUUID] = WeakWindowBox(window)
+    }
+
+    @objc class func unregisterSceneWindow(dataUUID: String) {
+        sceneWindows.removeValue(forKey: dataUUID)
+    }
+
+    /// Drop every trace of a native app window: the open-scene table
+    /// (so a later tap relaunches instead of reopening a dead scene),
+    /// the scene-window registry, and the switcher registry. Called
+    /// when the guest exits (AppSceneViewController delegate) and
+    /// when the scene disconnects. The virtual path cleans itself via
+    /// DecoratedAppSceneViewController.removeRunningApp.
+    @objc class func removeAppWindow(dataUUID: String) {
+        appDict.removeValue(forKey: dataUUID)
+        sceneWindows.removeValue(forKey: dataUUID)
+        MultitaskDockManager.shared.removeRunningApp(dataUUID)
+    }
     
     @objc class func openAppWindow(displayName: String, dataUUID: String, bundleId: String, pidCallback: ((NSNumber, Error?) -> Void)?) {
         DataManager.shared.model.enableMultipleWindow = true
@@ -102,6 +135,10 @@ struct AppSceneViewSwiftUI: UIViewControllerRepresentable {
     func makeCoordinator() -> Coordinator {
         Coordinator(onAppInitialize: onAppInitialize, onExit: {
             show = false
+            // 0.0.5: the guest is gone — drop its scene table and
+            // switcher entries so the switcher never lists a dead app
+            // and a later tap relaunches instead of reopening it.
+            MultitaskWindowManager.removeAppWindow(dataUUID: dataUUID)
         })
     }
     
@@ -145,6 +182,10 @@ struct MultitaskAppWindow: View {
                 AppSceneViewSwiftUI(show: $show, bundleId: appInfo.bundleId, dataUUID: appInfo.dataUUID, initSize: geometry.size,
                                     onAppInitialize: { pid, error in
                     DispatchQueue.main.async {
+                        // 0.0.5: the scene's window is live now — make
+                        // sure the switcher can snapshot it (onAppear
+                        // may have run before the window was attached).
+                        MultitaskWindowManager.registerSceneWindow(dataUUID: appInfo.dataUUID, window: sceneDelegate.window)
                         if error == nil {
                             self.pid = Int(pid)
                         } else {
@@ -159,9 +200,20 @@ struct MultitaskAppWindow: View {
             }
             .ignoresSafeArea(.all, edges: .all)
             .navigationTitle(Text("\(appInfo.displayName) - \(String(pid))"))
+            .onAppear {
+                // 0.0.5: register this scene's window so the switcher
+                // can snapshot it for its card.
+                MultitaskWindowManager.registerSceneWindow(dataUUID: appInfo.dataUUID, window: sceneDelegate.window)
+            }
+            .onDisappear {
+                MultitaskWindowManager.unregisterSceneWindow(dataUUID: appInfo.dataUUID)
+            }
             .onReceive(pub) { out in
                 if let scene1 = sceneDelegate.window?.windowScene, let scene2 = out.object as? UIWindowScene, scene1 == scene2 {
                     show = false
+                    // 0.0.5: the scene is gone — drop its entries so
+                    // the switcher never lists a dead app.
+                    MultitaskWindowManager.removeAppWindow(dataUUID: appInfo.dataUUID)
                 }
             }
             

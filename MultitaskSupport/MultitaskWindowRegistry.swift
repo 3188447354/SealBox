@@ -177,8 +177,6 @@ class AppInfoProvider {
     }
 
     @objc public func removeRunningApp(_ appUUID: String) {
-        guard isDockEnabled() else { return }
-
         DispatchQueue.main.async {
             self.apps.removeAll { $0.appUUID == appUUID }
         }
@@ -277,8 +275,6 @@ class AppInfoProvider {
     }
 
     @objc public func addRunningAppWithInfo(_ appInfo: LCAppInfo?, appUUID: String, view: UIView?) {
-        guard isDockEnabled() else { return }
-
         if apps.contains(where: { $0.appUUID == appUUID }) {
             return
         }
@@ -304,8 +300,13 @@ class AppInfoProvider {
     }
 
     // MARK: - Multitask Mode Check
-    private func isDockEnabled() -> Bool {
-        let multitaskMode = MultitaskMode(rawValue: LCUtils.appGroupUserDefault.integer(forKey: "LCMultitaskMode")) ?? .virtualWindow
-        return multitaskMode == .virtualWindow
-    }
+    // 0.0.5: the registry is mode-independent now. It used to be
+    // gated on virtualWindow (isDockEnabled) because it fed the
+    // deleted floating Dock; the native launch path
+    // (LCUtils.launchMultitaskGuestApp) registers with view:nil and
+    // was silently dropped by that guard, so in native mode the
+    // switcher never saw a running app. The registry now feeds the
+    // app switcher in BOTH modes — native entries carry view:nil
+    // and their scene window lives in MultitaskWindowManager
+    // .sceneWindows instead (see GuestSceneSnapshot).
 }

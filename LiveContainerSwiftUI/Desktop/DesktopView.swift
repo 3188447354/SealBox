@@ -14,9 +14,11 @@
 //  Blank-area gestures live on each page's background layer (a sibling
 //  behind the grid, NOT on an ancestor): a tap on an icon never reaches
 //  them, a tap on empty space exits edit mode (400 ms guard) and a
-//  0.45 s long-press enters it. Icon drag is edit-mode only (see
-//  DesktopDrag.swift for why hold-through drag cannot coexist with the
-//  normal-mode contextMenu on the same view).
+//  0.45 s long-press enters it. Normal-mode icon drag is
+//  hold-through (item 7): a sequenced LongPress -> Drag gesture
+//  lifts the icon, drags it, or opens the custom menu on release
+//  without a drag — the old system contextMenu is gone because it
+//  owned the long-press touch and made that impossible.
 
 import Foundation
 import SwiftUI
@@ -51,6 +53,16 @@ struct DesktopView: View {
     @State private var showDeleteConfirm = false
     @State private var alertMessage: String?
     @State private var zoomIconImage: UIImage?
+    /// Icon currently lifted by a normal-mode long-press (item 7):
+    /// it scales up in place until the finger moves (drag) or lifts
+    /// (menu). Set on long-press success, cleared on drag start or
+    /// on touch-up.
+    @State private var liftedID: String?
+    /// Long-press succeeded but the finger has not dragged yet: if
+    /// it lifts now, the menu opens for this icon.
+    @State private var menuCandidateID: String?
+    /// The custom long-press menu (item 7), anchored at the icon.
+    @State private var menuRequest: DesktopMenuRequest?
 
     private enum DragOrigin {
         case grid(slot: Int)
@@ -148,7 +160,7 @@ struct DesktopView: View {
     private func pullDownGesture() -> some Gesture {
         DragGesture(minimumDistance: 24)
             .onEnded { value in
-                guard !editState.isEditing, !showSearch, !showControlCenter, !showSwitcher else { return }
+                guard !editState.isEditing, !showSearch, !showControlCenter, !showSwitcher, menuRequest == nil else { return }
                 let start = value.startLocation
                 let dy = value.translation.height
                 guard dy > 60, abs(value.translation.width) < 60 else { return }
@@ -187,7 +199,14 @@ struct DesktopView: View {
 
     private func syncDesktopOrder() {
         let dockIDs = Set(dockStore.dockIDs)
-        orderStore.sync(allIDs: visibleIDs.filter { !dockIDs.contains($0) })
+        // 0.0.5: the fixed Settings entry lives in the order at slot 0
+        // (first page, first cell). It is in allIDs so sync() never
+        // frees it; pinSystemIconFirst puts it at the front on the
+        // first sync after the upgrade (sync alone would append it at
+        // the end). It never enters the Dock (dockIDs are app ids
+        // only) or search (searchableApps is built from visibleApps).
+        orderStore.sync(allIDs: [LCSystemPage.settings.id] + visibleIDs.filter { !dockIDs.contains($0) })
+        orderStore.pinSystemIconFirst(id: LCSystemPage.settings.id)
         dockStore.seedIfNeeded(launchCounts: metaStore.launchCounts, allIDs: visibleIDs)
         if currentPage >= pageCount {
             currentPage = max(0, pageCount - 1)
@@ -304,25 +323,39 @@ struct DesktopView: View {
     // MARK: - Drag & drop
 
     private func editDragGesture(for icon: LCDesktopIcon) -> some Gesture {
-        DragGesture(minimumDistance: LCDesktopDragState.dragStartDistance)
+        // 0.0.5: the gesture reports in the "desktop" coordinate
+        // space (the stationary full-screen ZStack), not the cell's
+        // local space. The old local-space translation jumped by a
+        // full page width when an edge flip slid the page under the
+        // finger, so the ghost teleported off-screen and the drop
+        // could never land on page 2. In desktop space the finger's
+        // location stays valid across flips, so startLocation and
+        // location are used directly — no cell frame needed.
+        DragGesture(minimumDistance: LCDesktopDragState.dragStartDistance, coordinateSpace: .named("desktop"))
             .onChanged { value in
                 if dragState.draggedID == nil {
-                    guard let frame = dragState.cellFrames[icon.id] else { return }
                     if let slot = orderStore.order.firstIndex(of: icon.id) {
                         dragOrigin = .grid(slot: slot)
                     }
-                    dragState.beginDrag(id: icon.id, frame: frame, startLocation: value.startLocation)
+                    dragState.beginDrag(id: icon.id, at: value.startLocation)
                 }
-                dragState.updateDrag(translation: value.translation)
-                if let direction = dragState.edgeDirection(at: dragState.dragLocation, screenWidth: UIScreen.main.bounds.width),
-                   dragState.edgeFlipReady() {
-                    dragState.markEdgeFlip()
-                    flipPage(direction)
-                }
+                updateGridDrag(translation: value.translation, location: value.location)
             }
             .onEnded { _ in
                 handleDrop()
             }
+    }
+
+    /// Shared per-frame drag update: ghost position, hover and the
+    /// edge-flip check. Used by the edit-mode drag and by the
+    /// normal-mode long-press drag (item 7).
+    private func updateGridDrag(translation: CGSize, location: CGPoint) {
+        dragState.updateDrag(translation: translation, location: location)
+        if let direction = dragState.edgeDirection(at: location, screenWidth: UIScreen.main.bounds.width),
+           dragState.edgeFlipReady() {
+            dragState.markEdgeFlip()
+            flipPage(direction)
+        }
     }
 
     private func handleDrop() {
@@ -334,6 +367,13 @@ struct DesktopView: View {
         withAnimation(.spring(response: LCDesktopDragState.landingDuration, dampingFraction: 1.0)) {
             switch drop {
             case .gridSlot(let slot):
+                // 0.0.5: dropping on the fixed Settings icon is a
+                // no-op (fly back) — system icons never swap and are
+                // never a landing slot.
+                if let targetID = orderStore.order.indices.contains(slot) ? orderStore.order[slot] : nil,
+                   LCDesktopIcon.isSystemID(targetID) {
+                    break
+                }
                 if case .dock(let originSlot) = dragOrigin {
                     // Dock -> grid: leave the Dock, land in the slot.
                     dockStore.removeFromDock(id: draggedID)
@@ -490,7 +530,8 @@ struct DesktopView: View {
                 ControlCenterView(isPresented: $showControlCenter, jitEnabled: jitEnabledForControlCenter)
             }
 
-            // App switcher (running apps only; multitask frozen in v1).
+            // App switcher (running apps only; 0.0.5 native windows
+            // with live-screen cards).
             if showSwitcher {
                 AppSwitcherView(
                     apps: switcherApps,
@@ -520,23 +561,6 @@ struct DesktopView: View {
                 .animation(.easeOut(duration: 0.5), value: installFlow.isInstalling)
             }
 
-            // Drag ghost, following the finger. It reads its own
-            // position object (dragState.position), so per-frame
-            // finger movement re-renders only the ghost, not this
-            // body — see LCDesktopDragPosition.
-            if let draggedID = dragState.draggedID,
-               let icon = modelByID[draggedID].map({ LCDesktopIcon.app($0) }) {
-                DesktopDragGhost(
-                    icon: icon,
-                    displayName: metaStore.displayName(for: draggedID, fallback: icon.displayName),
-                    position: dragState.position
-                )
-            }
-
-            // Launch zoom overlay.
-            if zoomState.isActive {
-                LaunchZoomOverlay(zoom: zoomState, icon: zoomIconImage)
-            }
         }
         .coordinateSpace(name: "desktop")
         .safeAreaInset(edge: .bottom) {
@@ -550,8 +574,13 @@ struct DesktopView: View {
                         launchDesktopApp(model, zoomFrom: icon)
                     }
                 },
-                onLongPress: { _ in
-                    editState.enter()
+                onMenuRequest: { icon, slot in
+                    if let frame = dragState.dockSlotFrames[slot] {
+                        menuRequest = DesktopMenuRequest(
+                            icon: icon,
+                            anchor: CGPoint(x: frame.midX, y: frame.midY)
+                        )
+                    }
                 },
                 onDragBegin: { icon, slot in
                     dragOrigin = .dock(slot: slot)
@@ -569,6 +598,80 @@ struct DesktopView: View {
             )
             // The Dock never moves when the keyboard rises (search).
             .ignoresSafeArea(.keyboard)
+        }
+        // 0.0.5: the drag ghost and the launch zoom live in an overlay
+        // ABOVE the Dock, not inside the ZStack. The Dock is attached
+        // via .safeAreaInset, whose content renders above everything
+        // in the ZStack — so a ghost starting on a Dock icon was
+        // covered by the Dock until the finger left its top edge
+        // (it looked like the icon came out from under the Dock), and
+        // the launch zoom was half-covered the same way. An overlay
+        // attached after .safeAreaInset draws above the inset, so the
+        // ghost is under the finger from the first frame. The ghost's
+        // .position is in the "desktop" coordinate space (the ZStack's
+        // full-screen frame), which is the same frame this overlay
+        // covers — no translation needed. Both children are
+        // hit-test disabled, so the overlay never eats touches.
+        .overlay {
+            // Drag ghost, following the finger. It reads its own
+            // position object (dragState.position), so per-frame
+            // finger movement re-renders only the ghost, not this
+            // body — see LCDesktopDragPosition.
+            if let draggedID = dragState.draggedID,
+               let icon = modelByID[draggedID].map({ LCDesktopIcon.app($0) }) {
+                DesktopDragGhost(
+                    icon: icon,
+                    displayName: metaStore.displayName(for: draggedID, fallback: icon.displayName),
+                    position: dragState.position
+                )
+            }
+            // Launch zoom overlay.
+            if zoomState.isActive {
+                LaunchZoomOverlay(zoom: zoomState, icon: zoomIconImage)
+            }
+        }
+        // 0.0.5: the custom long-press menu (item 7). A separate
+        // overlay above the ghost so it is never covered; its dim
+        // background eats taps (dismiss) and blocks the desktop
+        // underneath while it is open.
+        .overlay {
+            if let request = menuRequest {
+                DesktopAppMenuOverlay(
+                    request: request,
+                    onOpen: {
+                        menuRequest = nil
+                        if let model = request.icon.appModel {
+                            launchDesktopApp(model, zoomFrom: request.icon)
+                        }
+                    },
+                    onRename: {
+                        menuRequest = nil
+                        if let model = request.icon.appModel {
+                            renameApp = model
+                            showRename = true
+                        }
+                    },
+                    onDetail: {
+                        menuRequest = nil
+                        if let model = request.icon.appModel {
+                            detailApp = model
+                            showDetail = true
+                        }
+                    },
+                    onDelete: {
+                        menuRequest = nil
+                        if let model = request.icon.appModel {
+                            appPendingDelete = model
+                            showDeleteConfirm = true
+                        }
+                    },
+                    onEditHomeScreen: {
+                        menuRequest = nil
+                        editState.enter()
+                    },
+                    onDismiss: { menuRequest = nil }
+                )
+            }
         }
         // Pull-down zones: simultaneous, so TabView paging (horizontal)
         // and the background tap / long-press still work — this handler
@@ -596,6 +699,12 @@ struct DesktopView: View {
         }
         .onChange(of: sharedModel.apps) { _ in
             syncDesktopOrder()
+        }
+        .onChange(of: currentPage) { _ in
+            // 0.0.5: a page swipe behind the open long-press menu
+            // would leave the menu anchored to an icon that is no
+            // longer on screen — dismiss it with the page.
+            menuRequest = nil
         }
         .onChange(of: installFlow.installedAppIDs) { _ in
             syncDesktopOrder()
@@ -734,6 +843,11 @@ struct DesktopView: View {
                                     )
                                 }
                             )
+                    } else if id == LCSystemPage.settings.id {
+                        // 0.0.5: the fixed Settings entry (first page,
+                        // first cell). Rendered from the order like any
+                        // icon, but it is not an app — see gridCell.
+                        gridCell(.system(.settings), slot: slot)
                     } else if let model = modelByID[id] {
                         let icon = LCDesktopIcon.app(model)
                         gridCell(icon, slot: slot)
@@ -768,6 +882,7 @@ struct DesktopView: View {
             isEditing: editState.isEditing,
             isDragged: dragState.draggedID == id,
             isDropHover: dragState.hoverIconID == id,
+            isLifted: liftedID == id,
             onDelete: {
                 if let model = icon.appModel {
                     appPendingDelete = model
@@ -777,6 +892,11 @@ struct DesktopView: View {
             onTap: {
                 if let model = icon.appModel {
                     launchDesktopApp(model, zoomFrom: icon)
+                } else if case .system(.settings) = icon {
+                    // 0.0.5: the fixed desktop Settings entry opens
+                    // the settings page (RootView's fullScreenCover
+                    // is bound to requestedSystemPage == .settings).
+                    sharedModel.requestedSystemPage = .settings
                 }
             }
         )
@@ -788,7 +908,12 @@ struct DesktopView: View {
                     .preference(key: SlotFrameKey.self, value: [slot: geometry.frame(in: .named("desktop"))])
             }
         )
-        if editState.isEditing {
+        if icon.isSystem {
+            // Fixed system icon: no drag gesture, no context menu —
+            // it never moves, never deletes, never enters the Dock.
+            // It still jiggles in edit mode like a native icon.
+            cell
+        } else if editState.isEditing {
             // 0.0.4: high-priority so the icon drag wins over the
             // TabView's paging gesture — with a plain .gesture a
             // horizontal drag could page the desktop instead and the
@@ -797,35 +922,63 @@ struct DesktopView: View {
             // the edge hot zones still flip pages mid-drag.
             cell.highPriorityGesture(editDragGesture(for: icon))
         } else {
-            cell.desktopAppContextMenu(
-                icon,
-                onOpen: {
-                    if let model = icon.appModel {
-                        launchDesktopApp(model, zoomFrom: icon)
-                    }
-                },
-                onRename: {
-                    if let model = icon.appModel {
-                        renameApp = model
-                        showRename = true
-                    }
-                },
-                onDetail: {
-                    if let model = icon.appModel {
-                        detailApp = model
-                        showDetail = true
-                    }
-                },
-                onDelete: {
-                    if let model = icon.appModel {
-                        appPendingDelete = model
-                        showDeleteConfirm = true
-                    }
-                },
-                onEditHomeScreen: {
-                    editState.enter()
-                }
-            )
+            // Normal mode: the Button's tap opens the app; the
+            // long-press gesture (item 7) owns the long-press — lift,
+            // drag, or menu on release. It must be high-priority so
+            // it wins over the desktop's pull-down / control-centre
+            // gestures and over the Button's own press.
+            // The old system contextMenu is gone: it owned the
+            // long-press touch and made hold-through dragging
+            // impossible. The menu is now the custom overlay
+            // (DesktopAppMenuOverlay) shown on a long-press release.
+            cell.highPriorityGesture(longPressDragGesture(for: icon))
         }
+    }
+
+    /// Normal-mode long-press drag (item 7, iOS behaviour): press
+    /// 0.45 s and the icon lifts in place; move and it drags (the
+    /// same finger, no lift); release without moving and the menu
+    /// opens. A quick tap still opens the app (the Button owns it:
+    /// the long-press fails on touch-up before 0.45 s).
+    private func longPressDragGesture(for icon: LCDesktopIcon) -> some Gesture {
+        LongPressGesture(minimumDuration: LCDesktopDragState.longPressDuration)
+            .sequenced(before: DragGesture(minimumDistance: LCDesktopDragState.dragStartDistance, coordinateSpace: .named("desktop")))
+            .onChanged { value in
+                switch value {
+                case .first(let pressed):
+                    if pressed {
+                        liftedID = icon.id
+                        menuCandidateID = icon.id
+                    }
+                case .second(true, let drag):
+                    guard let drag else { return }
+                    if dragState.draggedID == nil {
+                        if let slot = orderStore.order.firstIndex(of: icon.id) {
+                            dragOrigin = .grid(slot: slot)
+                        }
+                        dragState.beginDrag(id: icon.id, at: drag.startLocation)
+                        liftedID = nil
+                        menuCandidateID = nil
+                    }
+                    updateGridDrag(translation: drag.translation, location: drag.location)
+                default:
+                    break
+                }
+            }
+            .onEnded { value in
+                liftedID = nil
+                switch value {
+                case .second(true, _):
+                    if dragState.draggedID != nil {
+                        handleDrop()
+                    } else if menuCandidateID == icon.id,
+                              let anchor = iconCenter(for: icon) {
+                        menuRequest = DesktopMenuRequest(icon: icon, anchor: anchor)
+                    }
+                default:
+                    break
+                }
+                menuCandidateID = nil
+            }
     }
 }

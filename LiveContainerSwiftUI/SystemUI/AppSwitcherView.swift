@@ -12,6 +12,13 @@
 //  card on the left, zIndex = 100 + index × 4, the focused card is NOT
 //  raised — only a card flying out on swipe-up may go to zIndex 1000.
 //
+//  0.0.5: a card IS the guest app's own live screen (GuestSceneSnapshot
+//  — the native scene's window, or the virtual window's live view),
+//  near full-screen, with the app name above it. When no picture can
+//  be taken (guest still launching, or a window that never rendered)
+//  the card falls back to the icon placeholder — never a black
+//  rectangle presented as the app.
+//
 //  Gestures (all values from research §2.2.4):
 //  - Horizontal drag follows 1:1, snaps with spring 0.38 / 0.85.
 //  - Tap a card: it scales up and opens (0.46 s spring).
@@ -20,15 +27,14 @@
 //  - Tap empty space / swipe down: back to the desktop.
 //  - The × on a card is only an accessibility fallback for the swipe.
 //
-//  Multitask is FROZEN in v1: this view never calls
-//  LCUtils.launchMultitaskGuestApp. The parent passes a snapshot of the
-//  apps that were running when the switcher opened; opening a card
-//  asks the parent to launch it (LCAppModel.runApp returns early for an
-//  already-running app), and closing a card removes it from that
-//  snapshot. A guest that runs as the host process itself can only be
-//  left via the Home Bar return gesture — the switcher does not claim
-//  to kill a process it cannot kill. Multitask-window close wiring is
-//  v2 work, after the multitask launch path is connected.
+//  Multitask is LIVE since 0.0.4: opening a card asks the parent to
+//  launch the app (LCAppModel.runApp returns early for an
+//  already-running app — bringExistingMultitaskWindowIfNeeded brings
+//  the existing native scene / virtual window forward instead of
+//  relaunching), and closing a card removes it from that snapshot.
+//  A guest that runs as the host process itself can only be left via
+//  the Home Bar return gesture — the switcher does not claim to kill
+//  a process it cannot kill.
 
 import Foundation
 import SwiftUI
@@ -196,9 +202,8 @@ struct AppSwitcherView: View {
         guard flyingOutID == nil, openingID == nil else { return }
         flyingOutID = id
         // Fly-out distance = card height × 1.12 (same geometry as the
-        // track metrics, derived from the screen size here because the
-        // × button has no GeometryReader), 0.38 s spring.
-        let cardHeight = max(200, UIScreen.main.bounds.height - 2 * 54 - 46)
+        // track metrics).
+        let cardHeight = SwitcherMetrics(size: UIScreen.main.bounds.size).cardHeight
         withAnimation(.spring(response: 0.38, dampingFraction: 0.85)) {
             flyOffset = -cardHeight * 1.12
         }
@@ -227,12 +232,18 @@ private struct SwitcherMetrics {
     var cardSize: CGSize { CGSize(width: cardWidth, height: cardHeight) }
 
     init(size: CGSize) {
-        // 54 pt clearance top and bottom, 46 pt for the lower chrome.
-        let height = max(200, size.height - 2 * 54 - 46)
-        let width = min(height * 0.4615, size.width * 0.84)
+        // 54 pt clearance top and bottom, 46 pt for the lower chrome,
+        // 36 pt for the app-name label above the card. The card keeps
+        // the app screen's aspect (0.4615), so the snapshot fills it
+        // edge to edge; width is capped at 88% of the screen.
+        // 0.0.5: spacing is a small peek of the neighbour (24 pt) —
+        // the old width × 0.58 deck overlap belonged to the small
+        // placeholder cards, not to near-full-screen ones.
+        let height = max(200, size.height - 2 * 54 - 46 - 36)
+        let width = min(height * 0.4615, size.width * 0.88)
         self.cardHeight = height
         self.cardWidth = width
-        self.cardSpacing = width * 0.58
+        self.cardSpacing = 24
     }
 }
 
@@ -250,42 +261,37 @@ private struct SwitcherCard: View {
     var onCloseTap: () -> Void
 
     var body: some View {
-        ZStack(alignment: .topTrailing) {
-            RoundedRectangle(cornerRadius: 20, style: .continuous)
-                .fill(Color(.secondarySystemBackground))
-                .shadow(color: .black.opacity(0.3), radius: 16, y: 8)
-            VStack(spacing: 12) {
-                AppIconImage(app: app, size: 72)
-                Text(app.displayName)
-                    .font(.headline)
-                    .lineLimit(1)
-                Text(app.bundleIdentifier)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                Text("正在运行")
-                    .font(.caption2.bold())
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 4)
-                    .background(Capsule().fill(Color.green.opacity(0.2)))
-                    .foregroundStyle(.green)
+        VStack(spacing: 8) {
+            // App name above the card, like the real switcher — the
+            // snapshot itself carries no label.
+            Text(app.displayName)
+                .font(.headline)
+                .foregroundStyle(.white)
+                .lineLimit(1)
+                .shadow(color: .black.opacity(0.6), radius: 4, x: 0, y: 1)
+            ZStack(alignment: .topTrailing) {
+                RoundedRectangle(cornerRadius: 20, style: .continuous)
+                    .fill(Color.black)
+                    .shadow(color: .black.opacity(0.3), radius: 16, y: 8)
+                // 0.0.5: the guest's own live screen; icon placeholder
+                // when no picture can be taken (see GuestSceneSnapshot).
+                GuestAppSnapshotView(app: app)
+                    .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+                // × is only an accessibility fallback for the swipe-up
+                // gesture; the gesture remains the primary close path.
+                Button(action: onCloseTap) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 12, weight: .bold))
+                        .foregroundStyle(.white)
+                        .frame(width: 28, height: 28)
+                        .background(Circle().fill(Color.black.opacity(0.5)))
+                }
+                .buttonStyle(.plain)
+                .padding(10)
+                .accessibilityLabel("关闭")
             }
-            .padding(16)
-            // × is only an accessibility fallback for the swipe-up
-            // gesture; the gesture remains the primary close path.
-            Button(action: onCloseTap) {
-                Image(systemName: "xmark")
-                    .font(.system(size: 12, weight: .bold))
-                    .foregroundStyle(.primary)
-                    .frame(width: 28, height: 28)
-                    .background(Circle().fill(Color(.tertiarySystemBackground)))
-            }
-            .buttonStyle(.plain)
-            .padding(10)
-            .accessibilityLabel("关闭")
+            .frame(width: size.width, height: size.height)
         }
-        .frame(width: size.width, height: size.height)
         .scaleEffect(isOpening ? 1.08 : 1.0)
         .opacity(dimmed ? 0 : 1.0)
         .offset(y: flyOffset)

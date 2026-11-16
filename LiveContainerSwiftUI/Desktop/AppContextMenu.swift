@@ -2,84 +2,116 @@
 //  AppContextMenu.swift
 //  LiveContainerSwiftUI
 //
-//  SealBox 0.0.3 rebuild — long-press icon menu.
+//  SealBox 0.0.5 — long-press icon menu (custom overlay).
 //
-//  Research §3 step 8: a normal-mode long-press (0.45 s) on an icon
-//  shows a native-style contextMenu — 打开 / 重命名 / 查看详情 / 删除
-//  (destructive) — plus "编辑主屏幕" to enter edit mode. Keep holding
-//  after the menu appears does NOT enter edit mode by itself: SwiftUI's
-//  contextMenu owns that touch, so the old hold-through path cannot be
-//  reproduced on the same view; the menu item and the blank-area
-//  long-press are the two edit entries in v1.
+//  The old implementation was a SwiftUI contextMenu. It owned the
+//  long-press touch, so a normal-mode long-press could never turn
+//  into a drag (item 7): the menu always won and hold-through
+//  dragging was edit-mode only. The menu is now a custom overlay
+//  shown by the desktop when a long-press ends WITHOUT a drag; the
+//  same long-press starts a drag when the finger moves (the
+//  sequenced LongPress -> Drag gesture in DesktopView /
+//  DesktopDockView). Same five actions (Open / Rename / View
+//  Details / Edit Home Screen / Delete), same trigger, no system
+//  menu. Labels come from the catalog (lc.menu.*, added in 0.0.5).
 
 import Foundation
 import SwiftUI
 
-struct DesktopAppContextMenu: ViewModifier {
+/// One menu request: which icon, and where it sits (desktop space).
+struct DesktopMenuRequest: Identifiable {
+    let id = UUID()
     let icon: LCDesktopIcon
+    let anchor: CGPoint
+}
+
+/// The long-press menu, drawn next to the pressed icon. Dismisses
+/// on tap outside or after an action.
+struct DesktopAppMenuOverlay: View {
+    let request: DesktopMenuRequest
     var onOpen: (() -> Void)? = nil
     var onRename: (() -> Void)? = nil
     var onDetail: (() -> Void)? = nil
     var onDelete: (() -> Void)? = nil
     var onEditHomeScreen: (() -> Void)? = nil
+    var onDismiss: (() -> Void)? = nil
 
-    func body(content: Content) -> some View {
-        content.contextMenu {
-            if let onOpen {
-                Button {
-                    onOpen()
-                } label: {
-                    Label("lc.menu.open".loc, systemImage: "arrow.up.forward.app")
-                }
+    private struct MenuRow {
+        let titleKey: String
+        let systemImage: String
+        let isDestructive: Bool
+        let action: () -> Void
+    }
+
+    private var rows: [MenuRow] {
+        var rows: [MenuRow] = []
+        if let onOpen {
+            rows.append(MenuRow(titleKey: "lc.menu.open", systemImage: "arrow.up.forward.app", isDestructive: false, action: onOpen))
+        }
+        if let onRename {
+            rows.append(MenuRow(titleKey: "lc.menu.rename", systemImage: "pencil", isDestructive: false, action: onRename))
+        }
+        if let onDetail {
+            rows.append(MenuRow(titleKey: "lc.menu.detail", systemImage: "info.circle", isDestructive: false, action: onDetail))
+        }
+        if let onEditHomeScreen {
+            rows.append(MenuRow(titleKey: "lc.menu.editHomeScreen", systemImage: "square.grid.3x3", isDestructive: false, action: onEditHomeScreen))
+        }
+        if let onDelete, request.icon.isDeletable {
+            rows.append(MenuRow(titleKey: "lc.menu.delete", systemImage: "trash", isDestructive: true, action: onDelete))
+        }
+        return rows
+    }
+
+    var body: some View {
+        GeometryReader { geometry in
+            ZStack {
+                // Tap outside: dismiss. Near-transparent so it still
+                // hit-tests over the whole screen.
+                Color.black.opacity(0.001)
+                    .ignoresSafeArea()
+                    .onTapGesture { onDismiss?() }
+                menuCard(size: geometry.size)
             }
-            if let onRename {
-                Button {
-                    onRename()
+        }
+        .ignoresSafeArea()
+    }
+
+    @ViewBuilder
+    private func menuCard(size: CGSize) -> some View {
+        // One 48pt row per action + 8pt padding top/bottom.
+        let cardWidth: CGFloat = 250
+        let cardHeight = CGFloat(rows.count * 48 + 16)
+        // Above the icon when it sits in the lower half, below it
+        // otherwise; clamped so the card never leaves the screen.
+        let above = request.anchor.y > size.height * 0.5
+        let centerY = above
+            ? request.anchor.y - 110 - cardHeight / 2
+            : request.anchor.y + 110 + cardHeight / 2
+        let clampedY = min(max(centerY, cardHeight / 2 + 12), size.height - cardHeight / 2 - 12)
+        let clampedX = min(max(request.anchor.x, cardWidth / 2 + 12), size.width - cardWidth / 2 - 12)
+        VStack(spacing: 0) {
+            ForEach(rows.indices, id: \.self) { index in
+                let row = rows[index]
+                Button(role: row.isDestructive ? .destructive : nil) {
+                    row.action()
                 } label: {
-                    Label("lc.menu.rename".loc, systemImage: "pencil")
+                    HStack {
+                        Label(row.titleKey.loc, systemImage: row.systemImage)
+                        Spacer()
+                    }
+                    .padding(.horizontal, 16)
+                    .frame(height: 48)
                 }
-            }
-            if let onDetail {
-                Button {
-                    onDetail()
-                } label: {
-                    Label("lc.menu.detail".loc, systemImage: "info.circle")
-                }
-            }
-            if let onEditHomeScreen {
-                Button {
-                    onEditHomeScreen()
-                } label: {
-                    Label("lc.menu.editHomeScreen".loc, systemImage: "square.grid.3x3")
-                }
-            }
-            if let onDelete, icon.isDeletable {
-                Button(role: .destructive) {
-                    onDelete()
-                } label: {
-                    Label("lc.menu.delete".loc, systemImage: "trash")
+                .buttonStyle(.plain)
+                if index < rows.count - 1 {
+                    Divider().padding(.leading, 16)
                 }
             }
         }
-    }
-}
-
-extension View {
-    func desktopAppContextMenu(
-        _ icon: LCDesktopIcon,
-        onOpen: (() -> Void)? = nil,
-        onRename: (() -> Void)? = nil,
-        onDetail: (() -> Void)? = nil,
-        onDelete: (() -> Void)? = nil,
-        onEditHomeScreen: (() -> Void)? = nil
-    ) -> some View {
-        modifier(DesktopAppContextMenu(
-            icon: icon,
-            onOpen: onOpen,
-            onRename: onRename,
-            onDetail: onDetail,
-            onDelete: onDelete,
-            onEditHomeScreen: onEditHomeScreen
-        ))
+        .frame(width: cardWidth)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .shadow(color: .black.opacity(0.3), radius: 16, x: 0, y: 8)
+        .position(x: clampedX, y: clampedY)
     }
 }

@@ -27,13 +27,14 @@
 //  - cancelling a drag (lifting on a page dot / count text / any
 //    no-target area, or backgrounding) clears the drag state.
 //
-//  Deviation note: in normal (non-edit) mode the icon carries a SwiftUI
-//  contextMenu, whose own long-press owns the touch — an explicit
-//  long-press-sequenced drag gesture on the same view cannot also win
-//  it. So hold-through dragging (long-press then drag without lifting)
-//  is edit-mode only in v1; in normal mode the context menu offers
-//  "编辑主屏幕" to enter edit mode, and blank-area long-press enters it
-//  too. The ghost / hover / edge-flip machinery below is unchanged.
+//  0.0.5: hold-through dragging now works in normal mode too. The
+//  old blocker was the SwiftUI contextMenu on the icon, whose own
+//  long-press owned the touch. The menu is now a custom overlay
+//  (DesktopAppMenuOverlay, in AppContextMenu.swift) shown on a
+//  long-press release without a drag, and both grid and Dock icons
+//  carry a sequenced LongPress -> Drag gesture: press 0.45 s to lift,
+//  move to drag, release without moving for the menu. The ghost /
+//  hover / edge-flip machinery below is unchanged.
 
 import Foundation
 import SwiftUI
@@ -113,9 +114,6 @@ final class LCDesktopDragState: ObservableObject {
 
     /// Last edge-flip time, for the 0.65 s cooldown.
     var lastEdgeFlipDate: Date?
-    /// Absolute drag-start point (desktop space), for translation math
-    /// that stays correct across page flips.
-    var dragStartAbs: CGPoint = .zero
 
     var isDragging: Bool { draggedID != nil }
 
@@ -129,13 +127,6 @@ final class LCDesktopDragState: ObservableObject {
         hoverDockSlot = nil
     }
 
-    /// Begin a drag from a cell-local touch: `frame` is the cell's frame
-    /// in desktop space, `startLocation` the touch inside the cell.
-    func beginDrag(id: String, frame: CGRect, startLocation: CGPoint) {
-        dragStartAbs = CGPoint(x: frame.minX + startLocation.x, y: frame.minY + startLocation.y)
-        beginDrag(id: id, at: dragStartAbs)
-    }
-
     func updateDrag(translation: CGSize, location: CGPoint) {
         dragTranslation = translation
         dragLocation = location
@@ -144,18 +135,13 @@ final class LCDesktopDragState: ObservableObject {
         // Hover is the only @Published write here, and only on change:
         // assigning the same cell id every frame would still notify
         // and re-render the desktop per frame.
-        let newHoverIcon = iconID(at: location)
+        // 0.0.5: the fixed Settings icon is not a drop target, so it
+        // never gets the hover outline either.
+        let hovered = iconID(at: location)
+        let newHoverIcon = (hovered.map { LCDesktopIcon.isSystemID($0) } ?? false) ? nil : hovered
         if newHoverIcon != hoverIconID { hoverIconID = newHoverIcon }
         let newHoverDock = dockSlotIndex(at: location)
         if newHoverDock != hoverDockSlot { hoverDockSlot = newHoverDock }
-    }
-
-    /// Update a drag from a gesture translation: the absolute finger
-    /// location is the drag-start point plus the translation, which
-    /// stays valid when an edge flip moves the pages under the finger.
-    func updateDrag(translation: CGSize) {
-        let abs = CGPoint(x: dragStartAbs.x + translation.width, y: dragStartAbs.y + translation.height)
-        updateDrag(translation: translation, location: abs)
     }
 
     /// Resolve the drop target from the current finger location.
@@ -263,22 +249,35 @@ struct SlotFrameKey: PreferenceKey {
 /// It observes ONLY the drag position object (LCDesktopDragPosition),
 /// so per-frame finger movement re-renders this one icon + label and
 /// nothing else — the desktop body is not re-run for the ghost.
+///
+/// 0.0.5: the ghost's frame is exactly the 58×58 icon, so .position
+/// centres the ICON on the finger. The name hangs below the icon as
+/// an overlay (it does not affect the frame). The old VStack (icon +
+/// label) put the frame centre ~10pt below the icon centre, so the
+/// icon floated ~10pt above the finger while dragging.
 struct DesktopDragGhost: View {
     let icon: LCDesktopIcon
     let displayName: String
     @ObservedObject var position: LCDesktopDragPosition
 
     var body: some View {
-        VStack(spacing: 4) {
+        ZStack {
             if case .app(let model) = icon {
                 AppIconImage(app: model, size: 58)
             }
+        }
+        .frame(width: 58, height: 58)
+        .overlay(alignment: .bottom) {
             Text(displayName)
                 .font(.system(size: 12))
                 .lineLimit(1)
                 .minimumScaleFactor(0.7)
                 .frame(maxWidth: 76)
                 .shadow(color: .black.opacity(0.55), radius: 2, x: 0, y: 1)
+                // Label 4pt below the icon: bottom-aligned overlay
+                // puts its bottom edge at the icon's bottom edge,
+                // so shift it down by its own height (~15pt) + 4pt.
+                .offset(y: 19)
         }
         .scaleEffect(LCDesktopDragState.dragLiftScale)
         .shadow(color: .black.opacity(0.35), radius: 12, x: 0, y: 8)

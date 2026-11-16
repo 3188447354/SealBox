@@ -10,14 +10,11 @@
 //  is SpringBoard's — no API embeds it — so this is a 1:1 rebuild
 //  with the native components the real Dock is made of:
 //  - Container: a real UIVisualEffectView (NativeDockBackground
-//    below), not a SwiftUI Material. On iOS 26+ the effect is
-//    UIGlassEffect (.regular) — the real Dock on iOS 26/27 IS Liquid
-//    Glass (verified: Apple ships the Dock and the Search pill in
-//    Liquid Glass; UIGlassEffect follows the user's system
-//    Clear/Tinted setting exactly like the real Dock). Below iOS 26
-//    it falls back to UIBlurEffect (.systemMaterial) — the pre-26
-//    frosted Dock, one grade thicker than ultraThin (ultraThin was
-//    the main "fake" cue: the wallpaper bled straight through).
+//    below), not a SwiftUI Material. 0.0.5: transparent, not
+//    frosted — MJ on device still saw frost on 0.0.4's .regular
+//    glass. On iOS 26+ the effect is UIGlassEffect (.clear); below
+//    iOS 26 there is no effect at all (nil), so the wallpaper shows
+//    straight through and the icons float on it directly.
 //  - No stroke: the real Dock has no outline at all, only the glass
 //    itself. The 1pt white stroke is deleted.
 //  - Geometry, measured off a real iOS 26 home-screen screenshot
@@ -49,21 +46,24 @@ import SwiftUI
 
 /// The Dock's native background: a real UIVisualEffectView.
 ///
-/// iOS 26+: UIGlassEffect (.regular) — the same Liquid Glass the
-/// system Dock is made of, so it tracks the user's Clear/Tinted
-/// system setting. iOS 15-25: UIBlurEffect (.systemMaterial), the
-/// pre-26 frosted Dock. The corner radius is applied to the effect
-/// view's own layer (continuous curve) so the glass itself is
-/// clipped round — no SwiftUI shape, no stroke.
+/// 0.0.5: transparent, not frosted — MJ on device (iPhone 14 Pro
+/// Max, iOS 27) still saw frost on 0.0.4's .regular glass.
+/// iOS 26+: UIGlassEffect (.clear) — transparent Liquid Glass, the
+/// wallpaper shows straight through. iOS 15-25: no effect at all
+/// (UIVisualEffectView with a nil effect) — fully transparent, the
+/// icons float straight on the wallpaper; no blur, no fill, no tint.
+/// The corner radius is applied to the effect view's own layer
+/// (continuous curve) so the glass itself is clipped round — no
+/// SwiftUI shape, no stroke.
 private struct NativeDockBackground: UIViewRepresentable {
     static let cornerRadius: CGFloat = 30
 
     func makeUIView(context: Context) -> UIVisualEffectView {
-        let effect: UIVisualEffect
+        let effect: UIVisualEffect?
         if #available(iOS 26.0, *) {
-            effect = UIGlassEffect(style: .regular)
+            effect = UIGlassEffect(style: .clear)
         } else {
-            effect = UIBlurEffect(style: .systemMaterial)
+            effect = nil
         }
         let view = UIVisualEffectView(effect: effect)
         view.backgroundColor = .clear
@@ -82,11 +82,16 @@ struct DesktopDockView: View {
     var draggedID: String?
     @ObservedObject var dragState: LCDesktopDragState
     var onTap: ((LCDesktopIcon) -> Void)? = nil
-    var onLongPress: ((LCDesktopIcon) -> Void)? = nil
+    /// Normal-mode long-press release without a drag: the desktop
+    /// shows the custom menu for this icon (item 7).
+    var onMenuRequest: ((LCDesktopIcon, Int) -> Void)? = nil
     /// Edit-mode drag-out: the desktop owns the drop resolution.
     var onDragBegin: ((LCDesktopIcon, Int) -> Void)? = nil
     var onDragUpdate: ((CGSize) -> Void)? = nil
     var onDragEnd: (() -> Void)? = nil
+    /// Slot lifted by a normal-mode long-press (item 7): it scales
+    /// up in place until the finger moves (drag) or lifts (menu).
+    @State private var liftedSlot: Int?
 
     static let iconSize: CGFloat = 60
 
@@ -145,6 +150,8 @@ struct DesktopDockView: View {
             }
         }
         .buttonStyle(.plain)
+        .scaleEffect(liftedSlot == slot ? LCDesktopDragState.dragLiftScale : 1.0)
+        .shadow(color: liftedSlot == slot ? .black.opacity(0.35) : .clear, radius: liftedSlot == slot ? 12 : 0, x: 0, y: 8)
         .background(
             GeometryReader { geometry in
                 Color.clear.preference(
@@ -153,23 +160,24 @@ struct DesktopDockView: View {
                 )
             }
         )
-        .onLongPressGesture(minimumDuration: 0.45) {
-            onLongPress?(icon)
-        }
         if isEditing {
             // 0.0.4: high-priority so the Dock drag wins over the
             // desktop's own gestures (pull-down search / control
             // centre) — a drag starting on a Dock icon must move the
             // icon, not pull the desktop down.
+            // 0.0.5: the gesture reports in the "desktop" coordinate
+            // space, like the grid drag — the old local-space
+            // translation went stale when an edge flip slid the page
+            // under the finger. startLocation / location are desktop
+            // space now, so no slot frame is needed to begin.
             button.highPriorityGesture(
-                DragGesture(minimumDistance: LCDesktopDragState.dragStartDistance)
+                DragGesture(minimumDistance: LCDesktopDragState.dragStartDistance, coordinateSpace: .named("desktop"))
                     .onChanged { value in
                         if dragState.draggedID == nil {
-                            guard let frame = dragState.dockSlotFrames[slot] else { return }
                             onDragBegin?(icon, slot)
-                            dragState.beginDrag(id: icon.id, frame: frame, startLocation: value.startLocation)
+                            dragState.beginDrag(id: icon.id, at: value.startLocation)
                         }
-                        dragState.updateDrag(translation: value.translation)
+                        dragState.updateDrag(translation: value.translation, location: value.location)
                         onDragUpdate?(value.translation)
                     }
                     .onEnded { _ in
@@ -177,8 +185,54 @@ struct DesktopDockView: View {
                     }
             )
         } else {
-            button
+            // 0.0.5: normal-mode long-press drag (item 7), same as
+            // the grid: lift, drag, or menu on release. The old
+            // onLongPressGesture (enter edit mode) is gone — edit
+            // mode is still one tap away in the menu ("编辑主屏幕").
+            // High-priority so the Dock drag wins over the desktop's
+            // own gestures, as in edit mode above.
+            button.highPriorityGesture(dockLongPressDragGesture(for: icon, slot: slot))
         }
+    }
+
+    /// Normal-mode long-press drag for a Dock icon (item 7, iOS
+    /// behaviour): press 0.45 s and the icon lifts in place; move
+    /// and it drags out of the Dock (the same finger, no lift);
+    /// release without moving and the menu opens. A quick tap still
+    /// opens the app (the Button owns it).
+    private func dockLongPressDragGesture(for icon: LCDesktopIcon, slot: Int) -> some Gesture {
+        LongPressGesture(minimumDuration: LCDesktopDragState.longPressDuration)
+            .sequenced(before: DragGesture(minimumDistance: LCDesktopDragState.dragStartDistance, coordinateSpace: .named("desktop")))
+            .onChanged { value in
+                switch value {
+                case .first(let pressed):
+                    if pressed { liftedSlot = slot }
+                case .second(true, let drag):
+                    guard let drag else { return }
+                    if dragState.draggedID == nil {
+                        onDragBegin?(icon, slot)
+                        dragState.beginDrag(id: icon.id, at: drag.startLocation)
+                        liftedSlot = nil
+                    }
+                    dragState.updateDrag(translation: drag.translation, location: drag.location)
+                    onDragUpdate?(drag.translation)
+                default:
+                    break
+                }
+            }
+            .onEnded { value in
+                liftedSlot = nil
+                switch value {
+                case .second(true, _):
+                    if dragState.draggedID != nil {
+                        onDragEnd?()
+                    } else {
+                        onMenuRequest?(icon, slot)
+                    }
+                default:
+                    break
+                }
+            }
     }
 }
 

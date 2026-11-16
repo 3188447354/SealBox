@@ -251,6 +251,22 @@ final class LCDesktopOrderStore: ObservableObject {
         save()
     }
 
+    /// Pin a fixed system icon at slot 0 (first page, first cell).
+    /// 0.0.5: the desktop gains a Settings entry. It is not an app,
+    /// so it never enters the Dock, drag sorting, or search — but it
+    /// does occupy grid slot 0. sync() keeps it wherever it already
+    /// is, so this moves it to the front (shifting apps right by one
+    /// slot) when it is elsewhere — which happens exactly once, on
+    /// the first sync after the 0.0.5 upgrade, when sync() appended
+    /// it at the end. No-op once pinned.
+    func pinSystemIconFirst(id: String) {
+        guard order.first != id else { return }
+        var newOrder = order.filter { $0 != id }
+        newOrder.insert(id, at: 0)
+        order = trimTrailingEmpty(newOrder)
+        save()
+    }
+
     /// Put `id` in the first free slot (new installs, Dock evictions,
     /// Dock → grid occupant). Appends at the end if there is no free slot.
     func placeInFirstFreeSlot(id: String) {

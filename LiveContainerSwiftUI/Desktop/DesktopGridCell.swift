@@ -54,6 +54,9 @@ struct DesktopGridCell: View {
     var isEditing: Bool
     var isDragged: Bool
     var isDropHover: Bool
+    /// Normal-mode long-press lift (item 7): the icon scales up in
+    /// place while the finger holds it, before any drag starts.
+    var isLifted: Bool = false
     var onDelete: (() -> Void)? = nil
     var onTap: (() -> Void)? = nil
 
@@ -121,7 +124,8 @@ struct DesktopGridCell: View {
             }
         }
         .buttonStyle(DesktopCellButtonStyle(isPressing: $isPressing))
-        .scaleEffect(isEditing ? 1.0 : (isPressing ? 0.86 : 1.0))
+        .scaleEffect(isLifted ? LCDesktopDragState.dragLiftScale : (isEditing ? 1.0 : (isPressing ? 0.86 : 1.0)))
+        .shadow(color: isLifted ? .black.opacity(0.35) : .clear, radius: isLifted ? 12 : 0, x: 0, y: 8)
         .rotationEffect(.degrees(isEditing ? (jiggling ? jiggleAngles.to : jiggleAngles.from) : 0))
         .offset(y: isEditing && jiggling ? 0.5 : 0)
         .animation(
@@ -129,15 +133,16 @@ struct DesktopGridCell: View {
             value: jiggling
         )
         .onChange(of: isEditing) { editing in
-            if editing {
-                // Enter-edit pop: 0.88 → 1, spring 0.34 / 0.6, then jiggle.
-                jiggling = false
-                withAnimation(.spring(response: 0.34, dampingFraction: 0.6)) {
-                    jiggling = true
-                }
-            } else {
-                jiggling = false
-            }
+            // 0.0.5: set jiggling WITHOUT withAnimation. The
+            // .animation(repeatForever) modifier above is what makes
+            // the icon oscillate; wrapping this assignment in
+            // withAnimation(.spring) put a one-shot spring transaction
+            // on the change, which overrode the repeating animation —
+            // the icon rotated once and then froze, so edit mode
+            // showed no jiggle on device. A plain assignment lets
+            // the modifier drive the jiggle; exiting edit mode sets
+            // it false and the rotation returns to 0.
+            jiggling = editing
         }
         .overlay(alignment: .topLeading) {
             if isEditing, icon.isDeletable, let onDelete {
