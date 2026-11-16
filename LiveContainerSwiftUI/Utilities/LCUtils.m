@@ -8,6 +8,7 @@
 #import "LCUtils.h"
 #import "../../LiveContainer/LCSharedUtils.h"
 #import "LCAppInfo.h"
+#import "../../LiveContainer/FoundationPrivate.h" // 0.0.7: NSExtension is declared here (private header). The deleted DecoratedAppSceneViewController.h used to bring it in transitively — without this import the build fails with "use of undeclared identifier 'NSExtension'" (CI run 43878087335).
 #import "../../ZSign/zsigner.h"
 #import "LiveContainerSwiftUI-Swift.h"
 
