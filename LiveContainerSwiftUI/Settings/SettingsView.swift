@@ -231,7 +231,7 @@ struct SettingsView: View {
                         Text("证书状态")
                         Spacer()
                         Text(statusText)
-                            .foregroundStyle(certStatus == 0 ? .green : .red)
+                            .foregroundStyle(certStatus == 0 ? .green : (certStatus == -1 ? .secondary : .red))
                     }
                 }
                 if let validUntil = certValidUntil {
@@ -289,8 +289,13 @@ struct SettingsView: View {
     }
 
     private var certificateStatusText: String? {
-        guard certificateImported, certStatus != -1 else { return nil }
+        // 0.0.7 audit fix (spec H1): the row must always be present
+        // while a certificate is imported — the old code returned nil
+        // while validation was still in flight (certStatus -1), so
+        // the whole row vanished instead of saying it is checking.
+        guard certificateImported else { return nil }
         switch certStatus {
+        case -1: return "验证中…"
         case 0: return "有效"
         case 1: return "已被吊销"
         default: return "验证失败"

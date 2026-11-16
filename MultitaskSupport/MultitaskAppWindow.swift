@@ -72,18 +72,26 @@ final class WeakWindowBox {
         // of no-op-ing and hanging runApp forever — the launch
         // watchdog in DesktopView surfaces the failure. The pid is
         // ignored when an error is set (both call sites throw on
-        // error), so -1 is just a placeholder.
+        // error), so -1 is just a placeholder. Also drop the appDict
+        // entry: a later tap must relaunch instead of finding this
+        // dead entry via openExistingAppWindow.
         guard let openWindow = openWindowAction else {
+            removeAppWindow(dataUUID: dataUUID)
             pidCallback?(NSNumber(value: -1), "SealBox 还没准备好，请稍后再试。")
             return
         }
         openWindow(id: "appView", value: dataUUID)
     }
-    
+
     @objc class func openExistingAppWindow(dataUUID: String) -> Bool {
+        // 0.0.7 audit fix (spec C5): with no openWindow action the
+        // optional call below is a no-op, but the old code still
+        // returned true — runApp then believed the window was
+        // brought to front and returned without launching anything.
+        guard let openWindow = openWindowAction else { return false }
         for a in appDict {
             if a.value.dataUUID == dataUUID {
-                openWindowAction?(id: "appView", value: a.key)
+                openWindow(id: "appView", value: a.key)
                 return true
             }
         }
@@ -192,7 +200,13 @@ struct MultitaskAppWindow: View {
         // virtual small window and its auto-relaunch-on-terminate
         // path are gone, so a terminated guest always shows the
         // terminated screen below.
-        if show, let appInfo {
+        // 0.0.7 audit fix (spec C3): a guest that fails to initialize
+        // used to sit on this branch with errorMessage set but never
+        // rendered — the user stared at a black fullscreen scene
+        // while the error alert landed on the desktop behind it.
+        // Once there is an error, fall through to the terminated
+        // screen below, which shows the message with a close button.
+        if show, let appInfo, errorMessage == nil {
             GeometryReader { geometry in
                 AppSceneViewSwiftUI(show: $show, bundleId: appInfo.bundleId, dataUUID: appInfo.dataUUID, initSize: geometry.size,
                                     onAppInitialize: { pid, error in

@@ -54,7 +54,11 @@ int LiveProcessMain(int argc, char *argv[]) {
         return payloadEntry(argc, argv, _envp, _apple);
     }
     
-    NSLog(@"Retrieved app info: %@", appInfo);
+    // 0.0.7 fix: appInfo carries certificatePassword (see below) — never
+    // log it in plaintext. Print a redacted copy instead.
+    NSMutableDictionary *redactedAppInfo = [appInfo mutableCopy];
+    redactedAppInfo[@"certificatePassword"] = @"<redacted>";
+    NSLog(@"Retrieved app info: %@", redactedAppInfo);
     // Set LiveContainer's home path
     setenv("LP_HOME_PATH", getenv("HOME"), 1);
     const char *overrideHomePath = [appInfo[@"lcHomePath"] fileSystemRepresentation];

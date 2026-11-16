@@ -65,8 +65,14 @@ final class SealBoxLaunchCoordinator: LCAppModelDelegate {
     }
 
     /// Multitask is frozen in v1: never run a shared app into a busy
-    /// multitask session — refuse instead of asking.
+    /// multitask session — refuse instead of asking. The refusal is
+    /// intentional, but it must be visible (spec C6): runApp returns
+    /// silently on false, so surface the reason through the desktop
+    /// error alert instead of leaving the tap with no feedback.
     func showRunWhenMultitaskAlert() async -> Bool? {
+        await MainActor.run {
+            InstallFlow.shared.errorMessage = "已有应用在多任务中运行，请先退出它再打开共享应用。"
+        }
         return false
     }
 
@@ -76,10 +82,28 @@ final class SealBoxLaunchCoordinator: LCAppModelDelegate {
 
     func jitLaunch(withScript script: String, appName: String, classicMode: UInt) async {
         var log = ""
-        let _ = await LCUtils.askForJIT(withScript: script, appName: appName, classicMode: classicMode) { newMsg in
+        // 0.0.7 audit fix (spec G3): askForJIT returns true only on
+        // the TrollStore path, where it already launched the guest —
+        // the old code ignored the return and launched it a second
+        // time after the confirmation dialog.
+        let jitRequested = await LCUtils.askForJIT(withScript: script, appName: appName, classicMode: classicMode) { newMsg in
             log += "\(newMsg)\n"
         }
-        guard JITEnablerType(rawValue: LCUtils.appGroupUserDefault.integer(forKey: "LCJITEnablerType")) != nil else {
+        if jitRequested {
+            return
+        }
+        // A missing "LCJITEnablerType" key reads as 0 (.SideJITServer)
+        // via integer(forKey:) — never treat that phantom as a
+        // configured enabler (same rule as SettingsView
+        // jitEnablerText). With no enabler recorded, say so instead
+        // of showing a bogus enable dialog and launching the guest
+        // without JIT.
+        guard let rawEnabler = LCUtils.appGroupUserDefault.object(forKey: "LCJITEnablerType") as? Int,
+              JITEnablerType(rawValue: rawEnabler) != nil else {
+            await MainActor.run {
+                InstallFlow.shared.errorMessage = "未配置 JIT 开启器，请先在 Seal 里开启 JIT。"
+            }
+            UserDefaults.standard.removeObject(forKey: "selected")
             return
         }
         // askForJIT only *requests* JIT from the external enabler; the
@@ -99,11 +123,23 @@ final class SealBoxLaunchCoordinator: LCAppModelDelegate {
         await MainActor.run {
             let encodedData = script?.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed)
 
-            guard let jitEnabler = JITEnablerType(rawValue: LCUtils.appGroupUserDefault.integer(forKey: "LCJITEnablerType")) else {
+            // 0.0.7 audit fix (spec G3): same phantom-enabler rule as
+            // jitLaunch(withScript:) — a missing key reads as 0
+            // (.SideJITServer) via integer(forKey:). With no enabler
+            // recorded, say so instead of opening a stikjit:// URL
+            // no app can answer (silent no-op, guest runs without JIT).
+            guard let rawEnabler = LCUtils.appGroupUserDefault.object(forKey: "LCJITEnablerType") as? Int,
+                  let jitEnabler = JITEnablerType(rawValue: rawEnabler) else {
+                InstallFlow.shared.errorMessage = "未配置 JIT 开启器，请先在 Seal 里开启 JIT。"
                 return
             }
             if jitEnabler == .StosDebug || jitEnabler == .StosDebugLC {
                 let encoded = encodedData.map { "&script=\($0)" } ?? ""
+                // 0.0.7 audit fix: appName is a display name — a space
+                // or non-ASCII in it makes URL(string:) return nil,
+                // and the if-let below would silently skip opening
+                // StosDebug (guest runs without JIT, no error shown).
+                let encodedAppName = appName.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed.subtracting(CharacterSet(charactersIn: "&=+"))) ?? appName
                 if jitEnabler == .StosDebugLC {
                     guard DataManager.shared.model.apps.contains(where: {
                         $0.appInfo.urlSchemes().contains("stosdebug") &&
@@ -112,10 +148,10 @@ final class SealBoxLaunchCoordinator: LCAppModelDelegate {
                         InstallFlow.shared.errorMessage = "找不到 StosDebug，请先安装并把它设为共享应用。"
                         return
                     }
-                    if let url = URL(string: "stosdebug://enableJIT?bundleId=\(Bundle.main.bundleIdentifier!)&appName=\(appName)&pid=\(pid)&relaunchApp=false&forcePID=true\(encoded)") {
+                    if let url = URL(string: "stosdebug://enableJIT?bundleId=\(Bundle.main.bundleIdentifier!)&appName=\(encodedAppName)&pid=\(pid)&relaunchApp=false&forcePID=true\(encoded)") {
                         UIApplication.shared.open(url)
                     }
-                } else if let url = URL(string: "stosdebug://enableJIT?bundleId=\(Bundle.main.bundleIdentifier!)&appName=\(appName)&pid=\(pid)&forcePID=true\(encoded)") {
+                } else if let url = URL(string: "stosdebug://enableJIT?bundleId=\(Bundle.main.bundleIdentifier!)&appName=\(encodedAppName)&pid=\(pid)&forcePID=true\(encoded)") {
                     UIApplication.shared.open(url)
                 }
                 return

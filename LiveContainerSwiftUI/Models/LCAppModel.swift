@@ -419,6 +419,18 @@ class LCAppModel: ObservableObject, Hashable {
         }
     }
     
+    /// Clear a launch stuck in flight (spec C4). runApp's top guard
+    /// returns silently while isAppRunning is true, and a hung runApp
+    /// (sign/launch callback never arrives) leaves it true forever:
+    /// the watchdog reports the timeout once, then every later tap
+    /// dies silently. Called only by the watchdog after it has
+    /// already reported the timeout, so a retry starts a fresh
+    /// launch. If the stuck task ever resumes, its defer clears the
+    /// flag again — harmless.
+    @MainActor func resetStuckLaunch() {
+        isAppRunning = false
+    }
+
     func forceResign() async throws {
         if isAppRunning {
             return

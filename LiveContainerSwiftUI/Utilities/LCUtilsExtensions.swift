@@ -308,10 +308,16 @@ extension LCUtils {
             }
         } else if jitEnabler == .StosDebug || jitEnabler == .StosDebugLC {
             guard let appName else { onServerMessage?("无法获取 App 名称，请重试。"); return false }
-            var launchURLStr = "stosdebug://enableJIT?bundleId=\(Bundle.main.bundleIdentifier!)&appName=\(appName)"
+            // 0.0.7 audit fix: appName is a display name — a space or
+            // non-ASCII in it makes URL(string:) return nil, and the
+            // force unwrap at the open call below would crash the
+            // host. Percent-encode it (query-safe set: "&=+" must not
+            // survive raw).
+            let encodedAppName = appName.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed.subtracting(CharacterSet(charactersIn: "&=+"))) ?? appName
+            var launchURLStr = "stosdebug://enableJIT?bundleId=\(Bundle.main.bundleIdentifier!)&appName=\(encodedAppName)"
             
             if let script = script, !script.isEmpty {
-                launchURLStr += "&script=\(script)"
+                launchURLStr += "&script=\(script.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed.subtracting(CharacterSet(charactersIn: "&=+"))) ?? script)"
             }
             
             if jitEnabler == .StosDebugLC {
@@ -372,7 +378,10 @@ extension LCUtils {
             var launchURLStr = "stikjit://enable-jit?bundle-id=\(Bundle.main.bundleIdentifier!)"
 
             if let script = script, !script.isEmpty {
-                launchURLStr += "&script-data=\(script)"
+                // 0.0.7 audit fix: same encoding rule as the StosDebug
+                // branch above — raw script text breaks URL(string:)
+                // and the force unwrap below would crash the host.
+                launchURLStr += "&script-data=\(script.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed.subtracting(CharacterSet(charactersIn: "&=+"))) ?? script)"
             }
             let launchURL : URL
             if jitEnabler == .StikJITLC {

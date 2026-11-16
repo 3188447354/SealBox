@@ -291,6 +291,11 @@ struct DesktopView: View {
                         zoomState.end()
                         zoomIconImage = nil
                     }
+                    // 0.0.7 audit fix (spec C4): a hung runApp leaves
+                    // isAppRunning true forever, so every retry after
+                    // this alert would die silently at runApp's top
+                    // guard. Reset it so the next tap starts fresh.
+                    app.resetStuckLaunch()
                     alertMessage = "启动超时，请重试"
                 }
             }

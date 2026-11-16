@@ -47,7 +47,13 @@
     _extension = [NSExtension extensionWithIdentifier:LCUtils.liveProcessBundleIdentifier error:&error];
     if(error) {
         [delegate appSceneVC:self didInitializeWithError:error];
-        return nil;
+        // 0.0.7 audit fix (spec I5): never return nil here — the
+        // Swift caller (AppSceneViewSwiftUI.makeUIViewController)
+        // imports this init as non-optional, so a nil return traps
+        // at runtime. Return the (extension-less) controller
+        // instead; the delegate already got the error, and
+        // MultitaskAppWindow shows it (spec C3).
+        return self;
     }
     _extension.preferredLanguages = @[];
     
