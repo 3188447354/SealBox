@@ -73,8 +73,10 @@
         if (@available(iOS 16.1, *)) {
             if(UIApplication.sharedApplication.supportsMultipleScenes && [NSUserDefaults.lcSharedDefaults integerForKey:@"LCMultitaskMode"] == 1) {
                 [MultitaskWindowManager openAppWindowWithDisplayName:displayName dataUUID:dataUUID bundleId:bundleId pidCallback:completionHandler];
-                MultitaskDockManager *dock = [MultitaskDockManager shared];
-                [dock addRunningApp:displayName appUUID:dataUUID view:nil];
+                // 0.0.6: do NOT register the running app here — the
+                // scene has not opened yet. MultitaskAppWindow
+                // registers it in onAppInitialize, once the guest
+                // really initialized.
                 return;
             }
         }

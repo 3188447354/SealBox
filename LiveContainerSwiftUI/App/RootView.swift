@@ -18,6 +18,25 @@
 import Foundation
 import SwiftUI
 
+/// Captures the Main scene's real openWindow action for
+/// MultitaskWindowManager (0.0.6). @Environment only resolves inside
+/// a View body — the manager is a plain @objc class, so a static
+/// @Environment there read the default no-op action and native-window
+/// launches never opened a scene. The Main scene is always resident,
+/// so this is set on first appear, before any launch. iOS 16.1+ only
+/// (openWindow needs multi-scene support).
+@available(iOS 16.1, *)
+private struct OpenWindowRegistrar: View {
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        Color.clear
+            .onAppear {
+                MultitaskWindowManager.openWindowAction = openWindow
+            }
+    }
+}
+
 struct RootView: View {
     @State var errorShow = false
     @State var crashReportShow = false
@@ -122,6 +141,13 @@ struct RootView: View {
         .onReceive(NotificationCenter.default.publisher(for: Notification.Name("SealBoxCertificateImported"))) { _ in
             certificateImported = hasImportedCertificate
         }
+        // 0.0.6: capture the Main scene's real openWindow action for
+        // MultitaskWindowManager (see OpenWindowRegistrar).
+        .background {
+            if #available(iOS 16.1, *) {
+                OpenWindowRegistrar()
+            }
+        }
     }
 
     /// Route a deep link: pick the system page it belongs to first
@@ -129,9 +155,11 @@ struct RootView: View {
     /// launch requests are queued on InstallFlow for the desktop to
     /// consume; the desktop owns the install / launch UI.
     ///
-    /// The settings cover is bound to requestedSystemPage == .settings
-    /// (see the fullScreenCover above): a "certificate" deep link opens
-    /// SettingsView, which consumes the link and opens the p12 import.
+    /// A "certificate" deep link with cert/password query items is
+    /// Seal's one-tap export callback (0.0.6): the cert is imported
+    /// directly, no settings page involved. Without those parameters
+    /// it opens SettingsView, which consumes the link and opens the
+    /// p12 import.
     private var settingsCoverBinding: Binding<Bool> {
         Binding(
             get: { sharedModel.requestedSystemPage == .settings },
@@ -161,12 +189,43 @@ struct RootView: View {
                 InstallFlow.shared.requestInstall(urlString: installUrl)
             }
         case "certificate":
+            // 0.0.6: Seal's one-tap export callback carries the cert
+            // itself (sealbox://certificate?cert=<base64>&password=…).
+            // Import it directly and stay on the desktop; the gate
+            // re-checks via the SealBoxCertificateImported
+            // notification. Seal returns an empty password — accept it.
+            if let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+               let certB64 = components.queryItems?.first(where: { $0.name == "cert" })?.value,
+               let certData = Data(base64Encoded: certB64) {
+                let certPassword = components.queryItems?.first(where: { $0.name == "password" })?.value ?? ""
+                importCertificateFromURL(certData: certData, password: certPassword)
+                return
+            }
+            // No cert payload: open Settings for the manual p12 import.
             sharedModel.requestedSystemPage = .settings
             sharedModel.deepLink = url
         default:
             return
         }
         sharedModel.deepLink = url
+    }
+
+    /// Import a certificate delivered by URL (Seal's one-tap export):
+    /// cert is base64 p12 data, password may be empty. Same validation
+    /// + storage as SettingsView's p12 confirmImport; on success the
+    /// notification lets the gate through to the desktop. On failure
+    /// show the error and let the user import manually in Settings.
+    private func importCertificateFromURL(certData: Data, password: String) {
+        guard LCUtils.getCertTeamId(withKeyData: certData, password: password) != nil else {
+            errorInfo = "证书导入失败，请在设置里手动导入 p12 证书。"
+            errorShow = true
+            return
+        }
+        LCUtils.appGroupUserDefault.set(certData, forKey: "LCCertificateData")
+        LCUtils.appGroupUserDefault.set(password, forKey: "LCCertificatePassword")
+        LCUtils.appGroupUserDefault.set(Date.now, forKey: "LCCertificateUpdateDate")
+        UserDefaults.standard.set(LCSharedUtils.appGroupID(), forKey: "LCAppGroupID")
+        NotificationCenter.default.post(name: Notification.Name("SealBoxCertificateImported"), object: nil)
     }
 
     func closeDuplicatedWindow() {

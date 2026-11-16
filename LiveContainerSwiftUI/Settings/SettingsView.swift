@@ -5,8 +5,8 @@
 //  SealBox 0.0.3 rebuild — settings page (implementation #2).
 //
 //  Full-screen cover with a Done button top-right (the only exit — a
-//  fullScreenCover has no swipe-to-dismiss). Four sections, no more:
-//  certificate, JIT status, storage, about.
+//  fullScreenCover has no swipe-to-dismiss). Five sections, no more:
+//  certificate, multitask, JIT status, storage, about.
 //
 //  CERTIFICATE — this closes the half-open flow #1 left behind: the
 //  certificate gate's "Go to Settings" only recorded
@@ -38,6 +38,11 @@
 //  STORAGE — LCStorageManagementModel, same model the old storage page
 //  used; only the UI is new.
 //
+//  MULTITASK (0.0.6) — the window-mode switch: virtual small window
+//  vs native fullscreen, bound straight to the "LCMultitaskMode" app
+//  group key LCUtils reads at launch. Takes effect the next time an
+//  app is opened; classic-mode apps are unaffected.
+//
 //  NOTE: this view uses ONE SwiftUI .alert (driven by a single enum)
 //  and ONE .sheet (driven by a single enum). SwiftUI honours only one
 //  alert / sheet per view — chaining several, as the old settings page
@@ -64,6 +69,14 @@ struct SettingsView: View {
     @State private var certLastUpdate: String?
     @State private var isVerifying = false
     @State private var isImporting = false
+
+    // MARK: Multitask state
+
+    // 0.0.6: window-mode switch, same binding as
+    // MultitaskAppWindow.swift. SealBoxApp registers nativeWindow as
+    // the default, so the fallback here only applies if the key was
+    // never registered.
+    @AppStorage("LCMultitaskMode", store: LCUtils.appGroupUserDefault) private var multitaskMode: MultitaskMode = .virtualWindow
 
     // MARK: JIT state
 
@@ -112,6 +125,7 @@ struct SettingsView: View {
         NavigationView {
             List {
                 certificateSection
+                multitaskSection
                 jitSection
                 storageSection
                 aboutSection
@@ -251,6 +265,15 @@ struct SettingsView: View {
                 activeSheet = .p12Picker
             }
             .disabled(isImporting)
+            // 0.0.6: one-tap import from Seal — Seal already holds the
+            // certificate it used to sign SealBox. Opens Seal's
+            // sidestore:// export; Seal asks for confirmation, then
+            // calls back to sealbox://certificate with the cert data,
+            // which RootView imports directly (empty password accepted).
+            Button("从 Seal 导入证书") {
+                importCertificateFromSeal()
+            }
+            .disabled(isImporting)
             if certificateImported {
                 Button("验证证书") {
                     Task { await verifyCertificate() }
@@ -263,7 +286,21 @@ struct SettingsView: View {
         } header: {
             Text("证书")
         } footer: {
-            Text("没有证书时，iOS 26+ 上客 App 连启动入口都进不去（JIT-less 重签也需要它）。证书来自你自己的开发者账号（.p12 + 密码），免费账号证书 7 天过期，需重新导入。")
+            Text("没有证书时，iOS 26+ 上客 App 连启动入口都进不去（JIT-less 重签也需要它）。证书来自你自己的开发者账号（.p12 + 密码），免费账号证书 7 天过期，需重新导入。也可以点「从 Seal 导入证书」，Seal 会把签名用的证书直接传过来（需在 Seal 里确认）。")
+        }
+    }
+
+    private var multitaskSection: some View {
+        Section {
+            Picker("窗口模式", selection: $multitaskMode) {
+                Text("虚拟小窗").tag(MultitaskMode.virtualWindow)
+                Text("原生全屏").tag(MultitaskMode.nativeWindow)
+            }
+            .pickerStyle(.segmented)
+        } header: {
+            Text("多任务")
+        } footer: {
+            Text("虚拟小窗把应用开在桌面内的悬浮窗口里；原生全屏用系统多场景全屏打开。切换后下次打开应用时生效，已打开的窗口不受影响。")
         }
     }
 
@@ -333,6 +370,23 @@ struct SettingsView: View {
         pendingP12Name = url.lastPathComponent
         password = ""
         activeSheet = .password
+    }
+
+    /// One-tap import from Seal (0.0.6): open Seal's sidestore://
+    /// certificate export with a callback_template pointing back at
+    /// sealbox://certificate. Seal replaces $(BASE64_CERT) and
+    /// $(PASSWORD) — password comes back empty — then opens the
+    /// callback, which RootView imports directly. The template is
+    /// passed as a query item so URLComponents percent-encodes it.
+    private func importCertificateFromSeal() {
+        var components = URLComponents()
+        components.scheme = "sidestore"
+        components.host = "certificate"
+        components.queryItems = [
+            URLQueryItem(name: "callback_template", value: "sealbox://certificate?cert=$(BASE64_CERT)&password=$(PASSWORD)")
+        ]
+        guard let url = components.url else { return }
+        UIApplication.shared.open(url)
     }
 
     private func confirmImport() async {

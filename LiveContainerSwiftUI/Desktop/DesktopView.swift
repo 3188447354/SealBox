@@ -264,6 +264,24 @@ struct DesktopView: View {
                 try? await Task.sleep(nanoseconds: LaunchZoomState.zoomWaitNanoseconds)
             }
             metaStore.recordLaunch(id: LCDesktopIcon.appID(for: app))
+            // 0.0.6 watchdog: runApp's await can hang forever if the
+            // launch callback never arrives (0.0.5 did exactly that —
+            // the zoom froze and no error ever showed). If the app is
+            // still launching after the timeout, pull the zoom down and
+            // report instead of freezing on the enlarged icon. 30 s is
+            // generous: ZSign re-signing + scene init on device take a
+            // few seconds even for large apps.
+            let watchdog = Task {
+                try? await Task.sleep(nanoseconds: LaunchZoomState.launchTimeoutNanoseconds)
+                await MainActor.run {
+                    guard app.isAppRunning else { return }
+                    if zoomState.isActive {
+                        zoomState.end()
+                        zoomIconImage = nil
+                    }
+                    alertMessage = "启动超时，请重试"
+                }
+            }
             do {
                 try await app.runApp()
             } catch {
@@ -273,6 +291,7 @@ struct DesktopView: View {
                     await MainActor.run { alertMessage = error.localizedDescription }
                 }
             }
+            watchdog.cancel()
             await MainActor.run {
                 zoomState.end()
                 zoomIconImage = nil
@@ -322,24 +341,41 @@ struct DesktopView: View {
 
     // MARK: - Drag & drop
 
+    /// Convert a drag-gesture point from the attaching cell's local
+    /// space to "desktop" space (0.0.6). The gesture's
+    /// coordinateSpace: parameter is NOT honoured for these gestures
+    /// (sequenced LongPress -> Drag, inside TabView pages): values
+    /// arrive in the cell's local space, and 0.0.5 trusted the
+    /// parameter and fed them to the ghost as desktop points, so the
+    /// ghost landed hundreds of points away from the finger. Adding
+    /// the cell's frame origin (reported in desktop space by the same
+    /// GeometryReader the ghost uses) gives the true finger position,
+    /// and stays correct across edge flips because the frame is read
+    /// fresh on every move. Falls back to the raw value when the frame
+    /// is not (yet) known.
+    private func desktopPoint(_ local: CGPoint, iconID: String) -> CGPoint {
+        if let frame = dragState.cellFrames[iconID] {
+            return CGPoint(x: frame.minX + local.x, y: frame.minY + local.y)
+        }
+        return local
+    }
+
     private func editDragGesture(for icon: LCDesktopIcon) -> some Gesture {
-        // 0.0.5: the gesture reports in the "desktop" coordinate
-        // space (the stationary full-screen ZStack), not the cell's
-        // local space. The old local-space translation jumped by a
-        // full page width when an edge flip slid the page under the
-        // finger, so the ghost teleported off-screen and the drop
-        // could never land on page 2. In desktop space the finger's
-        // location stays valid across flips, so startLocation and
-        // location are used directly — no cell frame needed.
-        DragGesture(minimumDistance: LCDesktopDragState.dragStartDistance, coordinateSpace: .named("desktop"))
+        // 0.0.6: no coordinateSpace: — values arrive in the cell's
+        // local space (see desktopPoint above); the old
+        // .named("desktop") was silently ignored, so the ghost did not
+        // follow the finger. The per-frame conversion below keeps the
+        // location valid across edge flips too (the frame moves with
+        // the cell), so no page-width teleport.
+        DragGesture(minimumDistance: LCDesktopDragState.dragStartDistance)
             .onChanged { value in
                 if dragState.draggedID == nil {
                     if let slot = orderStore.order.firstIndex(of: icon.id) {
                         dragOrigin = .grid(slot: slot)
                     }
-                    dragState.beginDrag(id: icon.id, at: value.startLocation)
+                    dragState.beginDrag(id: icon.id, at: desktopPoint(value.startLocation, iconID: icon.id))
                 }
-                updateGridDrag(translation: value.translation, location: value.location)
+                updateGridDrag(translation: value.translation, location: desktopPoint(value.location, iconID: icon.id))
             }
             .onEnded { _ in
                 handleDrop()
@@ -941,8 +977,13 @@ struct DesktopView: View {
     /// opens. A quick tap still opens the app (the Button owns it:
     /// the long-press fails on touch-up before 0.45 s).
     private func longPressDragGesture(for icon: LCDesktopIcon) -> some Gesture {
+        // 0.0.6: no coordinateSpace: — the sequenced DragGesture
+        // reports in the cell's local space (see desktopPoint); the
+        // old .named("desktop") was silently ignored, so the ghost
+        // started hundreds of points from the finger the moment the
+        // drag began ("只变大图标，按住拖起来偏移巨大").
         LongPressGesture(minimumDuration: LCDesktopDragState.longPressDuration)
-            .sequenced(before: DragGesture(minimumDistance: LCDesktopDragState.dragStartDistance, coordinateSpace: .named("desktop")))
+            .sequenced(before: DragGesture(minimumDistance: LCDesktopDragState.dragStartDistance))
             .onChanged { value in
                 switch value {
                 case .first(let pressed):
@@ -956,11 +997,11 @@ struct DesktopView: View {
                         if let slot = orderStore.order.firstIndex(of: icon.id) {
                             dragOrigin = .grid(slot: slot)
                         }
-                        dragState.beginDrag(id: icon.id, at: drag.startLocation)
+                        dragState.beginDrag(id: icon.id, at: desktopPoint(drag.startLocation, iconID: icon.id))
                         liftedID = nil
                         menuCandidateID = nil
                     }
-                    updateGridDrag(translation: drag.translation, location: drag.location)
+                    updateGridDrag(translation: drag.translation, location: desktopPoint(drag.location, iconID: icon.id))
                 default:
                     break
                 }

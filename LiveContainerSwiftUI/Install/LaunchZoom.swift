@@ -9,7 +9,10 @@
 //  the tapped icon's centre, then expands, with a 460 ms wait so signing
 //  / launch preparation has time. The zoom overlay stays up until runApp
 //  returns; on launch failure it is removed and the error alert takes
-//  over — never a fake opening to nowhere.
+//  over — never a fake opening to nowhere. If runApp never returns at
+//  all (0.0.5: the launch callback never arrived and the zoom froze),
+//  the watchdog in DesktopView.launchDesktopApp pulls the zoom down
+//  after launchTimeoutNanoseconds and reports the timeout.
 
 import Foundation
 import SwiftUI
@@ -27,6 +30,10 @@ final class LaunchZoomState: ObservableObject {
     static let zoomRadius: CGFloat = 44
     /// 460 ms wait while signing / launch preparation runs.
     static let zoomWaitNanoseconds: UInt64 = 460_000_000
+    /// Launch watchdog timeout (DesktopView): ZSign re-signing +
+    /// scene init take a few seconds even for large apps; 30 s means
+    /// the launch callback is never coming.
+    static let launchTimeoutNanoseconds: UInt64 = 30_000_000_000
 
     /// Start the zoom from the icon's centre. The start frame is
     /// committed without animation so the 0.12 / 44 frame shows for one

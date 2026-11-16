@@ -165,19 +165,18 @@ struct DesktopDockView: View {
             // desktop's own gestures (pull-down search / control
             // centre) — a drag starting on a Dock icon must move the
             // icon, not pull the desktop down.
-            // 0.0.5: the gesture reports in the "desktop" coordinate
-            // space, like the grid drag — the old local-space
-            // translation went stale when an edge flip slid the page
-            // under the finger. startLocation / location are desktop
-            // space now, so no slot frame is needed to begin.
+            // 0.0.6: no coordinateSpace: — values arrive in the slot's
+            // local space (see desktopPoint); the old .named("desktop")
+            // was silently ignored, so the ghost did not follow the
+            // finger. Converted with the slot frame, as in the grid.
             button.highPriorityGesture(
-                DragGesture(minimumDistance: LCDesktopDragState.dragStartDistance, coordinateSpace: .named("desktop"))
+                DragGesture(minimumDistance: LCDesktopDragState.dragStartDistance)
                     .onChanged { value in
                         if dragState.draggedID == nil {
                             onDragBegin?(icon, slot)
-                            dragState.beginDrag(id: icon.id, at: value.startLocation)
+                            dragState.beginDrag(id: icon.id, at: desktopPoint(value.startLocation, dockSlot: slot))
                         }
-                        dragState.updateDrag(translation: value.translation, location: value.location)
+                        dragState.updateDrag(translation: value.translation, location: desktopPoint(value.location, dockSlot: slot))
                         onDragUpdate?(value.translation)
                     }
                     .onEnded { _ in
@@ -195,14 +194,29 @@ struct DesktopDockView: View {
         }
     }
 
+    /// Convert a drag-gesture point from the attaching slot's local
+    /// space to "desktop" space (0.0.6) — same reason as the grid's
+    /// desktopPoint in DesktopView: the coordinateSpace: parameter is
+    /// not honoured for these gestures, so values arrive in the slot's
+    /// local space and must be offset by the slot's frame origin
+    /// (reported in desktop space by the same GeometryReader).
+    private func desktopPoint(_ local: CGPoint, dockSlot: Int) -> CGPoint {
+        if let frame = dragState.dockSlotFrames[dockSlot] {
+            return CGPoint(x: frame.minX + local.x, y: frame.minY + local.y)
+        }
+        return local
+    }
+
     /// Normal-mode long-press drag for a Dock icon (item 7, iOS
     /// behaviour): press 0.45 s and the icon lifts in place; move
     /// and it drags out of the Dock (the same finger, no lift);
     /// release without moving and the menu opens. A quick tap still
     /// opens the app (the Button owns it).
     private func dockLongPressDragGesture(for icon: LCDesktopIcon, slot: Int) -> some Gesture {
+        // 0.0.6: no coordinateSpace: — see desktopPoint above; the old
+        // .named("desktop") was silently ignored.
         LongPressGesture(minimumDuration: LCDesktopDragState.longPressDuration)
-            .sequenced(before: DragGesture(minimumDistance: LCDesktopDragState.dragStartDistance, coordinateSpace: .named("desktop")))
+            .sequenced(before: DragGesture(minimumDistance: LCDesktopDragState.dragStartDistance))
             .onChanged { value in
                 switch value {
                 case .first(let pressed):
@@ -211,10 +225,10 @@ struct DesktopDockView: View {
                     guard let drag else { return }
                     if dragState.draggedID == nil {
                         onDragBegin?(icon, slot)
-                        dragState.beginDrag(id: icon.id, at: drag.startLocation)
+                        dragState.beginDrag(id: icon.id, at: desktopPoint(drag.startLocation, dockSlot: slot))
                         liftedSlot = nil
                     }
-                    dragState.updateDrag(translation: drag.translation, location: drag.location)
+                    dragState.updateDrag(translation: drag.translation, location: desktopPoint(drag.location, dockSlot: slot))
                     onDragUpdate?(drag.translation)
                 default:
                     break

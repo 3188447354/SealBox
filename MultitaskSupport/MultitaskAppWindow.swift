@@ -26,8 +26,15 @@ final class WeakWindowBox {
 }
 
 @available(iOS 16.1, *)
+// 0.0.6: the real openWindow action is captured from the Main
+// scene's environment (RootView -> OpenWindowRegistrar) and stored
+// here. A static @Environment on this class used to read only the
+// default no-op action outside any View body, so openWindow did
+// nothing: the scene never opened, the pid callback never fired and
+// runApp hung forever while the launch zoom stayed frozen (0.0.5).
+// Set once by the Main scene on appear, before any launch.
 @objc class MultitaskWindowManager: NSObject {
-    @Environment(\.openWindow) static var openWindow
+    static var openWindowAction: OpenWindowAction?
     static var appDict: [String: MultitaskAppInfo] = [:]
 
     /// The live window of each native app scene, keyed by dataUUID.
@@ -61,13 +68,23 @@ final class WeakWindowBox {
         DataManager.shared.model.enableMultipleWindow = true
         DataManager.shared.model.pidCallback = pidCallback
         appDict[dataUUID] = MultitaskAppInfo(displayName: displayName, dataUUID: dataUUID, bundleId: bundleId)
+        // A scene open needs a real environment action; if it is
+        // missing (Main scene not up yet), fail the callback instead
+        // of no-op-ing and hanging runApp forever — the launch
+        // watchdog in DesktopView surfaces the failure. The pid is
+        // ignored when an error is set (both call sites throw on
+        // error), so -1 is just a placeholder.
+        guard let openWindow = openWindowAction else {
+            pidCallback?(NSNumber(value: -1), "SealBox 还没准备好，请稍后再试。")
+            return
+        }
         openWindow(id: "appView", value: dataUUID)
     }
     
     @objc class func openExistingAppWindow(dataUUID: String) -> Bool {
         for a in appDict {
             if a.value.dataUUID == dataUUID {
-                openWindow(id: "appView", value: a.key)
+                openWindowAction?(id: "appView", value: a.key)
                 return true
             }
         }
@@ -188,6 +205,12 @@ struct MultitaskAppWindow: View {
                         MultitaskWindowManager.registerSceneWindow(dataUUID: appInfo.dataUUID, window: sceneDelegate.window)
                         if error == nil {
                             self.pid = Int(pid)
+                            // 0.0.6: the guest really opened now — only
+                            // here does the app become "running" for
+                            // the switcher. LCUtils used to register
+                            // before the scene opened, so the switcher
+                            // listed apps that never opened (0.0.5).
+                            MultitaskDockManager.shared.addRunningApp(appInfo.displayName, appUUID: appInfo.dataUUID, view: nil)
                         } else {
                             self.errorMessage = error?.localizedDescription
                         }
