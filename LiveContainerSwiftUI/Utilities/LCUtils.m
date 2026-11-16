@@ -8,7 +8,6 @@
 #import "LCUtils.h"
 #import "../../LiveContainer/LCSharedUtils.h"
 #import "LCAppInfo.h"
-#import "../../MultitaskSupport/DecoratedAppSceneViewController.h"
 #import "../../ZSign/zsigner.h"
 #import "LiveContainerSwiftUI-Swift.h"
 
@@ -70,8 +69,13 @@
     [lcUserDefaults removeObjectForKey:@"selectedContainer"];
     
     dispatch_async(dispatch_get_main_queue(), ^{
+        // 0.0.7: the floating virtual window is gone — a native
+        // fullscreen scene is the only multitask path. On iOS <
+        // 16.1 (or without multi-scene support) there is no scene
+        // to open, so fail loudly through the callback instead of
+        // silently doing nothing.
         if (@available(iOS 16.1, *)) {
-            if(UIApplication.sharedApplication.supportsMultipleScenes && [NSUserDefaults.lcSharedDefaults integerForKey:@"LCMultitaskMode"] == 1) {
+            if(UIApplication.sharedApplication.supportsMultipleScenes) {
                 [MultitaskWindowManager openAppWindowWithDisplayName:displayName dataUUID:dataUUID bundleId:bundleId pidCallback:completionHandler];
                 // 0.0.6: do NOT register the running app here — the
                 // scene has not opened yet. MultitaskAppWindow
@@ -80,13 +84,8 @@
                 return;
             }
         }
-        
-        UIViewController *rootVC = ((UIWindowScene *)UIApplication.sharedApplication.connectedScenes.anyObject).keyWindow.rootViewController;
-        DecoratedAppSceneViewController *launcherView = [[DecoratedAppSceneViewController alloc] initWindowName:displayName bundleId:bundleId dataUUID:dataUUID rootVC:rootVC];
-        // Wire PID callback
-        launcherView.pidAvailableHandler = completionHandler;
-        launcherView.view.autoresizingMask = UIViewAutoresizingFlexibleTopMargin | UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleRightMargin | UIViewAutoresizingFlexibleBottomMargin;
-        launcherView.view.center = rootVC.view.center;
+        NSError *error = [NSError errorWithDomain:displayName code:3 userInfo:@{NSLocalizedDescriptionKey: @"多任务窗口需要 iOS 16.1 及以上。"}];
+        if (completionHandler) completionHandler(nil, error);
     });
 }
 

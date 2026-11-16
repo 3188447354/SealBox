@@ -224,6 +224,11 @@ struct RootView: View {
         LCUtils.appGroupUserDefault.set(certData, forKey: "LCCertificateData")
         LCUtils.appGroupUserDefault.set(password, forKey: "LCCertificatePassword")
         LCUtils.appGroupUserDefault.set(Date.now, forKey: "LCCertificateUpdateDate")
+        // 0.0.7: keep the standard-defaults copy in sync — it is
+        // the fallback LCSharedUtils.certificatePassword reads when
+        // the App Group suite resolves wrong in the extension
+        // process (see SettingsView.removeCertificate).
+        UserDefaults.standard.set(password, forKey: "LCCertificatePassword")
         UserDefaults.standard.set(LCSharedUtils.appGroupID(), forKey: "LCAppGroupID")
         NotificationCenter.default.post(name: Notification.Name("SealBoxCertificateImported"), object: nil)
     }

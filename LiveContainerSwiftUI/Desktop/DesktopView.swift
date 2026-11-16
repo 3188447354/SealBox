@@ -124,14 +124,14 @@ struct DesktopView: View {
         // flight (runApp clears it in defer), so the old filter
         // showed an empty switcher as soon as the launch finished.
         // Multitask windows live in MultitaskDockManager.apps —
-        // registered by DecoratedAppSceneViewController when the
-        // window is created, removed when it terminates — so map
-        // each registered window back to its model by container
-        // folderName (DockAppModel.appUUID), in registry (launch)
-        // order. Hidden apps are included: a running hidden app
-        // still needs a way back. Tapping a card still goes through
-        // launchDesktopApp -> runApp, which brings an already-running
-        // multitask window to front instead of relaunching.
+        // registered by MultitaskAppWindow onAppInitialize when the
+        // scene opens, removed when it terminates — so map each
+        // registered window back to its model by container folderName
+        // (DockAppModel.appUUID), in registry (launch) order. Hidden
+        // apps are included: a running hidden app still needs a way
+        // back. Tapping a card still goes through launchDesktopApp
+        // -> runApp, which brings an already-running multitask
+        // window to front instead of relaunching.
         // iOS 15 has no registry (MultitaskDockManager is iOS 16+):
         // keep the old filter there.
         if #available(iOS 16.0, *) {
@@ -157,13 +157,25 @@ struct DesktopView: View {
     /// control center (right corner) and notification centre (left /
     /// centre); the middle of the screen belongs to search. Only in
     /// normal mode — never while editing, searching, or in a panel.
+    ///
+    /// 0.0.7: this used to fire on ANY downward drag, including a
+    /// long-press icon drag — it never excluded an in-progress drag
+    /// and its 60pt threshold was easy to cross by accident, so
+    /// search kept popping up mid-drag. Now: no trigger while an
+    /// icon is lifted or being dragged, a 120pt pull, and the drag
+    /// must start on empty space — never on an icon cell or a Dock
+    /// slot (frames and this gesture's locations share the
+    /// "desktop" coordinate space).
     private func pullDownGesture() -> some Gesture {
         DragGesture(minimumDistance: 24)
             .onEnded { value in
-                guard !editState.isEditing, !showSearch, !showControlCenter, !showSwitcher, menuRequest == nil else { return }
+                guard !editState.isEditing, !showSearch, !showControlCenter, !showSwitcher, menuRequest == nil,
+                      dragState.draggedID == nil, liftedID == nil else { return }
                 let start = value.startLocation
                 let dy = value.translation.height
-                guard dy > 60, abs(value.translation.width) < 60 else { return }
+                guard dy > 120, abs(value.translation.width) < 60 else { return }
+                guard dragState.iconID(at: start) == nil,
+                      dragState.dockSlotIndex(at: start) == nil else { return }
                 let width = UIScreen.main.bounds.width
                 if start.y < 80 {
                     if start.x > width - 140 {

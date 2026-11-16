@@ -5,10 +5,8 @@
 //  Created by s s on 2025/5/17.
 //
 #import "AppSceneViewController.h"
-#import "DecoratedAppSceneViewController.h"
 #import "LiveContainerSwiftUI-Swift.h"
 #import "../LiveContainerSwiftUI/Utilities/LCUtils.h"
-#import "PiPManager.h"
 #import "Localization.h"
 #import "LCSharedUtils.h"
 #import "utils.h"
@@ -18,7 +16,6 @@
 @property int resizeDebounceToken;
 @property CFTimeInterval lastResizeRequestTime;
 @property CGPoint normalizedOrigin;
-@property bool isNativeWindow;
 @property NSUUID* identifier;
 @end
 
@@ -39,7 +36,6 @@
     self.bundleId = bundleId;
     self.scaleRatio = 1.0;
     self.isAppTerminationCleanUpCalled = false;
-    self.isNativeWindow = [NSUserDefaults.lcSharedDefaults integerForKey:@"LCMultitaskMode" ] == 1;
     
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
@@ -63,6 +59,14 @@
         @"selectedContainer": _dataUUID,
         @"bookmarks": bookmarks,
         @"lcHomePath": NSHomeDirectory(),
+        // 0.0.7: hand the certificate password to the extension
+        // process with the launch request. The extension's own App
+        // Group suite can resolve to the wrong group after a
+        // re-sign, so it must not have to derive the password from
+        // the suite (LiveProcess/main.m stashes this in the
+        // extension's standard defaults; LCSharedUtils
+        // .certificatePassword falls back to it).
+        @"certificatePassword": [LCSharedUtils certificatePassword] ?: @"",
     }.mutableCopy;
     
     NSString* launchAppUrlScheme = [NSUserDefaults.standardUserDefaults stringForKey:@"launchAppUrlScheme"];
@@ -134,7 +138,10 @@
         //settings.interruptionPolicy = 2; // reconnect
         settings.level = 1;
         settings.persistenceIdentifier = self.dataUUID;
-        settings.statusBarDisabled = !self.isNativeWindow;
+        // 0.0.7: native fullscreen is the only window mode now, so
+        // the guest always shows its status bar (the virtual window
+        // used to hide it).
+        settings.statusBarDisabled = NO;
         //settings.previewMaximumSize =
         //settings.deviceOrientationEventsEnabled = YES;
         if(!self.usesHostingControllerAPI) {

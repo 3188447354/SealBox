@@ -38,18 +38,6 @@ struct SealBoxApp: SwiftUI.App {
         // wins; classic-mode apps (classicMode != 0) still launch
         // non-multitask by design (LCAppModel.shouldLaunchInMultitaskMode).
         UserDefaults.standard.register(defaults: ["LCLaunchInMultitaskMode": true])
-        // 0.0.5: native multitask windows are the default, not the
-        // floating virtual window. LCMultitaskMode lives in the
-        // app-group defaults (LCUtils / AppSceneViewController read
-        // it there); nothing ever wrote it (no settings UI), so
-        // register() flips every existing install to native. On
-        // iOS < 16.1 or without multi-scene support LCUtils falls
-        // back to the virtual window, and LCLaunchMultitaskMaximized
-        // (standard defaults — DecoratedAppSceneViewController reads
-        // it via lcUserDefaults == standard) only affects that
-        // virtual path, so both registrations are safe together.
-        LCUtils.appGroupUserDefault.register(defaults: ["LCMultitaskMode": MultitaskMode.nativeWindow.rawValue])
-        UserDefaults.standard.register(defaults: ["LCLaunchMultitaskMaximized": true])
 
         let fm = FileManager()
         var tempAppDataFolderNames: [String] = []

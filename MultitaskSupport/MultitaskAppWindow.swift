@@ -56,8 +56,7 @@ final class WeakWindowBox {
     /// (so a later tap relaunches instead of reopening a dead scene),
     /// the scene-window registry, and the switcher registry. Called
     /// when the guest exits (AppSceneViewController delegate) and
-    /// when the scene disconnects. The virtual path cleans itself via
-    /// DecoratedAppSceneViewController.removeRunningApp.
+    /// when the scene disconnects.
     @objc class func removeAppWindow(dataUUID: String) {
         appDict.removeValue(forKey: dataUUID)
         sceneWindows.removeValue(forKey: dataUUID)
@@ -178,12 +177,8 @@ struct MultitaskAppWindow: View {
     @State var pid = 0
     @State var appInfo: MultitaskAppInfo? = nil
     @State var errorMessage: String? = nil
-    @State private var hasScheduledAutoClose = false
-    @State private var didRequestManualClose = false
     @EnvironmentObject var sceneDelegate: SceneDelegate
     @Environment(\.openWindow) var openWindow
-    @AppStorage("LCMultitaskMode", store: LCUtils.appGroupUserDefault) var multitaskMode: MultitaskMode = .virtualWindow
-    @AppStorage("LCSkipTerminatedScreen", store: LCUtils.appGroupUserDefault) var skipTerminatedScreen = false
     let pub = NotificationCenter.default.publisher(for: UIScene.didDisconnectNotification)
     init(id: String) {
         guard let appInfo = MultitaskWindowManager.appDict[id] else {
@@ -193,7 +188,10 @@ struct MultitaskAppWindow: View {
     }
     
     var body: some View {
-        let isVirtualWindowMode = multitaskMode == .virtualWindow
+        // 0.0.7: native fullscreen is the only window mode — the
+        // virtual small window and its auto-relaunch-on-terminate
+        // path are gone, so a terminated guest always shows the
+        // terminated screen below.
         if show, let appInfo {
             GeometryReader { geometry in
                 AppSceneViewSwiftUI(show: $show, bundleId: appInfo.bundleId, dataUUID: appInfo.dataUUID, initSize: geometry.size,
@@ -240,21 +238,6 @@ struct MultitaskAppWindow: View {
                 }
             }
             
-        } else if skipTerminatedScreen && isVirtualWindowMode, appInfo != nil {
-            Color.clear
-                .ignoresSafeArea(.all, edges: .all)
-                .onAppear {
-                    guard !didRequestManualClose else { return }
-                    if let appInfo {
-                        MultitaskRelaunchManager.scheduleRelaunchIfNeeded(bundleId: appInfo.bundleId, dataUUID: appInfo.dataUUID, isManualTermination: false)
-                    }
-                    if !hasScheduledAutoClose {
-                        hasScheduledAutoClose = true
-                        DispatchQueue.main.async {
-                            requestSceneDestruction(isManual: false)
-                        }
-                    }
-                }
         } else {
             VStack {
                 Text("lc.multitaskAppWindow.appTerminated".loc)
@@ -264,12 +247,12 @@ struct MultitaskAppWindow: View {
                         .font(.system(.body, design: .monospaced))
                     Button("lc.common.copy".loc) {
                         UIPasteboard.general.string = errorMessage
-                        requestSceneDestruction(isManual: true)
+                        requestSceneDestruction()
                     }
                     .buttonStyle(.bordered)
                 }
                 Button("lc.common.close".loc) {
-                    requestSceneDestruction(isManual: true)
+                    requestSceneDestruction()
                 }
                 .buttonStyle(.bordered)
             }.onAppear {
@@ -294,75 +277,10 @@ struct MultitaskAppWindow: View {
         }
     }
     
-    private func requestSceneDestruction(isManual: Bool = false) {
-        if isManual {
-            didRequestManualClose = true
-        }
+    private func requestSceneDestruction() {
         guard let session = sceneDelegate.window?.windowScene?.session else { return }
         UIApplication.shared.requestSceneSessionDestruction(session, options: nil) { error in
             print(error)
         }
-    }
-}
-
-@objcMembers
-class MultitaskRelaunchManager: NSObject {
-    private static var pendingKeys: Set<String> = []
-    private static let pendingLock = NSLock()
-    
-    static func scheduleRelaunchIfNeeded(bundleId: String, dataUUID: String, isManualTermination: Bool) {
-        let defaults = LCUtils.appGroupUserDefault
-        let multitaskMode = MultitaskMode(rawValue: defaults.integer(forKey: "LCMultitaskMode")) ?? .virtualWindow
-        guard defaults.bool(forKey: "LCSkipTerminatedScreen"),
-              defaults.bool(forKey: "LCRestartTerminatedApp"),
-              multitaskMode == .virtualWindow,
-              !isManualTermination else { return }
-        
-        let key = "\(bundleId)#\(dataUUID)"
-        guard markPendingIfNeeded(key: key) else { return }
-        
-        Task {
-            defer { clearPending(key: key) }
-            try? await Task.sleep(nanoseconds: 500_000_000)
-            await relaunchApp(bundleId: bundleId, dataUUID: dataUUID)
-        }
-    }
-    
-    private static func markPendingIfNeeded(key: String) -> Bool {
-        pendingLock.lock()
-        defer { pendingLock.unlock() }
-        if pendingKeys.contains(key) {
-            return false
-        }
-        pendingKeys.insert(key)
-        return true
-    }
-    
-    private static func clearPending(key: String) {
-        pendingLock.lock()
-        pendingKeys.remove(key)
-        pendingLock.unlock()
-    }
-    
-    private static func relaunchApp(bundleId: String, dataUUID: String) async {
-        guard let appModel = await MainActor.run(body: { lookupAppModel(bundleId: bundleId) }),
-              appModel.appInfo.lastLaunched.distance(to: .now) > 2
-        else {
-            return
-        }
-        
-        do {
-            try await appModel.runApp(multitask: true, containerFolderName: dataUUID)
-        } catch {
-            print("Failed to restart \(bundleId): \(error)")
-        }
-    }
-    
-    @MainActor private static func lookupAppModel(bundleId: String) -> LCAppModel? {
-        let sharedModel = DataManager.shared.model
-        if let app = sharedModel.apps.first(where: { $0.appInfo.relativeBundlePath == bundleId }) {
-            return app
-        }
-        return sharedModel.hiddenApps.first(where: { $0.appInfo.relativeBundlePath == bundleId })
     }
 }

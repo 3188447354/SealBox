@@ -6,7 +6,6 @@
 //
 #import "LCStatusBarManager.h"
 #import "LiveContainerSwiftUI-Swift.h"
-#import "VirtualWindowsHostView.h"
 
 @implementation LCStatusBarManager
 - (void)handleTapAction:(UIAction *)action {
@@ -14,10 +13,10 @@
         [self.nativeWindowViewController handleStatusBarTapAction:action];
         return;
     }
-    BOOL handledByVirtualWindow = [MultitaskDockManager.shared.windowHostingView handleStatusBarTapAction:action];
-    if(!handledByVirtualWindow) {
-        [super handleTapAction:action];
-    }
+    // 0.0.7: the virtual window is gone, so there is no
+    // windowHostingView to offer the tap to — fall through to the
+    // system status-bar behaviour.
+    [super handleTapAction:action];
 }
 @end
 

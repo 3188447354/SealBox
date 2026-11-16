@@ -65,6 +65,18 @@ int LiveProcessMain(int argc, char *argv[]) {
     [lcUserDefaults setObject:appInfo[@"launchAppUrlScheme"] forKey:@"launchAppUrlScheme"];
     [lcUserDefaults setObject:appInfo[@"selected"] forKey:@"selected"];
     [lcUserDefaults setObject:appInfo[@"selectedContainer"] forKey:@"selectedContainer"];
+    // 0.0.7: the certificate password rides along with the launch
+    // request (AppSceneViewController puts it in userInfo). This
+    // process cannot be trusted to read it from the App Group suite
+    // — appGroupID() can resolve to the wrong suite here after a
+    // re-sign — so stash it in this process's standard defaults,
+    // where LCSharedUtils.certificatePassword falls back to it.
+    // Without this, invokeAppMain's iOS 26+ JITLess gate sees a nil
+    // password and refuses to start the guest.
+    NSString *certificatePassword = appInfo[@"certificatePassword"];
+    if (certificatePassword.length > 0) {
+        [lcUserDefaults setObject:certificatePassword forKey:@"LCCertificatePassword"];
+    }
     
     bool access = false;
     NSArray* bookmarks = appInfo[@"bookmarks"];

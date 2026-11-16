@@ -118,8 +118,22 @@ NSString* FBSOpenApplicationOptionKeyPayloadURL = @"__PayloadURL";
 }
 
 + (NSString *)certificatePassword {
-    NSUserDefaults* nud = NSUserDefaults.lcSharedDefaults ?: NSUserDefaults.standardUserDefaults;
-    return [nud objectForKey:@"LCCertificatePassword"];
+    // 0.0.7: the App Group suite (lcSharedDefaults) is derived from
+    // appGroupID(), which can resolve to the wrong suite in the
+    // LiveProcess extension process after a re-sign (the Release
+    // group has no team suffix, so the team-suffixed candidates
+    // miss and the extension has no LCAppGroupID cache). The
+    // password is handed to the extension in its launch request
+    // (AppSceneViewController userInfo -> LiveProcess/main.m), which
+    // stores it in this process's standard defaults — so fall back
+    // there when the suite has nothing. The suite still wins when
+    // it has a value (main app process, and any extension process
+    // whose suite resolves correctly).
+    NSString *password = [NSUserDefaults.lcSharedDefaults objectForKey:@"LCCertificatePassword"];
+    if (!password) {
+        password = [NSUserDefaults.standardUserDefaults objectForKey:@"LCCertificatePassword"];
+    }
+    return password;
 }
 
 + (BOOL)launchToGuestAppWithClassicMode:(NSUInteger)classicMode {

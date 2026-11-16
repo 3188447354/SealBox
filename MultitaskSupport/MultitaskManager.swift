@@ -5,10 +5,10 @@
 //  Created by s s on 2026/3/20.
 //
 
-enum MultitaskMode : Int {
-    case virtualWindow = 0
-    case nativeWindow = 1
-}
+// 0.0.7: the virtual-window mode is gone — MultitaskMode and
+// the native/virtual fork are deleted. Every multitask launch is a
+// native fullscreen scene now (see LCUtils.launchMultitaskGuestApp
+// and MultitaskAppWindow).
 
 @objc class MultitaskManager : NSObject {
     static private var usingMultitaskContainers : [String] = []

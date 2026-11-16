@@ -5,13 +5,11 @@
 //  SealBox 0.0.5 — switcher card snapshots (item 4).
 //
 //  The switcher card shows the guest app's own live screen, not an
-//  icon placeholder. Two sources, in order:
-//  - Native window mode (the 0.0.5 default): the guest runs in its
-//    own window scene. The registry holds view:nil for these, so the
-//    scene's window is taken from MultitaskWindowManager.sceneWindows
-//    (registered by MultitaskAppWindow on appear).
-//  - Virtual window mode: the registry holds the guest's live view
-//    (DecoratedAppSceneViewController's view) — snapshot that.
+//  icon placeholder. One source (0.0.7 — the virtual window is gone):
+//  the guest runs in its own window scene. The registry holds
+//  view:nil for these, so the scene's window is taken from
+//  MultitaskWindowManager.sceneWindows (registered by
+//  MultitaskAppWindow on appear).
 //
 //  A snapshot is taken ONCE when the card appears (plus one retry
 //  1.5 s later if the first came back black), never per frame — a
@@ -39,15 +37,10 @@ enum GuestSceneSnapshot {
     /// drawHierarchy is main-thread only.
     @MainActor static func image(for app: LCAppModel) -> UIImage? {
         guard let dataUUID = runningDataUUID(for: app) else { return nil }
-        // Native scene window first (view is nil in native mode).
+        // Native scene window (view is nil in native mode).
         if #available(iOS 16.1, *),
            let window = MultitaskWindowManager.sceneWindows[dataUUID]?.window {
             return snapshot(window: window)
-        }
-        // Virtual window: the registry holds the live view.
-        if #available(iOS 16.0, *),
-           let view = MultitaskDockManager.shared.apps.first(where: { $0.appUUID == dataUUID })?.view {
-            return snapshot(view: view)
         }
         return nil
     }
@@ -57,15 +50,6 @@ enum GuestSceneSnapshot {
         let renderer = UIGraphicsImageRenderer(size: window.bounds.size)
         let image = renderer.image { _ in
             window.drawHierarchy(in: window.bounds, afterScreenUpdates: false)
-        }
-        return isNearBlack(image) ? nil : image
-    }
-
-    @MainActor private static func snapshot(view: UIView) -> UIImage? {
-        guard view.bounds.size.width > 0, view.bounds.size.height > 0 else { return nil }
-        let renderer = UIGraphicsImageRenderer(size: view.bounds.size)
-        let image = renderer.image { _ in
-            view.drawHierarchy(in: view.bounds, afterScreenUpdates: false)
         }
         return isNearBlack(image) ? nil : image
     }

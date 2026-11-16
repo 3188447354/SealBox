@@ -556,10 +556,10 @@ class LCAppModel: ObservableObject, Hashable {
             }
             var found = false
             if #available(iOS 16.1, *) {
+                // 0.0.7: native fullscreen is the only window mode —
+                // reopen the scene. (The virtual-window
+                // bring-to-front fallback is deleted with it.)
                 found = MultitaskWindowManager.openExistingAppWindow(dataUUID: dataUUID)
-            }
-            if !found {
-                found = MultitaskDockManager.shared.bringMultitaskViewToFront(uuid: dataUUID)
             }
             if let urlScheme, !found  {
                 UserDefaults.standard.removeObject(forKey: "launchAppUrlScheme")
