@@ -280,9 +280,13 @@ public enum SBInstaller {
         guard SecPKCS12Import(certData as CFData, options as CFDictionary, &items) == errSecSuccess,
               let array = items as? [[String: Any]],
               let identityDict = array.first,
-              let identity = identityDict[kSecImportItemIdentity as String] as? SecIdentity else {
+              let rawIdentity = identityDict[kSecImportItemIdentity as String] else {
             return nil
         }
+        // 注意：不能写 `as? SecIdentity`——对 CoreFoundation 类型做条件转换，
+        // 编译器判“恒成功”而直接报错；这里先取 Any 再强制转换（该键的值按
+        // SecPKCS12Import 约定就是 SecIdentity，键缺失时上面已返回 nil）。
+        let identity = rawIdentity as! SecIdentity
         var certificate: SecCertificate?
         guard SecIdentityCopyCertificate(identity, &certificate) == errSecSuccess,
               let certificate = certificate else {
