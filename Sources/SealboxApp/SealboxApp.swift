@@ -51,6 +51,10 @@ struct VMRootView: View {
         case .source: SourceView()
         case .plugins: PluginsView()
         case .installed(let name): InstalledAppDetailView(name: name)
+        case .phone: PhoneAppView()
+        case .safari: SafariAppView()
+        case .messages: MessagesAppView()
+        case .music: MusicAppView()
         }
     }
 

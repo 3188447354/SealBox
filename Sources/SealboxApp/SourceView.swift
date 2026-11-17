@@ -215,6 +215,7 @@ private struct SourceRow: View {
 struct SourceAppDetailView: View {
     let app: SourceApp
     @ObservedObject var downloads: DownloadManager
+    @EnvironmentObject private var vm: VMState
 
     var body: some View {
         ScrollView {
@@ -239,6 +240,19 @@ struct SourceAppDetailView: View {
                     Divider()
                         .padding(.vertical, 8)
                     infoRow(label: "更新日期", value: app.date)
+                    Divider()
+                        .padding(.vertical, 8)
+                    infoRow(label: "分类", value: app.category.rawValue)
+                    Divider()
+                        .padding(.vertical, 8)
+                    infoRow(label: "介绍", value: app.intro)
+                    // Real disk size, only when the IPA is actually on disk.
+                    if vm.isInstalled(app.name),
+                       let size = VMFiles.ipaFileSizeString(fileName: app.url.lastPathComponent) {
+                        Divider()
+                            .padding(.vertical, 8)
+                        infoRow(label: "文件大小", value: size)
+                    }
                 }
                 .padding()
                 .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 12))
@@ -256,6 +270,7 @@ struct SourceAppDetailView: View {
             Spacer()
             Text(value)
                 .foregroundStyle(.secondary)
+                .multilineTextAlignment(.trailing)
         }
     }
 }
@@ -267,6 +282,7 @@ struct SourceAppDetailView: View {
 struct InstalledAppDetailView: View {
     let name: String
     @EnvironmentObject private var vm: VMState
+    @State private var showDeleteConfirm = false
 
     var body: some View {
         NavigationStack {
@@ -291,9 +307,19 @@ struct InstalledAppDetailView: View {
                                 Divider()
                                     .padding(.vertical, 8)
                                 infoRow(label: "文件名", value: app.fileName)
+                                // Real disk size of the downloaded IPA file.
+                                if let size = VMFiles.ipaFileSizeString(fileName: app.fileName) {
+                                    Divider()
+                                        .padding(.vertical, 8)
+                                    infoRow(label: "文件大小", value: size)
+                                }
                             }
                             .padding()
                             .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 12))
+                            Button("删除此应用", role: .destructive) {
+                                showDeleteConfirm = true
+                            }
+                            .buttonStyle(.bordered)
                             Text("已下载到 Documents/IPAs，未安装到系统")
                                 .font(.footnote)
                                 .foregroundStyle(.secondary)
@@ -302,6 +328,19 @@ struct InstalledAppDetailView: View {
                         .padding()
                     }
                     .safeAreaInset(edge: .bottom) { Color.clear.frame(height: 28) }
+                    .confirmationDialog(
+                        "删除“\(app.name)”？",
+                        isPresented: $showDeleteConfirm,
+                        titleVisibility: .visible
+                    ) {
+                        Button("删除", role: .destructive) {
+                            vm.removeInstalled(app.name)
+                            vm.openApp = nil
+                        }
+                        Button("取消", role: .cancel) {}
+                    } message: {
+                        Text("将删除已下载的 IPA 文件与记录。")
+                    }
                 } else {
                     Text("未找到")
                         .foregroundStyle(.secondary)

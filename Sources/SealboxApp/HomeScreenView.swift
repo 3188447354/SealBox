@@ -8,27 +8,30 @@ struct HomeScreenView: View {
     @EnvironmentObject private var vm: VMState
     @AppStorage("vm.plugin.iconThemeDark") private var iconThemeDark = false
     @AppStorage("vm.plugin.customGestures") private var customGestures = false
+    @AppStorage("vm.settings.wallpaper") private var selectedWallpaper = 0
+    @State private var pendingDelete: InstalledApp? = nil
+    @State private var showDeleteConfirm = false
+
+    /// The home-screen wallpaper is the option picked on the wallpaper
+    /// page (vm.settings.wallpaper); it survives restarts via @AppStorage.
+    private var wallpaperColors: [Color] { VMWallpapers.colors(for: selectedWallpaper) }
 
     var body: some View {
         ZStack {
-            // Wallpaper: iOS-style gradient with soft color blobs.
+            // Wallpaper: the selected option's gradient with soft color blobs.
             LinearGradient(
-                colors: [
-                    Color(red: 0.05, green: 0.25, blue: 0.85),
-                    Color(red: 0.35, green: 0.25, blue: 0.75),
-                    Color(red: 0.75, green: 0.30, blue: 0.55),
-                ],
+                colors: wallpaperColors,
                 startPoint: .topLeading,
                 endPoint: .bottomTrailing
             )
             .ignoresSafeArea()
             Circle()
-                .fill(Color(red: 0.15, green: 0.65, blue: 0.95).opacity(0.55))
+                .fill((wallpaperColors.first ?? .blue).opacity(0.55))
                 .frame(width: 340, height: 340)
                 .blur(radius: 60)
                 .offset(x: -110, y: -260)
             Circle()
-                .fill(Color(red: 0.95, green: 0.45, blue: 0.65).opacity(0.45))
+                .fill((wallpaperColors.last ?? .pink).opacity(0.45))
                 .frame(width: 300, height: 300)
                 .blur(radius: 70)
                 .offset(x: 130, y: 140)
@@ -65,17 +68,29 @@ struct HomeScreenView: View {
                 }
                 .padding(.bottom, 12)
 
-                // Dock: four pure-visual system icons.
+                // Dock: four working system apps.
                 HStack(spacing: 0) {
-                    DockIcon(symbol: "phone.fill", gradient: dockPhoneGradient)
+                    Button { vm.openApp = .phone } label: {
+                        DockIcon(symbol: "phone.fill", gradient: dockPhoneGradient)
+                    }
+                    .buttonStyle(.plain)
                     Spacer()
-                    DockIcon(symbol: "safari",
-                             gradient: dockSafariGradient,
-                             symbolColor: dockSafariSymbolColor)
+                    Button { vm.openApp = .safari } label: {
+                        DockIcon(symbol: "safari",
+                                 gradient: dockSafariGradient,
+                                 symbolColor: dockSafariSymbolColor)
+                    }
+                    .buttonStyle(.plain)
                     Spacer()
-                    DockIcon(symbol: "message.fill", gradient: dockMessageGradient)
+                    Button { vm.openApp = .messages } label: {
+                        DockIcon(symbol: "message.fill", gradient: dockMessageGradient)
+                    }
+                    .buttonStyle(.plain)
                     Spacer()
-                    DockIcon(symbol: "music.note", gradient: dockMusicGradient)
+                    Button { vm.openApp = .music } label: {
+                        DockIcon(symbol: "music.note", gradient: dockMusicGradient)
+                    }
+                    .buttonStyle(.plain)
                 }
                 .padding(.horizontal, 22)
                 .padding(.vertical, 12)
@@ -165,6 +180,12 @@ struct HomeScreenView: View {
                                 }
                             }
                             .buttonStyle(.plain)
+                            .contextMenu {
+                                Button("删除", role: .destructive) {
+                                    pendingDelete = app
+                                    showDeleteConfirm = true
+                                }
+                            }
                         }
                     }
                     .padding(.horizontal, 26)
@@ -173,6 +194,23 @@ struct HomeScreenView: View {
             }
         }
         .frame(width: width)
+        .confirmationDialog(
+            "删除“\(pendingDelete?.name ?? "")”？",
+            isPresented: $showDeleteConfirm,
+            titleVisibility: .visible
+        ) {
+            Button("删除", role: .destructive) {
+                if let app = pendingDelete {
+                    vm.removeInstalled(app.name)
+                }
+                pendingDelete = nil
+            }
+            Button("取消", role: .cancel) {
+                pendingDelete = nil
+            }
+        } message: {
+            Text("将删除已下载的 IPA 文件与记录。")
+        }
     }
 
     // MARK: - Paging gesture
