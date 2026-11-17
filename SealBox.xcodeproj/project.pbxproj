@@ -228,16 +228,6 @@
 			membershipExceptions = ("Info.plist", );
 			target = 5EED0000000000000000004A /* SealBox */;
 		};
-		5EED0000000000000000004E /* PBXFileSystemSynchronizedBuildFileExceptionSet */ = {
-			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
-			membershipExceptions = ("Tests/main.c", "Tests/Makefile", );
-			target = 5EED0000000000000000004A /* SealBox */;
-		};
-		5EED0000000000000000004F /* PBXFileSystemSynchronizedBuildFileExceptionSet */ = {
-			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
-			membershipExceptions = ("Tests/main.c", "Tests/Makefile", );
-			target = 5EED0000000000000000004C /* SBGuestHooks */;
-		};
 /* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		5EED00000000000000000016 /* SealboxApp */ = {
@@ -327,10 +317,9 @@
 		};
 		5EED00000000000000000022 /* litehook */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
-			exceptions = (5EED0000000000000000004E /* PBXFileSystemSynchronizedBuildFileExceptionSet */, 5EED0000000000000000004F /* PBXFileSystemSynchronizedBuildFileExceptionSet */, );
 			explicitFileTypes = {};
 			explicitFolders = ();
-			path = "litehook";
+			path = "litehook/src";
 			sourceTree = "<group>";
 		};
 /* End PBXFileSystemSynchronizedRootGroup section */
@@ -380,7 +369,7 @@
 			buildConfigurationList = 5EED00000000000000000047 /* Build configuration list for PBXNativeTarget "SealBox" */;
 			buildPhases = (5EED00000000000000000035 /* Sources */, 5EED00000000000000000036 /* Frameworks */, 5EED00000000000000000037 /* Resources */, 5EED00000000000000000038 /* Embed Frameworks */, );
 			buildRules = ();
-			dependencies = (5EED00000000000000000052 /* ZSign */, 5EED00000000000000000054 /* SBGuestHooks */, );
+			dependencies = (5EED00000000000000000050 /* ZSign */, 5EED00000000000000000052 /* SBGuestHooks */, );
 			fileSystemSynchronizedGroups = (5EED00000000000000000016 /* SealboxApp */, 5EED00000000000000000017 /* Store */, 5EED00000000000000000018 /* Shared */, 5EED00000000000000000019 /* Importer */, 5EED0000000000000000001A /* Installer */, 5EED0000000000000000001B /* GuestLoader */, 5EED0000000000000000001C /* Certificate */, 5EED0000000000000000001D /* Desktop */, 5EED0000000000000000001E /* Settings */, 5EED00000000000000000022 /* litehook */, );
 			name = "SealBox";
 			packageProductDependencies = ();
@@ -416,7 +405,7 @@
 		};
 /* End PBXNativeTarget section */
 /* Begin PBXProject section */
-		5EED00000000000000000050 /* Project object */ = {
+		5EED0000000000000000004E /* Project object */ = {
 			isa = PBXProject;
 			attributes = {
 				LastUpgradeCheck = 1600;
@@ -465,28 +454,28 @@
 		};
 /* End PBXSourcesBuildPhase section */
 /* Begin PBXTargetDependency section */
-		5EED00000000000000000052 /* ZSign */ = {
+		5EED00000000000000000050 /* ZSign */ = {
 			isa = PBXTargetDependency;
 			target = 5EED0000000000000000004B /* ZSign */;
-			targetProxy = 5EED00000000000000000051 /* ZSign */;
+			targetProxy = 5EED0000000000000000004F /* ZSign */;
 		};
-		5EED00000000000000000054 /* SBGuestHooks */ = {
+		5EED00000000000000000052 /* SBGuestHooks */ = {
 			isa = PBXTargetDependency;
 			target = 5EED0000000000000000004C /* SBGuestHooks */;
-			targetProxy = 5EED00000000000000000053 /* SBGuestHooks */;
+			targetProxy = 5EED00000000000000000051 /* SBGuestHooks */;
 		};
 /* End PBXTargetDependency section */
 /* Begin PBXContainerItemProxy section */
-		5EED00000000000000000051 /* ZSign */ = {
+		5EED0000000000000000004F /* ZSign */ = {
 			isa = PBXContainerItemProxy;
-			containerPortal = 5EED00000000000000000050 /* Project object */;
+			containerPortal = 5EED0000000000000000004E /* Project object */;
 			proxyType = 1;
 			remoteGlobalIDString = 5EED0000000000000000004B;
 			remoteInfo = "ZSign";
 		};
-		5EED00000000000000000053 /* SBGuestHooks */ = {
+		5EED00000000000000000051 /* SBGuestHooks */ = {
 			isa = PBXContainerItemProxy;
-			containerPortal = 5EED00000000000000000050 /* Project object */;
+			containerPortal = 5EED0000000000000000004E /* Project object */;
 			proxyType = 1;
 			remoteGlobalIDString = 5EED0000000000000000004C;
 			remoteInfo = "SBGuestHooks";
@@ -495,7 +484,7 @@
 /* Begin XCBuildConfiguration section */
 		5EED0000000000000000003E /* Debug */ = {
 			isa = XCBuildConfiguration;
-			baseConfigurationReference = 5EED00000000000000000021 /* xcconfigs */;
+			baseConfigurationReferenceAnchor = 5EED00000000000000000021 /* xcconfigs */;
 			baseConfigurationReferenceRelativePath = "Global.xcconfig";
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
@@ -560,7 +549,7 @@
 		};
 		5EED0000000000000000003F /* Release */ = {
 			isa = XCBuildConfiguration;
-			baseConfigurationReference = 5EED00000000000000000021 /* xcconfigs */;
+			baseConfigurationReferenceAnchor = 5EED00000000000000000021 /* xcconfigs */;
 			baseConfigurationReferenceRelativePath = "Global.xcconfig";
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
@@ -619,7 +608,7 @@
 		};
 		5EED00000000000000000040 /* Debug */ = {
 			isa = XCBuildConfiguration;
-			baseConfigurationReference = 5EED00000000000000000021 /* xcconfigs */;
+			baseConfigurationReferenceAnchor = 5EED00000000000000000021 /* xcconfigs */;
 			baseConfigurationReferenceRelativePath = "SealBox.xcconfig";
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
@@ -662,7 +651,7 @@
 		};
 		5EED00000000000000000041 /* Release */ = {
 			isa = XCBuildConfiguration;
-			baseConfigurationReference = 5EED00000000000000000021 /* xcconfigs */;
+			baseConfigurationReferenceAnchor = 5EED00000000000000000021 /* xcconfigs */;
 			baseConfigurationReferenceRelativePath = "SealBox.xcconfig";
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
@@ -705,7 +694,7 @@
 		};
 		5EED00000000000000000042 /* Debug */ = {
 			isa = XCBuildConfiguration;
-			baseConfigurationReference = 5EED00000000000000000021 /* xcconfigs */;
+			baseConfigurationReferenceAnchor = 5EED00000000000000000021 /* xcconfigs */;
 			baseConfigurationReferenceRelativePath = "ZSign.xcconfig";
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
@@ -733,7 +722,7 @@
 		};
 		5EED00000000000000000043 /* Release */ = {
 			isa = XCBuildConfiguration;
-			baseConfigurationReference = 5EED00000000000000000021 /* xcconfigs */;
+			baseConfigurationReferenceAnchor = 5EED00000000000000000021 /* xcconfigs */;
 			baseConfigurationReferenceRelativePath = "ZSign.xcconfig";
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
@@ -761,7 +750,7 @@
 		};
 		5EED00000000000000000044 /* Debug */ = {
 			isa = XCBuildConfiguration;
-			baseConfigurationReference = 5EED00000000000000000021 /* xcconfigs */;
+			baseConfigurationReferenceAnchor = 5EED00000000000000000021 /* xcconfigs */;
 			baseConfigurationReferenceRelativePath = "SBGuestHooks.xcconfig";
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
@@ -785,7 +774,7 @@
 		};
 		5EED00000000000000000045 /* Release */ = {
 			isa = XCBuildConfiguration;
-			baseConfigurationReference = 5EED00000000000000000021 /* xcconfigs */;
+			baseConfigurationReferenceAnchor = 5EED00000000000000000021 /* xcconfigs */;
 			baseConfigurationReferenceRelativePath = "SBGuestHooks.xcconfig";
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
@@ -835,5 +824,5 @@
 		};
 /* End XCConfigurationList section */
 	};
-	rootObject = 5EED00000000000000000050 /* Project object */;
+	rootObject = 5EED0000000000000000004E /* Project object */;
 }
