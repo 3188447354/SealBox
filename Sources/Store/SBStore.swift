@@ -31,6 +31,22 @@ final class SBStore: ObservableObject {
         }
     }
 
+    // MARK: - JSON 编解码（日期一律用自 1970 的秒数）
+
+    /// 收据由 ObjC 侧以自 1970 的秒数写 createdAt；Swift 默认的
+    /// .deferredToDate 是自 2001 年的秒数，对不上，必须显式指定。
+    static var jsonEncoder: JSONEncoder {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .secondsSince1970
+        return encoder
+    }
+
+    static var jsonDecoder: JSONDecoder {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .secondsSince1970
+        return decoder
+    }
+
     // MARK: - 已装应用
 
     @Published private(set) var installedApps: [SBInstalledApp] = []
@@ -40,14 +56,14 @@ final class SBStore: ObservableObject {
             installedApps = []
             return []
         }
-        let apps = (try? JSONDecoder().decode([SBInstalledApp].self, from: data)) ?? []
+        let apps = (try? Self.jsonDecoder.decode([SBInstalledApp].self, from: data)) ?? []
         installedApps = apps
         return apps
     }
 
     func saveInstalledApps(_ apps: [SBInstalledApp]) {
         installedApps = apps
-        if let data = try? JSONEncoder().encode(apps) {
+        if let data = try? Self.jsonEncoder.encode(apps) {
             defaults.set(data, forKey: Key.installedApps)
         }
     }
@@ -136,11 +152,11 @@ final class SBStore: ObservableObject {
     var launchReceipt: SBLaunchReceipt? {
         get {
             guard let data = defaults.data(forKey: Key.launchReceipt) else { return nil }
-            return try? JSONDecoder().decode(SBLaunchReceipt.self, from: data)
+            return try? Self.jsonDecoder.decode(SBLaunchReceipt.self, from: data)
         }
         set {
             if let receipt = newValue,
-               let data = try? JSONEncoder().encode(receipt) {
+               let data = try? Self.jsonEncoder.encode(receipt) {
                 defaults.set(data, forKey: Key.launchReceipt)
             } else {
                 defaults.removeObject(forKey: Key.launchReceipt)

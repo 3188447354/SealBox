@@ -13,6 +13,20 @@ enum SBConstants {
     static let guestDataDirectoryName = "Data/Application"
     static let tweaksDirectoryName = "Tweaks"
 
+    /// 客 App 落位目录（Documents/Applications）、数据容器父目录、Hook 库目录。
+    /// 安装器按契约名直接用这三个 URL。
+    static var guestAppsDir: URL {
+        documentsURL.appendingPathComponent(guestAppsDirectoryName)
+    }
+
+    static var guestDataDir: URL {
+        documentsURL.appendingPathComponent(guestDataDirectoryName)
+    }
+
+    static var tweaksDir: URL {
+        documentsURL.appendingPathComponent(tweaksDirectoryName)
+    }
+
     /// 客端 Hook 库文件名（宿主包内 Frameworks/ 下，同时复制到 Documents/Tweaks/）。
     static let guestHooksDylibName = "SBGuestHooks.dylib"
 

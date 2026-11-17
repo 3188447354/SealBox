@@ -1,14 +1,24 @@
-//
-//  SBGuestHooks.m
-//  Sealbox
-//
-//  客端 Hook 库：随客 App 一起加载的 dylib。
-//  STUB：脚手架先行版（constructor 空实现）；完整实现由 GuestHooks 模块替换。
-//
-
+// SBGuestHooks.m — 客端 Hook dylib 入口。
+// 本 dylib 只被注入客可执行文件，所以天然只在客 App 进程上下文中运行；
+// 另加一道环境变量守卫：宿主自测 dlopen 它时 SB_GUEST_BUNDLE_ID 不存在，
+// constructor 直接返回，不装任何 Hook、不影响宿主。
 #import <Foundation/Foundation.h>
+#import <stdlib.h>
 
-__attribute__((constructor))
-static void SBGuestHooksInit(void) {
-    // STUB：完整 Hook（UserDefaults、钥匙串、文件管理、横杠返回）由 GuestHooks 模块实现。
+extern void SBUserDefaultsHookInstall(void);
+extern void SBSecItemHookInstall(void);
+extern void SBFileManagerHookInstall(void);
+extern void SBHomeBarOverlayInstall(void);
+
+__attribute__((constructor)) static void SBGuestHooksInit(void) {
+    if (getenv("SB_GUEST_BUNDLE_ID") == NULL) {
+        return;
+    }
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        SBUserDefaultsHookInstall();
+        SBSecItemHookInstall();
+        SBFileManagerHookInstall();
+        SBHomeBarOverlayInstall();
+    });
 }
