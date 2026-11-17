@@ -13,10 +13,10 @@ public struct SBSettingsView: View {
 
     // MARK: - 注入
 
-    public let apps: [SBInstalledApp]
-    public let jitEnabled: Bool
+    let apps: [SBInstalledApp]
+    let jitEnabled: Bool
 
-    public init(apps: [SBInstalledApp], jitEnabled: Bool) {
+    init(apps: [SBInstalledApp], jitEnabled: Bool) {
         self.apps = apps
         self.jitEnabled = jitEnabled
     }

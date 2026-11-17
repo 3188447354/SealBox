@@ -59,7 +59,7 @@ public enum SBIPAParser {
         do {
             try fileManager.createDirectory(at: stagingRoot, withIntermediateDirectories: true)
         } catch {
-            throw SBError.unzipFailed
+            throw SBError.unzipFailed(underlying: "创建临时目录失败：\(error.localizedDescription)")
         }
 
         // 来自文件选择器 / 分享入口的 URL 可能是安全作用域 URL；能取则取，
@@ -74,7 +74,7 @@ public enum SBIPAParser {
         do {
             let unzipResult = sb_unzip_to(ipaURL.path, stagingRoot.path, nil)
             guard unzipResult == SB_UNZIP_OK else {
-                throw SBError.unzipFailed
+                throw SBError.unzipFailed(underlying: "解压 IPA 失败（错误码 \(unzipResult)）")
             }
 
             guard let appURL = findAppBundle(in: stagingRoot) else {

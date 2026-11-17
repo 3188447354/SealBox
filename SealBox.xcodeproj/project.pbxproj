@@ -230,12 +230,12 @@
 		};
 		5EED0000000000000000004E /* PBXFileSystemSynchronizedBuildFileExceptionSet */ = {
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
-			membershipExceptions = ("Tests/main.c", );
+			membershipExceptions = ("Tests/main.c", "Tests/Makefile", );
 			target = 5EED0000000000000000004A /* SealBox */;
 		};
 		5EED0000000000000000004F /* PBXFileSystemSynchronizedBuildFileExceptionSet */ = {
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
-			membershipExceptions = ("Tests/main.c", );
+			membershipExceptions = ("Tests/main.c", "Tests/Makefile", );
 			target = 5EED0000000000000000004C /* SBGuestHooks */;
 		};
 /* End PBXFileSystemSynchronizedBuildFileExceptionSet section */

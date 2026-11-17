@@ -24,7 +24,7 @@ public enum SBInstaller {
     /// - Returns: 登记入库后的已装应用记录。
     /// - Throws: `SBError.encryptedIPA` / `SBError.patchFailed` / `SBError.unzipFailed`
     ///  （拷包阶段的 I/O 失败，见 MODULE_NOTES）等；任务取消时抛 `CancellationError`。
-    public static func install(
+    static func install(
         parsed: SBParsedIPA,
         progress: Progress,
         existing: SBInstalledApp?

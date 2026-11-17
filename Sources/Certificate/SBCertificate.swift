@@ -192,7 +192,7 @@ public enum SBCertificate {
     /// - Returns: 成功 `.success(())`；失败 `.failure(SBError)`，其中证书门失败为
     ///   `.missingCertificate` / `.certificateDeleted`，其余为
     ///   `.selfTestFailed(stage:reason:)`，stage 取自测返回的中文阶段名。
-    public static func runChainSelfTest() async -> Result<Void, SBError> {
+    static func runChainSelfTest() async -> Result<Void, SBError> {
         if let gateError = certificateGateError() {
             return .failure(gateError)
         }
@@ -236,8 +236,10 @@ public enum SBCertificate {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Bool, Error>) in
             DispatchQueue.global(qos: .userInitiated).async {
                 do {
-                    let passed = try SBGuestLoader.runSelfTest(withCertificate: data, password: password)
-                    continuation.resume(returning: passed)
+                    // ObjC 的 BOOL + NSError** 方法导入成 Swift 的 () throws：
+                    // 成功不抛错即通过，失败抛错；BOOL 返回值不进 Swift。
+                    try SBGuestLoader.runSelfTest(withCertificate: data, password: password)
+                    continuation.resume(returning: true)
                 } catch {
                     continuation.resume(throwing: error)
                 }
