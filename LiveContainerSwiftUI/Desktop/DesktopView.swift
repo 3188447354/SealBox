@@ -42,8 +42,6 @@ struct DesktopView: View {
     @State private var showSearch = false
     @State private var showControlCenter = false
     @State private var jitEnabledForControlCenter = false
-    @State private var showSwitcher = false
-    @State private var switcherApps: [LCAppModel] = []
     @State private var coachMarkDismissed = EmptyStateCoachMarkStore.shownBefore
     @State private var detailApp: LCAppModel?
     @State private var showDetail = false
@@ -114,45 +112,6 @@ struct DesktopView: View {
         sharedModel.apps.isEmpty && editState.isEditing && !coachMarkDismissed
     }
 
-    /// Open the switcher with a snapshot of the apps running right now
-    /// (LCAppModel.isAppRunning). Multitask is frozen in v1, so this is
-    /// normally empty — and an empty switcher says so instead of
-    /// inventing cards.
-    private func openSwitcher() {
-        // 0.0.4: the switcher lists the windows that are actually
-        // running. isAppRunning is only true while a launch is in
-        // flight (runApp clears it in defer), so the old filter
-        // showed an empty switcher as soon as the launch finished.
-        // Multitask windows live in MultitaskDockManager.apps —
-        // registered by MultitaskAppWindow onAppInitialize when the
-        // scene opens, removed when it terminates — so map each
-        // registered window back to its model by container folderName
-        // (DockAppModel.appUUID), in registry (launch) order. Hidden
-        // apps are included: a running hidden app still needs a way
-        // back. Tapping a card still goes through launchDesktopApp
-        // -> runApp, which brings an already-running multitask
-        // window to front instead of relaunching.
-        // iOS 15 has no registry (MultitaskDockManager is iOS 16+):
-        // keep the old filter there.
-        if #available(iOS 16.0, *) {
-            let running = MultitaskDockManager.shared.apps
-            if !running.isEmpty {
-                var seen = Set<ObjectIdentifier>()
-                switcherApps = running.compactMap { dockApp in
-                    guard let model = (sharedModel.apps + sharedModel.hiddenApps).first(where: {
-                        $0.appInfo.containers.contains { $0.folderName == dockApp.appUUID }
-                    }) else { return nil as LCAppModel? }
-                    guard seen.insert(ObjectIdentifier(model)).inserted else { return nil as LCAppModel? }
-                    return model
-                }
-                showSwitcher = true
-                return
-            }
-        }
-        switcherApps = sharedModel.apps.filter { $0.isAppRunning }
-        showSwitcher = true
-    }
-
     /// Pull-down zones (research §1.6/§1.7): the top edge belongs to
     /// control center (right corner) and notification centre (left /
     /// centre); the middle of the screen belongs to search. Only in
@@ -169,7 +128,7 @@ struct DesktopView: View {
     private func pullDownGesture() -> some Gesture {
         DragGesture(minimumDistance: 24)
             .onEnded { value in
-                guard !editState.isEditing, !showSearch, !showControlCenter, !showSwitcher, menuRequest == nil,
+                guard !editState.isEditing, !showSearch, !showControlCenter, menuRequest == nil,
                       dragState.draggedID == nil, liftedID == nil else { return }
                 let start = value.startLocation
                 let dy = value.translation.height
@@ -330,7 +289,7 @@ struct DesktopView: View {
             }
         }
         do {
-            try await appFound.runApp(multitask: nil, containerFolderName: launch.containerFolderName, urlStr: launch.urlStr, forceJIT: launch.forceJIT)
+            try await appFound.runApp(containerFolderName: launch.containerFolderName, urlStr: launch.urlStr, forceJIT: launch.forceJIT)
         } catch {
             await MainActor.run { alertMessage = error.localizedDescription }
         }
@@ -583,27 +542,6 @@ struct DesktopView: View {
                 ControlCenterView(isPresented: $showControlCenter, jitEnabled: jitEnabledForControlCenter)
             }
 
-            // App switcher (running apps only; 0.0.5 native windows
-            // with live-screen cards).
-            if showSwitcher {
-                AppSwitcherView(
-                    apps: switcherApps,
-                    onOpen: { app in
-                        showSwitcher = false
-                        launchDesktopApp(app)
-                    },
-                    onClose: { app in
-                        switcherApps.removeAll { $0 == app }
-                        if switcherApps.isEmpty {
-                            showSwitcher = false
-                        }
-                    },
-                    onDismiss: {
-                        showSwitcher = false
-                    }
-                )
-            }
-
             // Install progress pill, top centre.
             if installFlow.isInstalling {
                 VStack {
@@ -730,13 +668,6 @@ struct DesktopView: View {
         // and the background tap / long-press still work — this handler
         // only answers predominantly vertical drags (see pullDownGesture).
         .simultaneousGesture(pullDownGesture())
-        .onReceive(NotificationCenter.default.publisher(for: Notification.Name("SealBoxOpenAppSwitcher"))) { _ in
-            // Posted by SettingsView's Home Bar (double-tap / hold /
-            // swipe-up pause): dismiss the settings page first (RootView
-            // clears requestedSystemPage when the cover closes), then
-            // show the switcher over the desktop.
-            openSwitcher()
-        }
         .onPreferenceChange(CellFrameKey.self) { frames in
             dragState.cellFrames = frames
         }

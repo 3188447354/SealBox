@@ -11,8 +11,8 @@ extension UserDefaults {
     /// The App Group shared defaults (same suite as ObjC
     /// `NSUserDefaults.lcSharedDefaults`, i.e. `LCSharedUtils.appGroupID()`).
     /// Called from the app launch path, the desktop install flow
-    /// (`LCGuestURLSchemes`), the 32-bit log path and the multitask Dock
-    /// (`LCMaxOneAppOnStage`). This definition was missing: six call sites
+    /// (`LCGuestURLSchemes`) and the 32-bit log path.
+    /// This definition was missing: six call sites
     /// used `UserDefaults.lcShared()` with no declaration anywhere in the
     /// tree, which fails Swift compilation of the LiveContainerSwiftUI
     /// target (`type 'UserDefaults' has no member 'lcShared'`).

@@ -66,16 +66,12 @@ class SharedModel: ObservableObject {
     // 2 = current liveContainer is not the primary one
     @Published var multiLCStatus = 0
     @Published var isJITModalOpen = false
-    
-    @Published var enableMultipleWindow = false
 
     @Published var appDataFolderNames: [String] = []
     @Published var tweakFolderNames: [String] = []
     
     @Published var apps : [LCAppModel] = []
     @Published var hiddenApps : [LCAppModel] = []
-    
-    @Published var pidCallback : ((NSNumber, Error?) -> Void)? = nil
     
     static let isPhone: Bool = {
         UIDevice.current.userInterfaceIdiom == .phone

@@ -69,14 +69,16 @@ int LiveProcessMain(int argc, char *argv[]) {
     [lcUserDefaults setObject:appInfo[@"launchAppUrlScheme"] forKey:@"launchAppUrlScheme"];
     [lcUserDefaults setObject:appInfo[@"selected"] forKey:@"selected"];
     [lcUserDefaults setObject:appInfo[@"selectedContainer"] forKey:@"selectedContainer"];
-    // 0.0.7: the certificate password rides along with the launch
-    // request (AppSceneViewController puts it in userInfo). This
-    // process cannot be trusted to read it from the App Group suite
-    // — appGroupID() can resolve to the wrong suite here after a
-    // re-sign — so stash it in this process's standard defaults,
-    // where LCSharedUtils.certificatePassword falls back to it.
-    // Without this, invokeAppMain's iOS 26+ JITLess gate sees a nil
-    // password and refuses to start the guest.
+    // 0.0.8: the certificate password used to ride along with the
+    // multitask launch request (AppSceneViewController put it in
+    // userInfo). That sender is gone with the multitask window mode,
+    // so this stash only runs if the extension is ever invoked by
+    // another path. This process cannot be trusted to read it from
+    // the App Group suite — appGroupID() can resolve to the wrong
+    // suite here after a re-sign — so stash it in this process's
+    // standard defaults, where LCSharedUtils.certificatePassword
+    // falls back to it. Without this, invokeAppMain's iOS 26+
+    // JITLess gate sees a nil password and refuses to start the guest.
     NSString *certificatePassword = appInfo[@"certificatePassword"];
     if (certificatePassword.length > 0) {
         [lcUserDefaults setObject:certificatePassword forKey:@"LCCertificatePassword"];

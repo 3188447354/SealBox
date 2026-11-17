@@ -18,25 +18,6 @@
 import Foundation
 import SwiftUI
 
-/// Captures the Main scene's real openWindow action for
-/// MultitaskWindowManager (0.0.6). @Environment only resolves inside
-/// a View body — the manager is a plain @objc class, so a static
-/// @Environment there read the default no-op action and native-window
-/// launches never opened a scene. The Main scene is always resident,
-/// so this is set on first appear, before any launch. iOS 16.1+ only
-/// (openWindow needs multi-scene support).
-@available(iOS 16.1, *)
-private struct OpenWindowRegistrar: View {
-    @Environment(\.openWindow) private var openWindow
-
-    var body: some View {
-        Color.clear
-            .onAppear {
-                MultitaskWindowManager.openWindowAction = openWindow
-            }
-    }
-}
-
 struct RootView: View {
     @State var errorShow = false
     @State var crashReportShow = false
@@ -105,10 +86,6 @@ struct RootView: View {
             SettingsView(
                 onDone: {
                     sharedModel.requestedSystemPage = nil
-                },
-                onOpenSwitcher: {
-                    sharedModel.requestedSystemPage = nil
-                    NotificationCenter.default.post(name: Notification.Name("SealBoxOpenAppSwitcher"), object: nil)
                 }
             )
         }
@@ -140,13 +117,6 @@ struct RootView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: Notification.Name("SealBoxCertificateImported"))) { _ in
             certificateImported = hasImportedCertificate
-        }
-        // 0.0.6: capture the Main scene's real openWindow action for
-        // MultitaskWindowManager (see OpenWindowRegistrar).
-        .background {
-            if #available(iOS 16.1, *) {
-                OpenWindowRegistrar()
-            }
         }
     }
 

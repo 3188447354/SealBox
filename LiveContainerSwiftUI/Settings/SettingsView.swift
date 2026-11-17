@@ -50,7 +50,6 @@ import UniformTypeIdentifiers
 struct SettingsView: View {
     @EnvironmentObject var sharedModel: SharedModel
     var onDone: (() -> Void)? = nil
-    var onOpenSwitcher: (() -> Void)? = nil
 
     @StateObject private var storageModel = LCStorageManagementModel()
 
@@ -129,7 +128,6 @@ struct SettingsView: View {
         .overlay(alignment: .bottom) {
             HomeBarView(
                 onReturnToDesktop: { done() },
-                onOpenSwitcher: { onOpenSwitcher?() },
                 windowScale: $windowScale
             )
         }

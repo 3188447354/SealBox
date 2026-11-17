@@ -8,7 +8,6 @@
 #import "LCUtils.h"
 #import "../../LiveContainer/LCSharedUtils.h"
 #import "LCAppInfo.h"
-#import "../../LiveContainer/FoundationPrivate.h" // 0.0.7: NSExtension is declared here (private header). The deleted DecoratedAppSceneViewController.h used to bring it in transitively — without this import the build fails with "use of undeclared identifier 'NSExtension'" (CI run 43878087335).
 #import "../../ZSign/zsigner.h"
 #import "LiveContainerSwiftUI-Swift.h"
 
@@ -37,58 +36,6 @@
     [[[NSUserDefaults alloc] initWithSuiteName:[LCSharedUtils appGroupID]] setObject:certPassword forKey:@"LCCertificatePassword"];
 }
 
-
-#pragma mark Multitasking
-+ (NSString *)liveProcessBundleIdentifier {
-    // first check if we have LiveProcess extension in our own bundle
-    NSBundle *liveProcessBundle = [NSBundle bundleWithPath:[NSBundle.mainBundle.builtInPlugInsPath stringByAppendingPathComponent:@"LiveProcess.appex"]];
-    if(liveProcessBundle) {
-        return liveProcessBundle.bundleIdentifier;
-    }
-    
-    // in LC2, attempt to guess LC1's LiveProcess extension
-    NSString *bundleID = [NSString stringWithFormat:@"com.mjorb.sealbox.%@.LiveProcess", LCSharedUtils.teamIdentifier];
-    if([NSExtension extensionWithIdentifier:bundleID error:nil]) {
-        return bundleID;
-    }
-    
-    return nil;
-}
-
-+ (void)launchMultitaskGuestApp:(NSString *)displayName completionHandler:(void (^)(NSNumber *pid, NSError *error))completionHandler {
-    if(!self.liveProcessBundleIdentifier) {
-        NSError *error = [NSError errorWithDomain:displayName code:2 userInfo:@{NSLocalizedDescriptionKey: @"LiveProcess extension not found. Please reinstall SealBox and select Keep Extensions"}];
-        if (completionHandler) completionHandler(nil, error);
-        return;
-    }
-    
-    NSUserDefaults *lcUserDefaults = NSUserDefaults.standardUserDefaults;
-    NSString* bundleId = [lcUserDefaults stringForKey:@"selected"];
-    NSString* dataUUID = [lcUserDefaults stringForKey:@"selectedContainer"];
-    
-    [lcUserDefaults removeObjectForKey:@"selected"];
-    [lcUserDefaults removeObjectForKey:@"selectedContainer"];
-    
-    dispatch_async(dispatch_get_main_queue(), ^{
-        // 0.0.7: the floating virtual window is gone — a native
-        // fullscreen scene is the only multitask path. On iOS <
-        // 16.1 (or without multi-scene support) there is no scene
-        // to open, so fail loudly through the callback instead of
-        // silently doing nothing.
-        if (@available(iOS 16.1, *)) {
-            if(UIApplication.sharedApplication.supportsMultipleScenes) {
-                [MultitaskWindowManager openAppWindowWithDisplayName:displayName dataUUID:dataUUID bundleId:bundleId pidCallback:completionHandler];
-                // 0.0.6: do NOT register the running app here — the
-                // scene has not opened yet. MultitaskAppWindow
-                // registers it in onAppInitialize, once the guest
-                // really initialized.
-                return;
-            }
-        }
-        NSError *error = [NSError errorWithDomain:displayName code:3 userInfo:@{NSLocalizedDescriptionKey: @"多任务窗口需要 iOS 16.1 及以上。"}];
-        if (completionHandler) completionHandler(nil, error);
-    });
-}
 
 #pragma mark Code signing
 

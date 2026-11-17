@@ -33,11 +33,6 @@ struct SealBoxApp: SwiftUI.App {
         // the UI showed English). This only affects SealBox's own
         // strings — guest apps run in their own process/defaults.
         UserDefaults.standard.set(["zh-Hans"], forKey: "AppleLanguages")
-        // 0.0.4: multitasking is the default. register() only fills
-        // keys the user never set, so an explicit later choice still
-        // wins; classic-mode apps (classicMode != 0) still launch
-        // non-multitask by design (LCAppModel.shouldLaunchInMultitaskMode).
-        UserDefaults.standard.register(defaults: ["LCLaunchInMultitaskMode": true])
 
         let fm = FileManager()
         var tempAppDataFolderNames: [String] = []
@@ -115,18 +110,14 @@ struct SealBoxApp: SwiftUI.App {
     }
 
     var body: some Scene {
+        // 0.0.8: single scene only. The multitask "appView" scene is
+        // removed with the window mode — guest apps launch by
+        // relaunching this process as the guest (classic launch), so
+        // there is no second scene to host.
         WindowGroup(id: "Main") {
             RootView()
                 .handlesExternalEvents(preferring: ["*"], allowing: ["*"])
                 .environmentObject(DataManager.shared.model)
-        }
-
-        if UIApplication.shared.supportsMultipleScenes, #available(iOS 16.1, *) {
-            WindowGroup(id: "appView", for: String.self) { $id in
-                if let id {
-                    MultitaskAppWindow(id: id)
-                }
-            }
         }
     }
 }
@@ -144,11 +135,6 @@ struct SealBoxApp: SwiftUI.App {
                 UserDefaults.standard.removeObject(forKey: "selectedContainer")
             }
         }
-
-        // allow new scene pop up as a new fullscreen window
-        method_exchangeImplementations(
-            class_getInstanceMethod(UIApplication.self, #selector(UIApplication.requestSceneSessionActivation(_:userActivity:options:errorHandler:)))!,
-            class_getInstanceMethod(UIApplication.self, #selector(UIApplication.hook_requestSceneSessionActivation(_:userActivity:options:errorHandler:)))!)
 
         // remove symbol caches if user upgraded iOS
         if let lastIOSBuildVersion = LCUtils.appGroupUserDefault.string(forKey: "LCLastIOSBuildVersion"),
@@ -174,37 +160,5 @@ class SceneDelegate: NSObject, UIWindowSceneDelegate, ObservableObject {
 
     func scene(_ scene: UIScene, willConnectTo session: UISceneSession, options connectionOptions: UIScene.ConnectionOptions) {
         self.window = (scene as? UIWindowScene)?.keyWindow
-    }
-}
-
-@objc extension UIApplication {
-
-    func hook_requestSceneSessionActivation(
-        _ sceneSession: UISceneSession?,
-        userActivity: NSUserActivity?,
-        options: UIScene.ActivationRequestOptions?,
-        errorHandler: ((any Error) -> Void)? = nil
-    ) {
-        var newOptions = options
-        if newOptions == nil {
-            newOptions = UIScene.ActivationRequestOptions()
-        }
-        // NOTE: UIApplication has no keyWindow property — the old
-        // AppDelegate's `self.keyWindow` never compiled. Resolve the key
-        // window from the connected scenes instead (UIWindowScene.keyWindow
-        // is public API since iOS 15).
-        let keyWindow = UIApplication.shared.connectedScenes
-            .compactMap { $0 as? UIWindowScene }
-            .flatMap { $0.windows }
-            .first { $0.isKeyWindow }
-        guard let keyWindow else {
-            // No key window yet: treat as non-fullscreen, but still
-            // forward the activation request instead of dropping it.
-            newOptions!._setRequestFullscreen(false)
-            self.hook_requestSceneSessionActivation(sceneSession, userActivity: userActivity, options: newOptions, errorHandler: errorHandler)
-            return
-        }
-        newOptions!._setRequestFullscreen(UIScreen.main.bounds == keyWindow.bounds)
-        self.hook_requestSceneSessionActivation(sceneSession, userActivity: userActivity, options: newOptions, errorHandler: errorHandler)
     }
 }

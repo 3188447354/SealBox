@@ -16,8 +16,7 @@
 //
 //  SealBoxLaunchCoordinator is the LCAppModelDelegate every LCAppModel
 //  gets: with a nil delegate, runApp's JIT branch silently did nothing.
-//  Multitask is frozen in v1, so showRunWhenMultitaskAlert refuses;
-//  the JIT confirm dialog is a plain UIKit alert because the delegate
+//  The JIT confirm dialog is a plain UIKit alert because the delegate
 //  has no view to present from.
 
 import Foundation
@@ -64,18 +63,6 @@ final class SealBoxLaunchCoordinator: LCAppModelDelegate {
         // The grid filters on uiIsHidden directly; nothing else to do.
     }
 
-    /// Multitask is frozen in v1: never run a shared app into a busy
-    /// multitask session — refuse instead of asking. The refusal is
-    /// intentional, but it must be visible (spec C6): runApp returns
-    /// silently on false, so surface the reason through the desktop
-    /// error alert instead of leaving the tap with no feedback.
-    func showRunWhenMultitaskAlert() async -> Bool? {
-        await MainActor.run {
-            InstallFlow.shared.errorMessage = "已有应用在多任务中运行，请先退出它再打开共享应用。"
-        }
-        return false
-    }
-
     func jitLaunch(appName: String, classicMode: UInt) async {
         await jitLaunch(withScript: "", appName: appName, classicMode: classicMode)
     }
@@ -117,60 +104,6 @@ final class SealBoxLaunchCoordinator: LCAppModelDelegate {
             return
         }
         LCSharedUtils.launchToGuestApp(withClassicMode: classicMode)
-    }
-
-    func jitLaunch(withPID pid: Int, withScript script: String? = nil, appName: String) async {
-        await MainActor.run {
-            let encodedData = script?.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed)
-
-            // 0.0.7 audit fix (spec G3): same phantom-enabler rule as
-            // jitLaunch(withScript:) — a missing key reads as 0
-            // (.SideJITServer) via integer(forKey:). With no enabler
-            // recorded, say so instead of opening a stikjit:// URL
-            // no app can answer (silent no-op, guest runs without JIT).
-            guard let rawEnabler = LCUtils.appGroupUserDefault.object(forKey: "LCJITEnablerType") as? Int,
-                  let jitEnabler = JITEnablerType(rawValue: rawEnabler) else {
-                InstallFlow.shared.errorMessage = "未配置 JIT 开启器，请先在 Seal 里开启 JIT。"
-                return
-            }
-            if jitEnabler == .StosDebug || jitEnabler == .StosDebugLC {
-                let encoded = encodedData.map { "&script=\($0)" } ?? ""
-                // 0.0.7 audit fix: appName is a display name — a space
-                // or non-ASCII in it makes URL(string:) return nil,
-                // and the if-let below would silently skip opening
-                // StosDebug (guest runs without JIT, no error shown).
-                let encodedAppName = appName.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed.subtracting(CharacterSet(charactersIn: "&=+"))) ?? appName
-                if jitEnabler == .StosDebugLC {
-                    guard DataManager.shared.model.apps.contains(where: {
-                        $0.appInfo.urlSchemes().contains("stosdebug") &&
-                        (DataManager.shared.model.multiLCStatus != 2 || $0.appInfo.isShared)
-                    }) else {
-                        InstallFlow.shared.errorMessage = "找不到 StosDebug，请先安装并把它设为共享应用。"
-                        return
-                    }
-                    if let url = URL(string: "stosdebug://enableJIT?bundleId=\(Bundle.main.bundleIdentifier!)&appName=\(encodedAppName)&pid=\(pid)&relaunchApp=false&forcePID=true\(encoded)") {
-                        UIApplication.shared.open(url)
-                    }
-                } else if let url = URL(string: "stosdebug://enableJIT?bundleId=\(Bundle.main.bundleIdentifier!)&appName=\(encodedAppName)&pid=\(pid)&forcePID=true\(encoded)") {
-                    UIApplication.shared.open(url)
-                }
-                return
-            }
-
-            let encoded = encodedData.map { "&script-data=\($0)" } ?? ""
-            if let url = URL(string: "stikjit://enable-jit?bundle-id=\(Bundle.main.bundleIdentifier!)&pid=\(pid)\(encoded)") {
-                if jitEnabler == .StikJITLC {
-                    guard DataManager.shared.model.apps.contains(where: {
-                        $0.appInfo.urlSchemes().contains("stikjit") &&
-                        (DataManager.shared.model.multiLCStatus != 2 || $0.appInfo.isShared)
-                    }) else {
-                        InstallFlow.shared.errorMessage = "找不到 StikDebug，请先安装并把它设为共享应用。"
-                        return
-                    }
-                }
-                UIApplication.shared.open(url)
-            }
-        }
     }
 
     /// A UIKit yes/no alert from whatever window is key. The delegate has
