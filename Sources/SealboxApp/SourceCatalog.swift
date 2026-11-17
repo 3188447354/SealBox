@@ -124,9 +124,9 @@ enum SourceCatalog {
         SourceApp(
             name: "Erosion-CN",
             intro: "MobileGestalt 工具箱，中文",
-            version: "v1.0.2",
+            version: "v1.0.3",
             date: "2026-11-17",
-            url: URL(string: "https://github.com/Kianuni/Erosion-CN/releases/download/v1.0.2/Erosion_v1.0.2_Bilingual.ipa")!,
+            url: URL(string: "https://github.com/Kianuni/Erosion-CN/releases/download/v1.0.3/Erosion_v1.0.3_Bilingual.ipa")!,
             category: .tools
         ),
         SourceApp(
@@ -164,9 +164,9 @@ enum SourceCatalog {
         SourceApp(
             name: "WQFiles",
             intro: "worse_query 文件浏览器，免越狱",
-            version: "v0.9.16",
-            date: "2026-11-16",
-            url: URL(string: "https://github.com/kolbicz/WQFiles/releases/download/v0.9.16/WQFiles.ipa")!,
+            version: "v0.9.17",
+            date: "2026-11-17",
+            url: URL(string: "https://github.com/kolbicz/WQFiles/releases/download/v0.9.17/WQFiles.ipa")!,
             category: .tools
         ),
         SourceApp(
