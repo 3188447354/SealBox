@@ -229,7 +229,7 @@ struct SourceAppDetailView: View {
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
                 }
-                GetButtonView(app: app, downloads: downloads, wide: true)
+                GetButtonView(app: app, wide: true, downloads: downloads)
                     .padding(.horizontal, 32)
                 VStack(alignment: .leading, spacing: 0) {
                     Text("版本说明")
