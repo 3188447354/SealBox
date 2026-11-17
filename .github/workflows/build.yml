@@ -67,7 +67,7 @@ jobs:
           security unlock-keychain -p "sealbox-ci" "$KEYCHAIN"
           printf '%s\n' '[req]' 'distinguished_name=dn' 'prompt=no' 'x509_extensions=v3' '[dn]' 'CN=SealBox CI' '[v3]' 'basicConstraints=critical,CA:FALSE' 'keyUsage=critical,digitalSignature' 'extendedKeyUsage=critical,codeSigning' > "$RUNNER_TEMP/ci-cert.cnf"
           openssl req -x509 -newkey rsa:2048 -keyout "$RUNNER_TEMP/ci-key.pem" -out "$RUNNER_TEMP/ci-cert.pem" -days 365 -nodes -config "$RUNNER_TEMP/ci-cert.cnf"
-          openssl pkcs12 -export -out "$RUNNER_TEMP/ci-cert.p12" -inkey "$RUNNER_TEMP/ci-key.pem" -in "$RUNNER_TEMP/ci-cert.pem" -passout pass:sealbox-ci
+          openssl pkcs12 -export -out "$RUNNER_TEMP/ci-cert.p12" -inkey "$RUNNER_TEMP/ci-key.pem" -in "$RUNNER_TEMP/ci-cert.pem" -passout pass:sealbox-ci -certpbe PBE-SHA1-3DES -keypbe PBE-SHA1-3DES -macalg sha1
           security import "$RUNNER_TEMP/ci-cert.p12" -k "$KEYCHAIN" -P "sealbox-ci" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple: -s -k "sealbox-ci" "$KEYCHAIN"
           security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
