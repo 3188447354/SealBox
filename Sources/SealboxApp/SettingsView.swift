@@ -325,9 +325,11 @@ private struct BluetoothSettingsView: View {
                 Toggle("蓝牙", isOn: $bluetoothOn)
             }
             if bluetoothOn {
-                Section("我的设备") {
+                Section {
                     Text("没有已配对的设备")
                         .foregroundStyle(.secondary)
+                } header: {
+                    Text("我的设备")
                 } footer: {
                     Text("虚拟机内没有真实蓝牙扫描，不显示设备列表。")
                 }
@@ -529,9 +531,11 @@ private struct StorageView: View {
     var body: some View {
         let space = VMFiles.diskSpace()
         List {
-            Section("本机储存空间") {
+            Section {
                 LabeledRow(label: "总容量", value: space.total)
                 LabeledRow(label: "可用", value: space.available)
+            } header: {
+                Text("本机储存空间")
             } footer: {
                 Text("以上为本机真实磁盘空间，由系统读取。")
             }
@@ -576,11 +580,13 @@ private struct DateTimeView: View {
             Section {
                 Toggle("自动设置", isOn: $autoDateTime)
             }
-            Section("当前时间") {
+            Section {
                 TimelineView(.periodic(from: .now, by: 1)) { context in
                     LabeledRow(label: "日期", value: VMTime.dateString(for: context.date))
                     LabeledRow(label: "时间", value: VMTime.timeString(for: context.date))
                 }
+            } header: {
+                Text("当前时间")
             } footer: {
                 Text("显示的是本机真实当前时间。")
             }
@@ -634,7 +640,7 @@ private struct LanguageView: View {
 
     var body: some View {
         List {
-            Section("语言") {
+            Section {
                 ForEach(languages, id: \.self) { name in
                     Button {
                         language = name
@@ -650,6 +656,8 @@ private struct LanguageView: View {
                         }
                     }
                 }
+            } header: {
+                Text("语言")
             } footer: {
                 Text("仅保存选择，不改变本界面语言。")
             }
@@ -793,7 +801,7 @@ private struct WallpaperSettingsView: View {
 
     var body: some View {
         List {
-            Section("选取墙纸") {
+            Section {
                 ForEach(VMWallpapers.options.indices, id: \.self) { index in
                     Button {
                         selectedWallpaper = index
@@ -816,6 +824,8 @@ private struct WallpaperSettingsView: View {
                         }
                     }
                 }
+            } header: {
+                Text("选取墙纸")
             } footer: {
                 Text("墙纸会同步换到主屏幕，重启后保持。")
             }
@@ -916,7 +926,7 @@ private struct TonePickerView: View {
 
     var body: some View {
         List {
-            Section(title) {
+            Section {
                 ForEach(options, id: \.self) { name in
                     Button {
                         selection.wrappedValue = name
@@ -934,6 +944,8 @@ private struct TonePickerView: View {
                         }
                     }
                 }
+            } header: {
+                Text(title)
             } footer: {
                 Text("点选时会响一声系统提示音作为反馈。")
             }
