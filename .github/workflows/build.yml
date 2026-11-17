@@ -55,7 +55,27 @@ jobs:
           scheme: ${{ steps.scheme.outputs.scheme }}
           filetype_parameter: ${{ steps.filetype_parameter.outputs.filetype_parameter }}
           file_to_build: ${{ steps.file_to_build.outputs.file_to_build }}
-        run: xcodebuild archive -archivePath "$archive_path" -scheme "$scheme" -"$filetype_parameter" "$file_to_build" -sdk iphoneos -arch arm64 -configuration Release CODE_SIGN_IDENTITY="-" CODE_SIGNING_REQUIRED=YES 2>&1 | tee xcodebuild-raw.log | xcpretty; exit ${PIPESTATUS[0]}
+        run: xcodebuild archive -archivePath "$archive_path" -scheme "$scheme" -"$filetype_parameter" "$file_to_build" -sdk iphoneos -arch arm64 -configuration Release CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO 2>&1 | tee xcodebuild-raw.log | xcpretty; exit ${PIPESTATUS[0]}
+      - name: Sign app with CI identity
+        run: |
+          set -e
+          APP="$archive_path.xcarchive/Products/Applications/$scheme.app"
+          KEYCHAIN="$RUNNER_TEMP/sealbox-ci.keychain-db"
+          # Self-signed code-signing identity (CI-only; Seal re-signs with the user's cert on device)
+          security create-keychain -p "sealbox-ci" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "sealbox-ci" "$KEYCHAIN"
+          printf '%s\n' '[req]' 'distinguished_name=dn' 'prompt=no' 'x509_extensions=v3' '[dn]' 'CN=SealBox CI' '[v3]' 'basicConstraints=critical,CA:FALSE' 'keyUsage=critical,digitalSignature' 'extendedKeyUsage=critical,codeSigning' > "$RUNNER_TEMP/ci-cert.cnf"
+          openssl req -x509 -newkey rsa:2048 -keyout "$RUNNER_TEMP/ci-key.pem" -out "$RUNNER_TEMP/ci-cert.pem" -days 365 -nodes -config "$RUNNER_TEMP/ci-cert.cnf"
+          openssl pkcs12 -export -out "$RUNNER_TEMP/ci-cert.p12" -inkey "$RUNNER_TEMP/ci-key.pem" -in "$RUNNER_TEMP/ci-cert.pem" -passout pass:
+          security import "$RUNNER_TEMP/ci-cert.p12" -k "$KEYCHAIN" -P "" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "sealbox-ci" "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          # Expand entitlements.xml build variables (Release: team AAAAA11111, no suffix)
+          sed -e 's/$(DEVELOPMENT_TEAM)/AAAAA11111/g' -e 's/$(APP_GROUP_SEALBOX)/group.com.mjorb.sealbox/g' -e 's/$(PRODUCT_BUNDLE_IDENTIFIER)/com.mjorb.sealbox/g' -e 's/$(AppIdentifierPrefix)/AAAAA11111./g' entitlements.xml > "$RUNNER_TEMP/entitlements-expanded.plist"
+          plutil -lint "$RUNNER_TEMP/entitlements-expanded.plist"
+          /usr/bin/codesign --force --sign "SealBox CI" --entitlements "$RUNNER_TEMP/entitlements-expanded.plist" --timestamp=none --deep "$APP"
+          /usr/bin/codesign --verify --deep "$APP"
       - name: Upload raw build log on failure
         if: failure()
         uses: actions/upload-artifact@v4
