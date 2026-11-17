@@ -6,76 +6,68 @@
 	objectVersion = 56;
 	objects = {
 /* Begin PBXBuildFile section */
-		5EED00000000000000000025 /* litehook.c */ = {
+		5EED00000000000000000025 /* ZSign.dylib */ = {
 			isa = PBXBuildFile;
-			fileRef = 5EED0000000000000000000F /* litehook.c */;
+			fileRef = 5EED00000000000000000013 /* ZSign.dylib */;
 		};
-		5EED00000000000000000026 /* litehook.c */ = {
+		5EED00000000000000000026 /* SBGuestHooks.dylib */ = {
 			isa = PBXBuildFile;
-			fileRef = 5EED0000000000000000000F /* litehook.c */;
+			fileRef = 5EED00000000000000000014 /* SBGuestHooks.dylib */;
 		};
-		5EED00000000000000000027 /* ZSign.dylib */ = {
-			isa = PBXBuildFile;
-			fileRef = 5EED00000000000000000014 /* ZSign.dylib */;
-		};
-		5EED00000000000000000028 /* SBGuestHooks.dylib */ = {
-			isa = PBXBuildFile;
-			fileRef = 5EED00000000000000000015 /* SBGuestHooks.dylib */;
-		};
-		5EED00000000000000000029 /* OpenSSL.xcframework */ = {
+		5EED00000000000000000027 /* OpenSSL.xcframework */ = {
 			isa = PBXBuildFile;
 			fileRef = 5EED0000000000000000000E /* OpenSSL.xcframework */;
 		};
-		5EED0000000000000000002A /* OpenSSL.xcframework */ = {
+		5EED00000000000000000028 /* OpenSSL.xcframework */ = {
 			isa = PBXBuildFile;
 			fileRef = 5EED0000000000000000000E /* OpenSSL.xcframework */;
 		};
-		5EED0000000000000000002B /* libz.tbd */ = {
+		5EED00000000000000000029 /* libz.tbd */ = {
 			isa = PBXBuildFile;
-			fileRef = 5EED00000000000000000010 /* libz.tbd */;
+			fileRef = 5EED0000000000000000000F /* libz.tbd */;
+		};
+		5EED0000000000000000002A /* UIKit.framework */ = {
+			isa = PBXBuildFile;
+			fileRef = 5EED00000000000000000010 /* UIKit.framework */;
+		};
+		5EED0000000000000000002B /* Foundation.framework */ = {
+			isa = PBXBuildFile;
+			fileRef = 5EED00000000000000000011 /* Foundation.framework */;
 		};
 		5EED0000000000000000002C /* UIKit.framework */ = {
 			isa = PBXBuildFile;
-			fileRef = 5EED00000000000000000011 /* UIKit.framework */;
+			fileRef = 5EED00000000000000000010 /* UIKit.framework */;
 		};
 		5EED0000000000000000002D /* Foundation.framework */ = {
 			isa = PBXBuildFile;
-			fileRef = 5EED00000000000000000012 /* Foundation.framework */;
+			fileRef = 5EED00000000000000000011 /* Foundation.framework */;
 		};
-		5EED0000000000000000002E /* UIKit.framework */ = {
-			isa = PBXBuildFile;
-			fileRef = 5EED00000000000000000011 /* UIKit.framework */;
-		};
-		5EED0000000000000000002F /* Foundation.framework */ = {
-			isa = PBXBuildFile;
-			fileRef = 5EED00000000000000000012 /* Foundation.framework */;
-		};
-		5EED00000000000000000030 /* Assets.xcassets */ = {
+		5EED0000000000000000002E /* Assets.xcassets */ = {
 			isa = PBXBuildFile;
 			fileRef = 5EED00000000000000000007 /* Assets.xcassets */;
 		};
-		5EED00000000000000000031 /* ZSign.dylib */ = {
+		5EED0000000000000000002F /* ZSign.dylib */ = {
 			isa = PBXBuildFile;
-			fileRef = 5EED00000000000000000014 /* ZSign.dylib */;
+			fileRef = 5EED00000000000000000013 /* ZSign.dylib */;
 			settings = {ATTRIBUTES = (CodeSignOnCopy, ); };
 		};
-		5EED00000000000000000032 /* SBGuestHooks.dylib */ = {
+		5EED00000000000000000030 /* SBGuestHooks.dylib */ = {
 			isa = PBXBuildFile;
-			fileRef = 5EED00000000000000000015 /* SBGuestHooks.dylib */;
+			fileRef = 5EED00000000000000000014 /* SBGuestHooks.dylib */;
 			settings = {ATTRIBUTES = (CodeSignOnCopy, ); };
 		};
-		5EED00000000000000000033 /* OpenSSL.xcframework */ = {
+		5EED00000000000000000031 /* OpenSSL.xcframework */ = {
 			isa = PBXBuildFile;
 			fileRef = 5EED0000000000000000000E /* OpenSSL.xcframework */;
 			settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); };
 		};
 /* End PBXBuildFile section */
 /* Begin PBXCopyFilesBuildPhase section */
-		5EED00000000000000000037 /* Embed Frameworks */ = {
+		5EED00000000000000000035 /* Embed Frameworks */ = {
 			isa = PBXCopyFilesBuildPhase;
 			dstPath = "";
 			dstSubfolderSpec = 10;
-			files = (5EED00000000000000000031 /* ZSign.dylib */, 5EED00000000000000000032 /* SBGuestHooks.dylib */, 5EED00000000000000000033 /* OpenSSL.xcframework */, );
+			files = (5EED0000000000000000002F /* ZSign.dylib */, 5EED00000000000000000030 /* SBGuestHooks.dylib */, 5EED00000000000000000031 /* OpenSSL.xcframework */, );
 			name = "Embed Frameworks";
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -172,49 +164,42 @@
 			path = "OpenSSL/Frameworks/OpenSSL.xcframework";
 			sourceTree = "<group>";
 		};
-		5EED0000000000000000000F /* litehook.c */ = {
-			isa = PBXFileReference;
-			lastKnownFileType = "sourcecode.c";
-			name = "litehook.c";
-			path = "litehook/src/litehook.c";
-			sourceTree = "<group>";
-		};
-		5EED00000000000000000010 /* libz.tbd */ = {
+		5EED0000000000000000000F /* libz.tbd */ = {
 			isa = PBXFileReference;
 			lastKnownFileType = "sourcecode.text-based-dylib-definition";
 			name = "libz.tbd";
 			path = "usr/lib/libz.tbd";
 			sourceTree = "SDKROOT";
 		};
-		5EED00000000000000000011 /* UIKit.framework */ = {
+		5EED00000000000000000010 /* UIKit.framework */ = {
 			isa = PBXFileReference;
 			lastKnownFileType = "wrapper.framework";
 			name = "UIKit.framework";
 			path = "System/Library/Frameworks/UIKit.framework";
 			sourceTree = "SDKROOT";
 		};
-		5EED00000000000000000012 /* Foundation.framework */ = {
+		5EED00000000000000000011 /* Foundation.framework */ = {
 			isa = PBXFileReference;
 			lastKnownFileType = "wrapper.framework";
 			name = "Foundation.framework";
 			path = "System/Library/Frameworks/Foundation.framework";
 			sourceTree = "SDKROOT";
 		};
-		5EED00000000000000000013 /* SealBox.app */ = {
+		5EED00000000000000000012 /* SealBox.app */ = {
 			isa = PBXFileReference;
 			lastKnownFileType = "wrapper.application";
 			name = "SealBox.app";
 			path = "SealBox.app";
 			sourceTree = "BUILT_PRODUCTS_DIR";
 		};
-		5EED00000000000000000014 /* ZSign.dylib */ = {
+		5EED00000000000000000013 /* ZSign.dylib */ = {
 			isa = PBXFileReference;
 			lastKnownFileType = "compiled.mach-o.dylib";
 			name = "ZSign.dylib";
 			path = "ZSign.dylib";
 			sourceTree = "BUILT_PRODUCTS_DIR";
 		};
-		5EED00000000000000000015 /* SBGuestHooks.dylib */ = {
+		5EED00000000000000000014 /* SBGuestHooks.dylib */ = {
 			isa = PBXFileReference;
 			lastKnownFileType = "compiled.mach-o.dylib";
 			name = "SBGuestHooks.dylib";
@@ -223,111 +208,129 @@
 		};
 /* End PBXFileReference section */
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
-		5EED0000000000000000004C /* PBXFileSystemSynchronizedBuildFileExceptionSet */ = {
+		5EED0000000000000000004A /* PBXFileSystemSynchronizedBuildFileExceptionSet */ = {
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = ("Info.plist", );
-			target = 5EED00000000000000000049 /* SealBox */;
+			target = 5EED00000000000000000047 /* SealBox */;
+		};
+		5EED0000000000000000004B /* PBXFileSystemSynchronizedBuildFileExceptionSet */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = ("Tests/main.c", );
+			target = 5EED00000000000000000047 /* SealBox */;
+		};
+		5EED0000000000000000004C /* PBXFileSystemSynchronizedBuildFileExceptionSet */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = ("Tests/main.c", );
+			target = 5EED00000000000000000049 /* SBGuestHooks */;
 		};
 /* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
 /* Begin PBXFileSystemSynchronizedRootGroup section */
-		5EED00000000000000000016 /* SealboxApp */ = {
+		5EED00000000000000000015 /* SealboxApp */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
-			exceptions = (5EED0000000000000000004C /* PBXFileSystemSynchronizedBuildFileExceptionSet */, );
+			exceptions = (5EED0000000000000000004A /* PBXFileSystemSynchronizedBuildFileExceptionSet */, );
 			explicitFileTypes = {};
 			explicitFolders = ();
 			path = "Sources/SealboxApp";
 			sourceTree = "<group>";
 		};
-		5EED00000000000000000017 /* Store */ = {
+		5EED00000000000000000016 /* Store */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			explicitFileTypes = {};
 			explicitFolders = ();
 			path = "Sources/Store";
 			sourceTree = "<group>";
 		};
-		5EED00000000000000000018 /* Shared */ = {
+		5EED00000000000000000017 /* Shared */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			explicitFileTypes = {};
 			explicitFolders = ();
 			path = "Sources/Shared";
 			sourceTree = "<group>";
 		};
-		5EED00000000000000000019 /* Importer */ = {
+		5EED00000000000000000018 /* Importer */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			explicitFileTypes = {};
 			explicitFolders = ();
 			path = "Sources/Importer";
 			sourceTree = "<group>";
 		};
-		5EED0000000000000000001A /* Installer */ = {
+		5EED00000000000000000019 /* Installer */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			explicitFileTypes = {};
 			explicitFolders = ();
 			path = "Sources/Installer";
 			sourceTree = "<group>";
 		};
-		5EED0000000000000000001B /* GuestLoader */ = {
+		5EED0000000000000000001A /* GuestLoader */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			explicitFileTypes = {};
 			explicitFolders = ();
 			path = "Sources/GuestLoader";
 			sourceTree = "<group>";
 		};
-		5EED0000000000000000001C /* Certificate */ = {
+		5EED0000000000000000001B /* Certificate */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			explicitFileTypes = {};
 			explicitFolders = ();
 			path = "Sources/Certificate";
 			sourceTree = "<group>";
 		};
-		5EED0000000000000000001D /* Desktop */ = {
+		5EED0000000000000000001C /* Desktop */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			explicitFileTypes = {};
 			explicitFolders = ();
 			path = "Sources/Desktop";
 			sourceTree = "<group>";
 		};
-		5EED0000000000000000001E /* Settings */ = {
+		5EED0000000000000000001D /* Settings */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			explicitFileTypes = {};
 			explicitFolders = ();
 			path = "Sources/Settings";
 			sourceTree = "<group>";
 		};
-		5EED0000000000000000001F /* GuestHooks */ = {
+		5EED0000000000000000001E /* GuestHooks */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			explicitFileTypes = {};
 			explicitFolders = ();
 			path = "Sources/GuestHooks";
 			sourceTree = "<group>";
 		};
-		5EED00000000000000000020 /* ZSign */ = {
+		5EED0000000000000000001F /* ZSign */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			explicitFileTypes = {};
 			explicitFolders = ();
 			path = "ZSign";
 			sourceTree = "<group>";
 		};
-		5EED00000000000000000021 /* xcconfigs */ = {
+		5EED00000000000000000020 /* xcconfigs */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			explicitFileTypes = {};
 			explicitFolders = ();
 			path = "xcconfigs";
 			sourceTree = "<group>";
 		};
+		5EED00000000000000000021 /* litehook */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (5EED0000000000000000004B /* PBXFileSystemSynchronizedBuildFileExceptionSet */, 5EED0000000000000000004C /* PBXFileSystemSynchronizedBuildFileExceptionSet */, );
+			explicitFileTypes = {};
+			explicitFolders = ();
+			path = "litehook";
+			sourceTree = "<group>";
+		};
 /* End PBXFileSystemSynchronizedRootGroup section */
 /* Begin PBXFrameworksBuildPhase section */
-		5EED00000000000000000035 /* Frameworks */ = {
+		5EED00000000000000000033 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
-			files = (5EED00000000000000000027 /* ZSign.dylib */, 5EED00000000000000000028 /* SBGuestHooks.dylib */, 5EED00000000000000000029 /* OpenSSL.xcframework */, 5EED0000000000000000002B /* libz.tbd */, 5EED0000000000000000002C /* UIKit.framework */, 5EED0000000000000000002D /* Foundation.framework */, );
+			files = (5EED00000000000000000025 /* ZSign.dylib */, 5EED00000000000000000026 /* SBGuestHooks.dylib */, 5EED00000000000000000027 /* OpenSSL.xcframework */, 5EED00000000000000000029 /* libz.tbd */, 5EED0000000000000000002A /* UIKit.framework */, 5EED0000000000000000002B /* Foundation.framework */, );
+		};
+		5EED00000000000000000038 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			files = (5EED00000000000000000028 /* OpenSSL.xcframework */, );
 		};
 		5EED0000000000000000003A /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
-			files = (5EED0000000000000000002A /* OpenSSL.xcframework */, );
-		};
-		5EED0000000000000000003C /* Frameworks */ = {
-			isa = PBXFrameworksBuildPhase;
-			files = (5EED0000000000000000002E /* UIKit.framework */, 5EED0000000000000000002F /* Foundation.framework */, );
+			files = (5EED0000000000000000002C /* UIKit.framework */, 5EED0000000000000000002D /* Foundation.framework */, );
 		};
 /* End PBXFrameworksBuildPhase section */
 /* Begin PBXGroup section */
@@ -340,60 +343,60 @@
 		};
 		5EED00000000000000000023 /* Products */ = {
 			isa = PBXGroup;
-			children = (5EED00000000000000000013 /* SealBox.app */, 5EED00000000000000000014 /* ZSign.dylib */, 5EED00000000000000000015 /* SBGuestHooks.dylib */, );
+			children = (5EED00000000000000000012 /* SealBox.app */, 5EED00000000000000000013 /* ZSign.dylib */, 5EED00000000000000000014 /* SBGuestHooks.dylib */, );
 			name = "Products";
 			sourceTree = "BUILT_PRODUCTS_DIR";
 		};
 		5EED00000000000000000024 /* SealBox */ = {
 			isa = PBXGroup;
-			children = (5EED00000000000000000016 /* SealboxApp */, 5EED00000000000000000017 /* Store */, 5EED00000000000000000018 /* Shared */, 5EED00000000000000000019 /* Importer */, 5EED0000000000000000001A /* Installer */, 5EED0000000000000000001B /* GuestLoader */, 5EED0000000000000000001C /* Certificate */, 5EED0000000000000000001D /* Desktop */, 5EED0000000000000000001E /* Settings */, 5EED0000000000000000001F /* GuestHooks */, 5EED00000000000000000020 /* ZSign */, 5EED00000000000000000022 /* Resources */, 5EED00000000000000000021 /* xcconfigs */, 5EED00000000000000000002 /* entitlements.xml */, 5EED00000000000000000003 /* README.md */, 5EED00000000000000000004 /* LICENSE */, 5EED00000000000000000005 /* .gitignore */, 5EED00000000000000000006 /* .gitmodules */, 5EED0000000000000000000F /* litehook.c */, 5EED0000000000000000000E /* OpenSSL.xcframework */, 5EED00000000000000000023 /* Products */, );
+			children = (5EED00000000000000000015 /* SealboxApp */, 5EED00000000000000000016 /* Store */, 5EED00000000000000000017 /* Shared */, 5EED00000000000000000018 /* Importer */, 5EED00000000000000000019 /* Installer */, 5EED0000000000000000001A /* GuestLoader */, 5EED0000000000000000001B /* Certificate */, 5EED0000000000000000001C /* Desktop */, 5EED0000000000000000001D /* Settings */, 5EED0000000000000000001E /* GuestHooks */, 5EED0000000000000000001F /* ZSign */, 5EED00000000000000000022 /* Resources */, 5EED00000000000000000020 /* xcconfigs */, 5EED00000000000000000002 /* entitlements.xml */, 5EED00000000000000000003 /* README.md */, 5EED00000000000000000004 /* LICENSE */, 5EED00000000000000000005 /* .gitignore */, 5EED00000000000000000006 /* .gitmodules */, 5EED0000000000000000000E /* OpenSSL.xcframework */, 5EED00000000000000000021 /* litehook */, 5EED00000000000000000023 /* Products */, );
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
 /* Begin PBXHeadersBuildPhase section */
-		5EED00000000000000000038 /* Headers */ = {
+		5EED00000000000000000036 /* Headers */ = {
 			isa = PBXHeadersBuildPhase;
 			files = ();
 		};
 /* End PBXHeadersBuildPhase section */
 /* Begin PBXNativeTarget section */
-		5EED00000000000000000049 /* SealBox */ = {
+		5EED00000000000000000047 /* SealBox */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = 5EED00000000000000000046 /* Build configuration list for PBXNativeTarget "SealBox" */;
-			buildPhases = (5EED00000000000000000034 /* Sources */, 5EED00000000000000000035 /* Frameworks */, 5EED00000000000000000036 /* Resources */, 5EED00000000000000000037 /* Embed Frameworks */, );
+			buildConfigurationList = 5EED00000000000000000044 /* Build configuration list for PBXNativeTarget "SealBox" */;
+			buildPhases = (5EED00000000000000000032 /* Sources */, 5EED00000000000000000033 /* Frameworks */, 5EED00000000000000000034 /* Resources */, 5EED00000000000000000035 /* Embed Frameworks */, );
 			buildRules = ();
 			dependencies = (5EED0000000000000000004F /* ZSign */, 5EED00000000000000000051 /* SBGuestHooks */, );
-			fileSystemSynchronizedGroups = (5EED00000000000000000016 /* SealboxApp */, 5EED00000000000000000017 /* Store */, 5EED00000000000000000018 /* Shared */, 5EED00000000000000000019 /* Importer */, 5EED0000000000000000001A /* Installer */, 5EED0000000000000000001B /* GuestLoader */, 5EED0000000000000000001C /* Certificate */, 5EED0000000000000000001D /* Desktop */, 5EED0000000000000000001E /* Settings */, );
+			fileSystemSynchronizedGroups = (5EED00000000000000000015 /* SealboxApp */, 5EED00000000000000000016 /* Store */, 5EED00000000000000000017 /* Shared */, 5EED00000000000000000018 /* Importer */, 5EED00000000000000000019 /* Installer */, 5EED0000000000000000001A /* GuestLoader */, 5EED0000000000000000001B /* Certificate */, 5EED0000000000000000001C /* Desktop */, 5EED0000000000000000001D /* Settings */, 5EED00000000000000000021 /* litehook */, );
 			name = "SealBox";
 			packageProductDependencies = ();
 			productName = "SealBox";
-			productReference = 5EED00000000000000000013 /* SealBox.app */;
+			productReference = 5EED00000000000000000012 /* SealBox.app */;
 			productType = "com.apple.product-type.application";
 		};
-		5EED0000000000000000004A /* ZSign */ = {
+		5EED00000000000000000048 /* ZSign */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = 5EED00000000000000000047 /* Build configuration list for PBXNativeTarget "ZSign" */;
-			buildPhases = (5EED00000000000000000038 /* Headers */, 5EED00000000000000000039 /* Sources */, 5EED0000000000000000003A /* Frameworks */, );
+			buildConfigurationList = 5EED00000000000000000045 /* Build configuration list for PBXNativeTarget "ZSign" */;
+			buildPhases = (5EED00000000000000000036 /* Headers */, 5EED00000000000000000037 /* Sources */, 5EED00000000000000000038 /* Frameworks */, );
 			buildRules = ();
 			dependencies = ();
-			fileSystemSynchronizedGroups = (5EED00000000000000000020 /* ZSign */, );
+			fileSystemSynchronizedGroups = (5EED0000000000000000001F /* ZSign */, );
 			name = "ZSign";
 			packageProductDependencies = ();
 			productName = "ZSign";
-			productReference = 5EED00000000000000000014 /* ZSign.dylib */;
+			productReference = 5EED00000000000000000013 /* ZSign.dylib */;
 			productType = "com.apple.product-type.library.dynamic";
 		};
-		5EED0000000000000000004B /* SBGuestHooks */ = {
+		5EED00000000000000000049 /* SBGuestHooks */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = 5EED00000000000000000048 /* Build configuration list for PBXNativeTarget "SBGuestHooks" */;
-			buildPhases = (5EED0000000000000000003B /* Sources */, 5EED0000000000000000003C /* Frameworks */, );
+			buildConfigurationList = 5EED00000000000000000046 /* Build configuration list for PBXNativeTarget "SBGuestHooks" */;
+			buildPhases = (5EED00000000000000000039 /* Sources */, 5EED0000000000000000003A /* Frameworks */, );
 			buildRules = ();
 			dependencies = ();
-			fileSystemSynchronizedGroups = (5EED0000000000000000001F /* GuestHooks */, );
+			fileSystemSynchronizedGroups = (5EED0000000000000000001E /* GuestHooks */, 5EED00000000000000000021 /* litehook */, );
 			name = "SBGuestHooks";
 			packageProductDependencies = ();
 			productName = "SBGuestHooks";
-			productReference = 5EED00000000000000000015 /* SBGuestHooks.dylib */;
+			productReference = 5EED00000000000000000014 /* SBGuestHooks.dylib */;
 			productType = "com.apple.product-type.library.dynamic";
 		};
 /* End PBXNativeTarget section */
@@ -403,18 +406,18 @@
 			attributes = {
 				LastUpgradeCheck = 1600;
 				TargetAttributes = {
+					5EED00000000000000000047 = {
+						CreatedOnToolsVersion = 16.0;
+					};
+					5EED00000000000000000048 = {
+						CreatedOnToolsVersion = 16.0;
+					};
 					5EED00000000000000000049 = {
-						CreatedOnToolsVersion = 16.0;
-					};
-					5EED0000000000000000004A = {
-						CreatedOnToolsVersion = 16.0;
-					};
-					5EED0000000000000000004B = {
 						CreatedOnToolsVersion = 16.0;
 					};
 				};
 			};
-			buildConfigurationList = 5EED00000000000000000045 /* Build configuration list for PBXProject "SealBox" */;
+			buildConfigurationList = 5EED00000000000000000043 /* Build configuration list for PBXProject "SealBox" */;
 			compatibilityVersion = "Xcode 16.0";
 			developmentRegion = en;
 			hasScannedForEncodings = 0;
@@ -423,38 +426,38 @@
 			productRefGroup = 5EED00000000000000000023 /* Products */;
 			projectDirPath = "";
 			projectRoot = "";
-			targets = (5EED00000000000000000049 /* SealBox */, 5EED0000000000000000004A /* ZSign */, 5EED0000000000000000004B /* SBGuestHooks */, );
+			targets = (5EED00000000000000000047 /* SealBox */, 5EED00000000000000000048 /* ZSign */, 5EED00000000000000000049 /* SBGuestHooks */, );
 		};
 /* End PBXProject section */
 /* Begin PBXResourcesBuildPhase section */
-		5EED00000000000000000036 /* Resources */ = {
+		5EED00000000000000000034 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
-			files = (5EED00000000000000000030 /* Assets.xcassets */, );
+			files = (5EED0000000000000000002E /* Assets.xcassets */, );
 		};
 /* End PBXResourcesBuildPhase section */
 /* Begin PBXSourcesBuildPhase section */
-		5EED00000000000000000034 /* Sources */ = {
+		5EED00000000000000000032 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
-			files = (5EED00000000000000000025 /* litehook.c */, );
+			files = ();
+		};
+		5EED00000000000000000037 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			files = ();
 		};
 		5EED00000000000000000039 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			files = ();
 		};
-		5EED0000000000000000003B /* Sources */ = {
-			isa = PBXSourcesBuildPhase;
-			files = (5EED00000000000000000026 /* litehook.c */, );
-		};
 /* End PBXSourcesBuildPhase section */
 /* Begin PBXTargetDependency section */
 		5EED0000000000000000004F /* ZSign */ = {
 			isa = PBXTargetDependency;
-			target = 5EED0000000000000000004A /* ZSign */;
+			target = 5EED00000000000000000048 /* ZSign */;
 			targetProxy = 5EED0000000000000000004E /* ZSign */;
 		};
 		5EED00000000000000000051 /* SBGuestHooks */ = {
 			isa = PBXTargetDependency;
-			target = 5EED0000000000000000004B /* SBGuestHooks */;
+			target = 5EED00000000000000000049 /* SBGuestHooks */;
 			targetProxy = 5EED00000000000000000050 /* SBGuestHooks */;
 		};
 /* End PBXTargetDependency section */
@@ -463,21 +466,21 @@
 			isa = PBXContainerItemProxy;
 			containerPortal = 5EED0000000000000000004D /* Project object */;
 			proxyType = 1;
-			remoteGlobalIDString = 5EED0000000000000000004A;
+			remoteGlobalIDString = 5EED00000000000000000048;
 			remoteInfo = "ZSign";
 		};
 		5EED00000000000000000050 /* SBGuestHooks */ = {
 			isa = PBXContainerItemProxy;
 			containerPortal = 5EED0000000000000000004D /* Project object */;
 			proxyType = 1;
-			remoteGlobalIDString = 5EED0000000000000000004B;
+			remoteGlobalIDString = 5EED00000000000000000049;
 			remoteInfo = "SBGuestHooks";
 		};
 /* End PBXContainerItemProxy section */
 /* Begin XCBuildConfiguration section */
-		5EED0000000000000000003D /* Debug */ = {
+		5EED0000000000000000003B /* Debug */ = {
 			isa = XCBuildConfiguration;
-			baseConfigurationReference = 5EED00000000000000000021 /* xcconfigs */;
+			baseConfigurationReference = 5EED00000000000000000020 /* xcconfigs */;
 			baseConfigurationReferenceRelativePath = "Global.xcconfig";
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
@@ -540,9 +543,9 @@
 			};
 			name = "Debug";
 		};
-		5EED0000000000000000003E /* Release */ = {
+		5EED0000000000000000003C /* Release */ = {
 			isa = XCBuildConfiguration;
-			baseConfigurationReference = 5EED00000000000000000021 /* xcconfigs */;
+			baseConfigurationReference = 5EED00000000000000000020 /* xcconfigs */;
 			baseConfigurationReferenceRelativePath = "Global.xcconfig";
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
@@ -599,9 +602,9 @@
 			};
 			name = "Release";
 		};
-		5EED0000000000000000003F /* Debug */ = {
+		5EED0000000000000000003D /* Debug */ = {
 			isa = XCBuildConfiguration;
-			baseConfigurationReference = 5EED00000000000000000021 /* xcconfigs */;
+			baseConfigurationReference = 5EED00000000000000000020 /* xcconfigs */;
 			baseConfigurationReferenceRelativePath = "SealBox.xcconfig";
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
@@ -610,7 +613,6 @@
 				CODE_SIGN_ENTITLEMENTS = entitlements.xml;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = "$(DEVELOPMENT_TEAM)";
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",
 					"$(PROJECT_DIR)/OpenSSL/Frameworks/iphoneos",
@@ -634,7 +636,6 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 0.1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "$(PRODUCT_BUNDLE_IDENTIFIER)";
 				PRODUCT_NAME = SealBox;
 				SWIFT_EMIT_LOC_STRINGS = NO;
 				SWIFT_OBJC_BRIDGING_HEADER = Sources/SealboxApp/SB-Bridging-Header.h;
@@ -644,9 +645,9 @@
 			};
 			name = "Debug";
 		};
-		5EED00000000000000000040 /* Release */ = {
+		5EED0000000000000000003E /* Release */ = {
 			isa = XCBuildConfiguration;
-			baseConfigurationReference = 5EED00000000000000000021 /* xcconfigs */;
+			baseConfigurationReference = 5EED00000000000000000020 /* xcconfigs */;
 			baseConfigurationReferenceRelativePath = "SealBox.xcconfig";
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
@@ -655,7 +656,6 @@
 				CODE_SIGN_ENTITLEMENTS = entitlements.xml;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = "$(DEVELOPMENT_TEAM)";
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",
 					"$(PROJECT_DIR)/OpenSSL/Frameworks/iphoneos",
@@ -679,7 +679,6 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 0.1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "$(PRODUCT_BUNDLE_IDENTIFIER)";
 				PRODUCT_NAME = SealBox;
 				SWIFT_EMIT_LOC_STRINGS = NO;
 				SWIFT_OBJC_BRIDGING_HEADER = Sources/SealboxApp/SB-Bridging-Header.h;
@@ -689,13 +688,12 @@
 			};
 			name = "Release";
 		};
-		5EED00000000000000000041 /* Debug */ = {
+		5EED0000000000000000003F /* Debug */ = {
 			isa = XCBuildConfiguration;
-			baseConfigurationReference = 5EED00000000000000000021 /* xcconfigs */;
+			baseConfigurationReference = 5EED00000000000000000020 /* xcconfigs */;
 			baseConfigurationReferenceRelativePath = "ZSign.xcconfig";
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
-				DEVELOPMENT_TEAM = "$(DEVELOPMENT_TEAM)";
 				DYLIB_COMPATIBILITY_VERSION = 1;
 				DYLIB_CURRENT_VERSION = 1;
 				DYLIB_INSTALL_NAME_BASE = "@rpath";
@@ -713,6 +711,58 @@
 					"$(inherited)",
 					"$(PROJECT_DIR)/OpenSSL/Frameworks/OpenSSL.xcframework/ios-arm64/OpenSSL.framework/Headers",
 					"$(PROJECT_DIR)/OpenSSL/Frameworks/iphoneos/OpenSSL.framework/Headers",
+				);
+				PRODUCT_NAME = "$(TARGET_NAME)";
+			};
+			name = "Debug";
+		};
+		5EED00000000000000000040 /* Release */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = 5EED00000000000000000020 /* xcconfigs */;
+			baseConfigurationReferenceRelativePath = "ZSign.xcconfig";
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				DYLIB_COMPATIBILITY_VERSION = 1;
+				DYLIB_CURRENT_VERSION = 1;
+				DYLIB_INSTALL_NAME_BASE = "@rpath";
+				EXECUTABLE_PREFIX = "";
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				SDKROOT = iphoneos;
+				SKIP_INSTALL = YES;
+				SUPPORTS_MACCATALYST = NO;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(PROJECT_DIR)/OpenSSL/Frameworks/iphoneos",
+				);
+				HEADER_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(PROJECT_DIR)/OpenSSL/Frameworks/OpenSSL.xcframework/ios-arm64/OpenSSL.framework/Headers",
+					"$(PROJECT_DIR)/OpenSSL/Frameworks/iphoneos/OpenSSL.framework/Headers",
+				);
+				PRODUCT_NAME = "$(TARGET_NAME)";
+			};
+			name = "Release";
+		};
+		5EED00000000000000000041 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = 5EED00000000000000000020 /* xcconfigs */;
+			baseConfigurationReferenceRelativePath = "SBGuestHooks.xcconfig";
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				DYLIB_COMPATIBILITY_VERSION = 1;
+				DYLIB_CURRENT_VERSION = 1;
+				DYLIB_INSTALL_NAME_BASE = "@rpath";
+				EXECUTABLE_PREFIX = "";
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				SDKROOT = iphoneos;
+				SKIP_INSTALL = YES;
+				SUPPORTS_MACCATALYST = NO;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				HEADER_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(PROJECT_DIR)/litehook/src",
+					"$(PROJECT_DIR)/litehook/external/include",
 				);
 				PRODUCT_NAME = "$(TARGET_NAME)";
 			};
@@ -720,65 +770,10 @@
 		};
 		5EED00000000000000000042 /* Release */ = {
 			isa = XCBuildConfiguration;
-			baseConfigurationReference = 5EED00000000000000000021 /* xcconfigs */;
-			baseConfigurationReferenceRelativePath = "ZSign.xcconfig";
-			buildSettings = {
-				CODE_SIGN_STYLE = Automatic;
-				DEVELOPMENT_TEAM = "$(DEVELOPMENT_TEAM)";
-				DYLIB_COMPATIBILITY_VERSION = 1;
-				DYLIB_CURRENT_VERSION = 1;
-				DYLIB_INSTALL_NAME_BASE = "@rpath";
-				EXECUTABLE_PREFIX = "";
-				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
-				SDKROOT = iphoneos;
-				SKIP_INSTALL = YES;
-				SUPPORTS_MACCATALYST = NO;
-				TARGETED_DEVICE_FAMILY = "1,2";
-				FRAMEWORK_SEARCH_PATHS = (
-					"$(inherited)",
-					"$(PROJECT_DIR)/OpenSSL/Frameworks/iphoneos",
-				);
-				HEADER_SEARCH_PATHS = (
-					"$(inherited)",
-					"$(PROJECT_DIR)/OpenSSL/Frameworks/OpenSSL.xcframework/ios-arm64/OpenSSL.framework/Headers",
-					"$(PROJECT_DIR)/OpenSSL/Frameworks/iphoneos/OpenSSL.framework/Headers",
-				);
-				PRODUCT_NAME = "$(TARGET_NAME)";
-			};
-			name = "Release";
-		};
-		5EED00000000000000000043 /* Debug */ = {
-			isa = XCBuildConfiguration;
-			baseConfigurationReference = 5EED00000000000000000021 /* xcconfigs */;
+			baseConfigurationReference = 5EED00000000000000000020 /* xcconfigs */;
 			baseConfigurationReferenceRelativePath = "SBGuestHooks.xcconfig";
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
-				DEVELOPMENT_TEAM = "$(DEVELOPMENT_TEAM)";
-				DYLIB_COMPATIBILITY_VERSION = 1;
-				DYLIB_CURRENT_VERSION = 1;
-				DYLIB_INSTALL_NAME_BASE = "@rpath";
-				EXECUTABLE_PREFIX = "";
-				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
-				SDKROOT = iphoneos;
-				SKIP_INSTALL = YES;
-				SUPPORTS_MACCATALYST = NO;
-				TARGETED_DEVICE_FAMILY = "1,2";
-				HEADER_SEARCH_PATHS = (
-					"$(inherited)",
-					"$(PROJECT_DIR)/litehook/src",
-					"$(PROJECT_DIR)/litehook/external/include",
-				);
-				PRODUCT_NAME = "$(TARGET_NAME)";
-			};
-			name = "Debug";
-		};
-		5EED00000000000000000044 /* Release */ = {
-			isa = XCBuildConfiguration;
-			baseConfigurationReference = 5EED00000000000000000021 /* xcconfigs */;
-			baseConfigurationReferenceRelativePath = "SBGuestHooks.xcconfig";
-			buildSettings = {
-				CODE_SIGN_STYLE = Automatic;
-				DEVELOPMENT_TEAM = "$(DEVELOPMENT_TEAM)";
 				DYLIB_COMPATIBILITY_VERSION = 1;
 				DYLIB_CURRENT_VERSION = 1;
 				DYLIB_INSTALL_NAME_BASE = "@rpath";
@@ -799,27 +794,27 @@
 		};
 /* End XCBuildConfiguration section */
 /* Begin XCConfigurationList section */
-		5EED00000000000000000045 /* Build configuration list for PBXProject "SealBox" */ = {
+		5EED00000000000000000043 /* Build configuration list for PBXProject "SealBox" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (5EED0000000000000000003B /* Debug */, 5EED0000000000000000003C /* Release */, );
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		5EED00000000000000000044 /* Build configuration list for PBXNativeTarget "SealBox" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (5EED0000000000000000003D /* Debug */, 5EED0000000000000000003E /* Release */, );
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
-		5EED00000000000000000046 /* Build configuration list for PBXNativeTarget "SealBox" */ = {
+		5EED00000000000000000045 /* Build configuration list for PBXNativeTarget "ZSign" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (5EED0000000000000000003F /* Debug */, 5EED00000000000000000040 /* Release */, );
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
-		5EED00000000000000000047 /* Build configuration list for PBXNativeTarget "ZSign" */ = {
+		5EED00000000000000000046 /* Build configuration list for PBXNativeTarget "SBGuestHooks" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (5EED00000000000000000041 /* Debug */, 5EED00000000000000000042 /* Release */, );
-			defaultConfigurationIsVisible = 0;
-			defaultConfigurationName = Release;
-		};
-		5EED00000000000000000048 /* Build configuration list for PBXNativeTarget "SBGuestHooks" */ = {
-			isa = XCConfigurationList;
-			buildConfigurations = (5EED00000000000000000043 /* Debug */, 5EED00000000000000000044 /* Release */, );
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
