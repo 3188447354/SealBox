@@ -56,14 +56,14 @@ struct HomeScreenView: View {
                 }
                 .padding(.horizontal, 26)
 
-                // Page dots.
+                Spacer()
+
+                // Page dots: iOS standard position, just above the Dock.
                 HStack(spacing: 8) {
                     Circle().fill(Color.white).frame(width: 7, height: 7)
                     Circle().fill(Color.white.opacity(0.4)).frame(width: 7, height: 7)
                 }
-                .padding(.top, 26)
-
-                Spacer()
+                .padding(.bottom, 12)
 
                 // Dock: four pure-visual system icons.
                 HStack(spacing: 0) {
