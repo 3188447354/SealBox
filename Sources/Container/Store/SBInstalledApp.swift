@@ -10,8 +10,14 @@ struct SBLaunchResult: Codable, Equatable {
 /// 已安装的客 App（元数据存在 App Group UserDefaults 的 SBInstalledApps 里；
 /// bundle 本体在 Documents/Applications/<bundleID>.app，数据容器在
 /// Documents/Data/Application/<containerUUID>/）。
+///
+/// 记录主键是 `recordID`（UUID），不是 Bundle ID：平行安装的两条同名记录必须
+/// 共存，0.1.0 用 Bundle ID 作 id 时桌面只显示首条（v1 已知限制）。
 struct SBInstalledApp: Codable, Identifiable, Equatable {
-    var id: String { bundleID }
+    /// 记录主键。旧记录（无此键）解码时现场生成一个新 UUID，不丢记录。
+    var recordID: UUID
+
+    var id: UUID { recordID }
 
     var bundleID: String
     var displayName: String
@@ -26,10 +32,19 @@ struct SBInstalledApp: Codable, Identifiable, Equatable {
     var needsJIT: Bool
     var lastLaunchResult: SBLaunchResult?
 
+    /// 安装时所用证书的 SHA-256 指纹（SecCertificateCopyData 后取 SHA-256 hex）；
+    /// 未签名安装时为 nil。证书更换后靠它判断是否需要重签（设计 §4.7）。
+    var signingCertFingerprint: String?
+
+    /// 迁移失败标记：旧记录重解析失败时建的占位记录，bundleID / executableName /
+    /// diskDirectoryName 均为空串（不编造），桌面显示灰色、点开只给重新导入 / 删除。
+    var needsReimport: Bool
+
     /// 磁盘上的 bundle 目录名。平行安装时加时间戳后缀，与 bundleID 区分。
     var diskDirectoryName: String
 
-    init(bundleID: String,
+    init(recordID: UUID = UUID(),
+         bundleID: String,
          displayName: String,
          version: String,
          shortVersion: String,
@@ -41,7 +56,10 @@ struct SBInstalledApp: Codable, Identifiable, Equatable {
          signed: Bool,
          needsJIT: Bool = false,
          lastLaunchResult: SBLaunchResult? = nil,
+         signingCertFingerprint: String? = nil,
+         needsReimport: Bool = false,
          diskDirectoryName: String? = nil) {
+        self.recordID = recordID
         self.bundleID = bundleID
         self.displayName = displayName
         self.version = version
@@ -54,7 +72,37 @@ struct SBInstalledApp: Codable, Identifiable, Equatable {
         self.signed = signed
         self.needsJIT = needsJIT
         self.lastLaunchResult = lastLaunchResult
+        self.signingCertFingerprint = signingCertFingerprint
+        self.needsReimport = needsReimport
         self.diskDirectoryName = diskDirectoryName ?? (bundleID + ".app")
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case recordID, bundleID, displayName, version, shortVersion
+        case executableName, containerUUID, keychainGroup, installedDate
+        case patchRevision, signed, needsJIT, lastLaunchResult
+        case signingCertFingerprint, needsReimport, diskDirectoryName
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        // 新字段用 decodeIfPresent 兜底：旧收据 / 旧记录没有这些键时不丢整条记录。
+        recordID = try container.decodeIfPresent(UUID.self, forKey: .recordID) ?? UUID()
+        bundleID = try container.decode(String.self, forKey: .bundleID)
+        displayName = try container.decode(String.self, forKey: .displayName)
+        version = try container.decode(String.self, forKey: .version)
+        shortVersion = try container.decode(String.self, forKey: .shortVersion)
+        executableName = try container.decode(String.self, forKey: .executableName)
+        containerUUID = try container.decode(String.self, forKey: .containerUUID)
+        keychainGroup = try container.decode(Int.self, forKey: .keychainGroup)
+        installedDate = try container.decode(Date.self, forKey: .installedDate)
+        patchRevision = try container.decode(Int.self, forKey: .patchRevision)
+        signed = try container.decode(Bool.self, forKey: .signed)
+        needsJIT = try container.decode(Bool.self, forKey: .needsJIT)
+        lastLaunchResult = try container.decodeIfPresent(SBLaunchResult.self, forKey: .lastLaunchResult)
+        signingCertFingerprint = try container.decodeIfPresent(String.self, forKey: .signingCertFingerprint)
+        needsReimport = try container.decodeIfPresent(Bool.self, forKey: .needsReimport) ?? false
+        diskDirectoryName = try container.decode(String.self, forKey: .diskDirectoryName)
     }
 
     var bundleURL: URL {

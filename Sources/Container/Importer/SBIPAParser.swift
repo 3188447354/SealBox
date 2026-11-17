@@ -93,8 +93,10 @@ public enum SBIPAParser {
                 throw SBError.noBundleID
             }
 
+            // 可执行名：CFBundleExecutable，无则用 Bundle ID 最后一段兜底（设计 §2.2）。
             let executableName = (plist["CFBundleExecutable"] as? String)
-                ?? appURL.deletingPathExtension().lastPathComponent
+                ?? bundleID.components(separatedBy: ".").last
+                ?? bundleID
 
             // 显示名三 fallback；三者都没有时用 Bundle ID 兜底，保证桌面总有名字可显示。
             let displayName = (plist["CFBundleDisplayName"] as? String)

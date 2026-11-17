@@ -99,8 +99,8 @@ final class SBAppCoordinator: ObservableObject {
             poll.cancel()
             await MainActor.run {
                 var order = SBStore.shared.desktopIconOrder
-                if !order.contains(record.bundleID) {
-                    order.append(record.bundleID)
+                if !order.contains(record.recordID.uuidString) {
+                    order.append(record.recordID.uuidString)
                     SBStore.shared.desktopIconOrder = order
                 }
                 SBStore.shared.loadInstalledApps()

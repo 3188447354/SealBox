@@ -1,6 +1,8 @@
 // SBInstaller.swift — 安装管线：拷包落位（80%）→ 打补丁 + 重签（20%）→ 登记入库。
 
+import CryptoKit
 import Foundation
+import Security
 
 /// 安装管线。
 ///
@@ -107,7 +109,10 @@ public enum SBInstaller {
             try Task.checkCancellation()
 
             // ---- 阶段二：重签（20% 的后一半）。失败不回滚，记未签名继续装。----
+            // 签名成功时记当前证书的 SHA-256 指纹（证书更换后靠它判断是否需要
+            // 重签，设计 §4.7）；证书不可读时记 nil，不阻塞安装；未签名记 nil。
             var signed = false
+            var signingCertFingerprint: String? = nil
             if let certData = certificateData(),
                let password = certificatePassword(),
                !password.isEmpty {
@@ -120,6 +125,7 @@ public enum SBInstaller {
                         progress: patchProgress
                     )
                     signed = true
+                    signingCertFingerprint = certificateFingerprint(certData: certData, password: password)
                 } catch {
                     // 验收 C5：签名失败也照样装，详情页标「未签名 / JIT 启动」。
                     signed = false
@@ -156,7 +162,10 @@ public enum SBInstaller {
             let keychainGroup = existing?.keychainGroup ?? allocateKeychainGroup()
 
             // ---- 登记入库 ----
+            // 替换复用旧记录的 recordID（upsert 按 recordID 匹配，原位更新）；
+            // 平行 / 全新安装用新 UUID（两条同名记录共存）。
             let record = SBInstalledApp(
+                recordID: existing?.recordID ?? UUID(),
                 bundleID: parsed.bundleID,
                 displayName: parsed.displayName,
                 version: parsed.version,
@@ -169,20 +178,10 @@ public enum SBInstaller {
                 signed: signed,
                 needsJIT: false,
                 lastLaunchResult: nil,
+                signingCertFingerprint: signingCertFingerprint,
                 diskDirectoryName: destinationDir.lastPathComponent
             )
-            var apps = SBStore.shared.loadInstalledApps()
-            if let index = apps.firstIndex(where: { $0.bundleID == parsed.bundleID }) {
-                if isReplace {
-                    apps[index] = record
-                } else {
-                    // 平行安装：Bundle ID 相同，追加一条记录（见 MODULE_NOTES 的缺口说明）。
-                    apps.append(record)
-                }
-            } else {
-                apps.append(record)
-            }
-            SBStore.shared.saveInstalledApps(apps)
+            SBStore.shared.upsertApp(record)
 
             // ---- 收尾：清替换备份（临时目录由函数入口的 defer 清理） ----
             if let backupDir = backupDir {
@@ -267,9 +266,31 @@ public enum SBInstaller {
         return try? Data(contentsOf: container.appendingPathComponent("Certificate.p12"))
     }
 
-    /// 证书密码存在 App Group UserDefaults 的 SBCertificatePassword 键下。
+    /// 证书密码改存系统钥匙串（SBKeychain），不再读 App Group UserDefaults 明文。
+    /// 步骤 5 的 SBCertificate 导入会把密码写进同一钥匙串。
     private static func certificatePassword() -> String? {
-        SBStore.shared.defaults.string(forKey: "SBCertificatePassword")
+        SBKeychain.read()
+    }
+
+    /// 取 p12 里首个身份的证书，做 SecCertificateCopyData 后取 SHA-256 hex。
+    /// 证书不可读（口令错、p12 损坏等）时返回 nil，不阻塞安装。
+    private static func certificateFingerprint(certData: Data, password: String) -> String? {
+        var items: CFArray?
+        let options: [String: Any] = [kSecImportExportPassphrase as String: password]
+        guard SecPKCS12Import(certData as CFData, options as CFDictionary, &items) == errSecSuccess,
+              let array = items as? [[String: Any]],
+              let identityDict = array.first,
+              let identity = identityDict[kSecImportItemIdentity as String] as? SecIdentity else {
+            return nil
+        }
+        var certificate: SecCertificate?
+        guard SecIdentityCopyCertificate(identity, &certificate) == errSecSuccess,
+              let certificate = certificate else {
+            return nil
+        }
+        let derData = SecCertificateCopyData(certificate) as Data
+        let digest = SHA256.hash(data: derData)
+        return digest.map { String(format: "%02x", $0) }.joined()
     }
 
     /// 调 ObjC++ 包装 `SBSigner` 对整个 .app 重签；失败抛 `SBError.signFailed`。

@@ -28,7 +28,7 @@ enum SBAppDeletion {
         }
 
         deleteKeychainItems(group: SBConstants.keychainGroupName(for: app.keychainGroup))
-        SBStore.shared.removeAppRecord(bundleID: app.bundleID)
+        SBStore.shared.removeAppRecord(recordID: app.recordID)
 
         if let firstError = firstError {
             throw firstError
