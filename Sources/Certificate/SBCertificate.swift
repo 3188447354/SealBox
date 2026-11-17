@@ -130,7 +130,7 @@ public enum SBCertificate {
     public static func importP12(presenter: UIViewController) async throws {
         let pickedURL = try await pickP12(presenter: presenter)
         guard let destination = certificateFileURL else {
-            throw SBError.generic(stage: "导入证书", message: "取不到应用共享目录，请重试")
+            throw SBError.generic(stage: "导入证书", message: "取不到应用共享目录：App Group 权限缺失，属签名问题，重装也解决不了")
         }
         guard let data = try? Data(contentsOf: pickedURL) else {
             throw SBError.generic(stage: "导入证书", message: "读不到所选证书文件，请重试")
@@ -186,13 +186,19 @@ public enum SBCertificate {
 
     // MARK: - 启动链自测（F1）
 
-    /// 启动链自测：先过证书门，再调 SBGuestLoader 自测入口。
+    /// 启动链自测：先查应用共享目录（App Group 权限缺失时当场报，不走到证书门），
+    /// 再过证书门，再调 SBGuestLoader 自测入口。
     /// 自测内部用信号量等 ZSign 回调，必须在后台线程跑，本方法已把调用派到全局队列，
     /// 调用方在主线程调本方法即可。
     /// - Returns: 成功 `.success(())`；失败 `.failure(SBError)`，其中证书门失败为
     ///   `.missingCertificate` / `.certificateDeleted`，其余为
     ///   `.selfTestFailed(stage:reason:)`，stage 取自测返回的中文阶段名。
     static func runChainSelfTest() async -> Result<Void, SBError> {
+        guard SBConstants.appGroupContainerURL != nil else {
+            return .failure(.selfTestFailed(
+                stage: "应用共享目录",
+                reason: "App Group 权限缺失，取不到应用共享目录，属签名问题，重装也解决不了"))
+        }
         if let gateError = certificateGateError() {
             return .failure(gateError)
         }

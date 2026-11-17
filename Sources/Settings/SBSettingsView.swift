@@ -110,7 +110,9 @@ public struct SBSettingsView: View {
             Button(isSelfTesting ? "自测中…" : "启动链自测") {
                 runSelfTest()
             }
-            .disabled(isSelfTesting || !hasCertificateFlag)
+            // 无证书时默认禁用；但应用共享目录取不到时放行——此时一定无证书，
+            // 放行才能让自测当场报出 App Group 权限缺失，而不是什么都不让点。
+            .disabled(isSelfTesting || (!hasCertificateFlag && SBConstants.appGroupContainerURL != nil))
         }
     }
 

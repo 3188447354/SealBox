@@ -3,8 +3,10 @@
 //  Sealbox
 //
 
-// 开发团队占位符：CI 以 CODE_SIGNING_ALLOWED=NO 构建，不实际签名；
-// 真机侧载时由 Seal / SideStore / AltStore 以用户自己的团队重签。
+// 开发团队占位符：CI 以临时身份（CODE_SIGN_IDENTITY="-"）做 ad-hoc 签名并嵌
+// entitlements.xml（主 App target 的 CODE_SIGN_ENTITLEMENTS）；真机侧载时由
+// Seal / SideStore / AltStore 以用户自己的团队重签，entitlements 以描述文件
+// 派生的为准。
 DEVELOPMENT_TEAM[config=Debug] = AAAAA11111
 DEVELOPMENT_TEAM[config=Release] = AAAAA11111
 
