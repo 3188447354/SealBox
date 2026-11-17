@@ -1,10 +1,10 @@
 //
 //  Global.xcconfig
-//  LiveContainer
-//
-//  Created by Duy Tran on 2025/5/24.
+//  Sealbox
 //
 
+// 开发团队占位符：CI 以 CODE_SIGNING_ALLOWED=NO 构建，不实际签名；
+// 真机侧载时由 Seal / SideStore / AltStore 以用户自己的团队重签。
 DEVELOPMENT_TEAM[config=Debug] = AAAAA11111
 DEVELOPMENT_TEAM[config=Release] = AAAAA11111
 
@@ -12,4 +12,4 @@ DEVELOPMENT_TEAM_SUFFIX[config=Debug] = .$(DEVELOPMENT_TEAM)
 DEVELOPMENT_TEAM_SUFFIX[config=Release] =
 
 APP_GROUP_SEALBOX = group.com.mjorb.sealbox$(DEVELOPMENT_TEAM_SUFFIX)
-LIVECONTAINER_BUNDLE_IDENTIFIER = com.mjorb.sealbox$(DEVELOPMENT_TEAM_SUFFIX)
+SEALBOX_BUNDLE_IDENTIFIER = com.mjorb.sealbox$(DEVELOPMENT_TEAM_SUFFIX)

@@ -1,0 +1,6 @@
+//
+//  SBGuestHooks.xcconfig
+//  Sealbox
+//
+
+#include "Global.xcconfig"

@@ -1,0 +1,8 @@
+//
+//  SealBox.xcconfig
+//  Sealbox
+//
+
+#include "Global.xcconfig"
+
+PRODUCT_BUNDLE_IDENTIFIER = $(SEALBOX_BUNDLE_IDENTIFIER)
