@@ -1,7 +1,7 @@
 import Foundation
 
 /// 一次启动的结果（成功或失败），记在详情页“上次启动结果”里。
-struct SBLaunchResult: Codable {
+struct SBLaunchResult: Codable, Equatable {
     var success: Bool
     var date: Date
     var message: String
