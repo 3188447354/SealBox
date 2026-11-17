@@ -15,9 +15,37 @@
             buildForAnalyzing = "YES">
             <BuildableReference
                BuildableIdentifier = "primary"
-               BlueprintIdentifier = "9A1B00000000000000000013"
+               BlueprintIdentifier = "5EED0000000000000000004A"
                BuildableName = "SealBox.app"
                BlueprintName = "SealBox"
+               ReferencedContainer = "container:SealBox.xcodeproj">
+            </BuildableReference>
+         </BuildActionEntry>
+         <BuildActionEntry
+            buildForTesting = "YES"
+            buildForRunning = "YES"
+            buildForProfiling = "YES"
+            buildForArchiving = "YES"
+            buildForAnalyzing = "YES">
+            <BuildableReference
+               BuildableIdentifier = "primary"
+               BlueprintIdentifier = "5EED0000000000000000004B"
+               BuildableName = "ZSign.dylib"
+               BlueprintName = "ZSign"
+               ReferencedContainer = "container:SealBox.xcodeproj">
+            </BuildableReference>
+         </BuildActionEntry>
+         <BuildActionEntry
+            buildForTesting = "YES"
+            buildForRunning = "YES"
+            buildForProfiling = "YES"
+            buildForArchiving = "YES"
+            buildForAnalyzing = "YES">
+            <BuildableReference
+               BuildableIdentifier = "primary"
+               BlueprintIdentifier = "5EED0000000000000000004C"
+               BuildableName = "SBGuestHooks.dylib"
+               BlueprintName = "SBGuestHooks"
                ReferencedContainer = "container:SealBox.xcodeproj">
             </BuildableReference>
          </BuildActionEntry>
@@ -46,7 +74,7 @@
          runnableDebuggingMode = "0">
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "9A1B00000000000000000013"
+            BlueprintIdentifier = "5EED0000000000000000004A"
             BuildableName = "SealBox.app"
             BlueprintName = "SealBox"
             ReferencedContainer = "container:SealBox.xcodeproj">
@@ -63,7 +91,7 @@
          runnableDebuggingMode = "0">
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "9A1B00000000000000000013"
+            BlueprintIdentifier = "5EED0000000000000000004A"
             BuildableName = "SealBox.app"
             BlueprintName = "SealBox"
             ReferencedContainer = "container:SealBox.xcodeproj">

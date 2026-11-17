@@ -1,0 +1,247 @@
+#!/usr/bin/env python3
+"""Generate the 3-target SealBox.xcodeproj/project.pbxproj + shared scheme.
+
+Mechanism: scripted transformation of the proven 0.1.1 base
+(commit 087f0661, "Sealbox 0.1.1 (part 1/2)"), which already went through
+full CI green with three targets (SealBox app + ZSign dylib + SBGuestHooks
+dylib). The base is read from git history, so regenerating is deterministic;
+the output is the committed pbxproj, not a second source of truth.
+
+Transformations applied to the base (0.2.0 step 1: container skeleton):
+  1. Container modules move Sources/<module> -> Sources/Container/<module>
+     (Shared, Store, Importer, Installer, GuestLoader, GuestHooks,
+     Certificate). This renames the 7 sync-group paths and the app target's
+     HEADER_SEARCH_PATHS entries for GuestLoader/Installer. ZSign and
+     SBGuestHooks target configs contain neither path, so they are untouched.
+  2. Desktop and Settings sync groups are deleted entirely (the 0.1.7 shell
+     owns its own home screen / settings UI) with every reference to them.
+  3. IPHONEOS_DEPLOYMENT_TARGET 15.0 -> 16.0 (project + all 3 targets,
+     Debug + Release).
+  4. App target: MARKETING_VERSION 0.2.0, CURRENT_PROJECT_VERSION 9,
+     INFOPLIST_KEY_CFBundleDisplayName "虚拟机" (quoted, as the shell had
+     it), iPhone orientations back to portrait-only
+     (the 0.1.1 base allowed iPhone landscape; the shell does not).
+  5. Scheme: the 0.1.1 scheme verbatim (3 BuildActionEntries); its
+     BlueprintIdentifiers must match the target IDs in the new pbxproj.
+
+Kept exactly as the base: Security.framework in the app and SBGuestHooks
+Frameworks phases; Embed Frameworks (ZSign.dylib, SBGuestHooks.dylib,
+OpenSSL.xcframework); target dependencies; DYLIB_INSTALL_NAME_BASE =
+"@rpath" (quoted); xcconfigs via baseConfigurationReferenceAnchor +
+RelativePath (a bare baseConfigurationReference is silently ignored and
+must never appear); litehook sync group covering litehook/src only;
+OpenSSL.xcframework at OpenSSL/Frameworks/OpenSSL.xcframework.
+
+Self-checks (fail loudly, write nothing on failure):
+  - every referenced 24-hex object ID exists as a definition;
+  - no bare baseConfigurationReference;
+  - no Desktop/Settings residue;
+  - the xcconfigs anchor exists and every sync-group path exists on disk
+    or is a known submodule path (litehook/src, fetched by CI);
+  - scheme BlueprintIdentifiers exist in the pbxproj;
+  - version / deployment-target / display-name / orientation markers.
+
+Run: python3 gen-pbxproj.py  (writes project.pbxproj + SealBox.xcscheme)
+"""
+import os
+import re
+import subprocess
+import sys
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+BASE_COMMIT = "087f0661"
+PBXPROJ = os.path.join(ROOT, "SealBox.xcodeproj", "project.pbxproj")
+SCHEME = os.path.join(
+    ROOT, "SealBox.xcodeproj", "xcshareddata", "xcschemes", "SealBox.xcscheme")
+
+# 24-hex object IDs of the sync groups that move under Sources/Container/.
+MOVED_MODULES = ("Shared", "Store", "Importer", "Installer",
+                 "GuestLoader", "GuestHooks", "Certificate")
+# Sync-group object IDs removed with the Desktop/Settings groups.
+REMOVED_GROUPS = {
+    "5EED0000000000000000001D": "Desktop",
+    "5EED0000000000000000001E": "Settings",
+}
+# App target XCBuildConfiguration object IDs (Debug, Release).
+APP_CONFIGS = ("5EED00000000000000000040", "5EED00000000000000000041")
+# Paths provided by CI-cloned submodules, not present in a plain checkout.
+SUBMODULE_PATHS = {"litehook/src"}
+# The xcconfigs sync group, used as baseConfigurationReferenceAnchor.
+XCCONFIGS_ANCHOR = "5EED00000000000000000021"
+
+
+def git_show(path):
+    out = subprocess.run(
+        ["git", "show", "%s:%s" % (BASE_COMMIT, path)],
+        cwd=ROOT, capture_output=True, text=True, check=False)
+    if out.returncode != 0:
+        sys.exit("gen-pbxproj: cannot read %s from %s: %s"
+                 % (path, BASE_COMMIT, out.stderr.strip()))
+    return out.stdout
+
+
+def replace_once(text, old, new, where):
+    n = text.count(old)
+    if n != 1:
+        sys.exit("gen-pbxproj: expected 1 occurrence of %r in %s, found %d"
+                 % (old, where, n))
+    return text.replace(old, new)
+
+
+def transform_pbxproj(base):
+    text = base
+
+    # 1. Container module paths (sync groups + app HEADER_SEARCH_PATHS).
+    for mod in MOVED_MODULES:
+        old = "Sources/%s" % mod
+        new = "Sources/Container/%s" % mod
+        n = text.count(old)
+        if n < 1:
+            sys.exit("gen-pbxproj: %r not found in base pbxproj" % old)
+        text = text.replace(old, new)
+
+    # 2. Delete the Desktop / Settings sync-group objects wholesale.
+    for gid, name in REMOVED_GROUPS.items():
+        pat = re.compile(
+            r"\t\t%s /\* %s \*/ = \{.*?\n\t\t\};\n" % (gid, name),
+            re.DOTALL)
+        text, n = pat.subn("", text)
+        if n != 1:
+            sys.exit("gen-pbxproj: expected 1 %s sync-group block, removed %d"
+                     % (name, n))
+        # Every reference to the group ("<id> /* <name> */, ") must go.
+        ref = "%s /* %s */, " % (gid, name)
+        if ref not in text:
+            sys.exit("gen-pbxproj: no reference left to remove for %s" % name)
+        text = text.replace(ref, "")
+
+    # 3. Deployment target 15.0 -> 16.0 (project + 3 targets x Debug/Release).
+    n = text.count("IPHONEOS_DEPLOYMENT_TARGET = 15.0;")
+    if n != 8:
+        sys.exit("gen-pbxproj: expected 8 deployment-target lines, found %d"
+                 % n)
+    text = text.replace("IPHONEOS_DEPLOYMENT_TARGET = 15.0;",
+                        "IPHONEOS_DEPLOYMENT_TARGET = 16.0;")
+
+    # 4. App target build settings (Debug + Release blocks only).
+    for cfg in APP_CONFIGS:
+        start = text.find("\t\t%s /* " % cfg)
+        if start < 0:
+            sys.exit("gen-pbxproj: app config %s not found" % cfg)
+        end = text.find("\n\t\t};", start)
+        if end < 0:
+            sys.exit("gen-pbxproj: app config %s has no end" % cfg)
+        end += len("\n\t\t};")
+        block = text[start:end]
+        block = replace_once(block, "MARKETING_VERSION = 0.1.1;",
+                             "MARKETING_VERSION = 0.2.0;", cfg)
+        block = replace_once(block, "CURRENT_PROJECT_VERSION = 2;",
+                             "CURRENT_PROJECT_VERSION = 9;", cfg)
+        block = replace_once(block,
+                             "INFOPLIST_KEY_CFBundleDisplayName = Sealbox;",
+                             "INFOPLIST_KEY_CFBundleDisplayName = \"虚拟机\";",
+                             cfg)
+        block = replace_once(
+            block,
+            "INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "
+            "\"UIInterfaceOrientationPortrait "
+            "UIInterfaceOrientationLandscapeLeft "
+            "UIInterfaceOrientationLandscapeRight\";",
+            "INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "
+            "UIInterfaceOrientationPortrait;",
+            cfg)
+        text = text[:start] + block + text[end:]
+
+    return text
+
+
+def self_check(pbxproj, scheme):
+    errors = []
+
+    # Every referenced 24-hex ID exists as an object definition.
+    defined = set(re.findall(r"\n\t\t([0-9A-F]{24}) /\*", pbxproj))
+    referenced = set(re.findall(r"\b([0-9A-F]{24})\b", pbxproj))
+    missing = sorted(referenced - defined)
+    if missing:
+        errors.append("referenced IDs with no definition: %s" % missing)
+
+    # No bare baseConfigurationReference (must be Anchor + RelativePath).
+    if re.search(r"baseConfigurationReference\s*=", pbxproj):
+        errors.append("bare baseConfigurationReference present")
+    if pbxproj.count("baseConfigurationReferenceAnchor") != 8:
+        errors.append("expected 8 baseConfigurationReferenceAnchor lines, "
+                      "found %d"
+                      % pbxproj.count("baseConfigurationReferenceAnchor"))
+    if XCCONFIGS_ANCHOR not in defined:
+        errors.append("xcconfigs anchor %s missing" % XCCONFIGS_ANCHOR)
+
+    # No Desktop / Settings residue (word-boundary: "buildSettings" is fine).
+    for word in ("Desktop", "Settings"):
+        if re.search(r"\b%s\b" % word, pbxproj):
+            errors.append("residue: %r still in pbxproj" % word)
+
+    # Sync-group paths exist on disk or are known submodule paths.
+    for m in re.finditer(
+            r"isa = PBXFileSystemSynchronizedRootGroup;\n"
+            r"(?:.*\n)*?\t\t\tpath = \"([^\"]+)\";", pbxproj):
+        p = m.group(1)
+        if p in SUBMODULE_PATHS:
+            continue
+        if not os.path.exists(os.path.join(ROOT, p)):
+            errors.append("sync-group path missing on disk: %s" % p)
+
+    # Quoted DYLIB_INSTALL_NAME_BASE kept (4x: ZSign + Hooks, Dbg + Rel).
+    if pbxproj.count('DYLIB_INSTALL_NAME_BASE = "@rpath";') != 4:
+        errors.append("DYLIB_INSTALL_NAME_BASE quoted form not x4")
+
+    # Version / target markers.
+    if pbxproj.count("MARKETING_VERSION = 0.2.0;") != 2:
+        errors.append("MARKETING_VERSION 0.2.0 not in both app configs")
+    if pbxproj.count("CURRENT_PROJECT_VERSION = 9;") != 2:
+        errors.append("CURRENT_PROJECT_VERSION 9 not in both app configs")
+    if pbxproj.count("IPHONEOS_DEPLOYMENT_TARGET = 16.0;") != 8:
+        errors.append("deployment target 16.0 not x8")
+    if "IPHONEOS_DEPLOYMENT_TARGET = 15.0;" in pbxproj:
+        errors.append("stale deployment target 15.0 remains")
+    if pbxproj.count('INFOPLIST_KEY_CFBundleDisplayName = "虚拟机";') != 2:
+        errors.append("display name not 虚拟机 in both app configs")
+
+    # Scheme BlueprintIdentifiers exist in the pbxproj.
+    for bid in re.findall(r'BlueprintIdentifier = "([0-9A-F]{24})"', scheme):
+        if bid not in defined:
+            errors.append("scheme BlueprintIdentifier %s not in pbxproj"
+                          % bid)
+    if scheme.count("<BuildActionEntry") != 3:
+        errors.append("scheme must have 3 BuildActionEntries")
+
+    # ZSign / SBGuestHooks target configs must not contain Container paths.
+    for cfg in ("5EED00000000000000000042", "5EED00000000000000000043",
+                "5EED00000000000000000044", "5EED00000000000000000045"):
+        start = pbxproj.find("\t\t%s /* " % cfg)
+        end = pbxproj.find("\n\t\t};", start)
+        if "Sources/Container" in pbxproj[start:end]:
+            errors.append("Container path leaked into %s config" % cfg)
+
+    if errors:
+        for e in errors:
+            print("gen-pbxproj SELF-CHECK FAILED: %s" % e, file=sys.stderr)
+        sys.exit(1)
+
+
+def main():
+    base_pbx = git_show("SealBox.xcodeproj/project.pbxproj")
+    base_scheme = git_show(
+        "SealBox.xcodeproj/xcshareddata/xcschemes/SealBox.xcscheme")
+    pbxproj = transform_pbxproj(base_pbx)
+    self_check(pbxproj, base_scheme)
+    with open(PBXPROJ, "w", encoding="utf-8") as fh:
+        fh.write(pbxproj)
+    with open(SCHEME, "w", encoding="utf-8") as fh:
+        fh.write(base_scheme)
+    print("wrote %s" % PBXPROJ)
+    print("wrote %s" % SCHEME)
+    print("self-check passed")
+
+
+if __name__ == "__main__":
+    main()
