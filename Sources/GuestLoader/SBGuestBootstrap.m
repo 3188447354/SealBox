@@ -87,7 +87,7 @@ static const NSInteger SBKeychainGroupCount = 128;
                            message:@"找不到客 App 可执行文件，请重新安装"
                           recovery:@"重新导入该应用"];
     }
-    if ([SBGuestEntry is32BitMachOAtPath:guestExecPath]) {
+    if (is32BitMachOAtPath(guestExecPath)) {
         return [self failWithError:error
                               code:SBGuestLoaderErrorUnsupportedBinary
                            message:@"该应用是 32 位应用，需要 JIT 才能运行"
