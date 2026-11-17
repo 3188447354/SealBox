@@ -15,7 +15,7 @@
             buildForAnalyzing = "YES">
             <BuildableReference
                BuildableIdentifier = "primary"
-               BlueprintIdentifier = "5EED00000000000000000049"
+               BlueprintIdentifier = "5EED00000000000000000047"
                BuildableName = "SealBox.app"
                BlueprintName = "SealBox"
                ReferencedContainer = "container:SealBox.xcodeproj">
@@ -29,7 +29,7 @@
             buildForAnalyzing = "YES">
             <BuildableReference
                BuildableIdentifier = "primary"
-               BlueprintIdentifier = "5EED0000000000000000004A"
+               BlueprintIdentifier = "5EED00000000000000000048"
                BuildableName = "ZSign.dylib"
                BlueprintName = "ZSign"
                ReferencedContainer = "container:SealBox.xcodeproj">
@@ -43,7 +43,7 @@
             buildForAnalyzing = "YES">
             <BuildableReference
                BuildableIdentifier = "primary"
-               BlueprintIdentifier = "5EED0000000000000000004B"
+               BlueprintIdentifier = "5EED00000000000000000049"
                BuildableName = "SBGuestHooks.dylib"
                BlueprintName = "SBGuestHooks"
                ReferencedContainer = "container:SealBox.xcodeproj">
@@ -74,7 +74,7 @@
          runnableDebuggingMode = "0">
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "5EED00000000000000000049"
+            BlueprintIdentifier = "5EED00000000000000000047"
             BuildableName = "SealBox.app"
             BlueprintName = "SealBox"
             ReferencedContainer = "container:SealBox.xcodeproj">
@@ -91,7 +91,7 @@
          runnableDebuggingMode = "0">
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "5EED00000000000000000049"
+            BlueprintIdentifier = "5EED00000000000000000047"
             BuildableName = "SealBox.app"
             BlueprintName = "SealBox"
             ReferencedContainer = "container:SealBox.xcodeproj">
