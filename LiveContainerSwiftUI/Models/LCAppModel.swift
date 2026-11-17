@@ -7,12 +7,30 @@ protocol LCAppModelDelegate {
     func jitLaunch(withScript script: String, appName: String, classicMode: UInt) async
 }
 
+/// Launch failures that runApp can report to the desktop (spec C6).
+/// relaunchNoResponse is the 0.0.8 silent dead-end: the classic
+/// relaunch request is fire-and-forget, so a dropped request used
+/// to return normally and the tap looked like nothing happened.
+enum LaunchError: LocalizedError {
+    case relaunchNoResponse
+    var errorDescription: String? {
+        switch self {
+        case .relaunchNoResponse:
+            return "启动请求无响应：系统没有重启应用，请重试"
+        }
+    }
+}
+
 class LCAppModel: ObservableObject, Hashable {
     
     @Published var appInfo : LCAppInfo
     
     @Published var isAppRunning = false
     @Published var isSigningInProgress = false
+    /// Where the current launch is stuck (spec C6): set before each
+    /// stage so the watchdog can name the stage in its timeout alert
+    /// instead of a bare "启动超时". Read only on the main actor.
+    @MainActor var launchStage = ""
     @Published var signProgress = 0.0
     private var observer : NSKeyValueObservation?
     
@@ -277,6 +295,9 @@ class LCAppModel: ObservableObject, Hashable {
                 isAppRunning = false
             }}
         }
+        await MainActor.run {
+            launchStage = "正在签名"
+        }
         try await signApp(force: false)
         
         if let bundleIdOverride {
@@ -300,6 +321,9 @@ class LCAppModel: ObservableObject, Hashable {
             // Single-scene JIT flow: ask the external enabler for JIT,
             // then relaunch as the guest (InstallFlow.jitLaunch ends
             // in launchToGuestApp). No PID-based multitask path.
+            await MainActor.run {
+                launchStage = "正在请求 JIT 开启"
+            }
             if let scriptData = jitLaunchScriptJs, !scriptData.isEmpty {
                 await delegate?.jitLaunch(withScript: scriptData, appName: self.appInfo.displayName(), classicMode: classicMode)
             } else {
@@ -311,7 +335,21 @@ class LCAppModel: ObservableObject, Hashable {
                 let fileURL = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0].appendingPathComponent("preloadLibraries.txt")
                 try fileContents?.write(to: fileURL)
             }
+            await MainActor.run {
+                launchStage = "正在请求系统重启应用"
+            }
             LCSharedUtils.launchToGuestApp(withClassicMode: classicMode)
+            // 0.0.9 (spec C6): the relaunch request is fire-and-forget
+            // — the process is supposed to die (open completion ->
+            // SIGKILL) within about a second. If we are still alive
+            // after 5 s, SpringBoard dropped the request: throw instead
+            // of returning normally (0.0.8 did exactly that — tap,
+            // zoom, nothing). The JIT branch gets no such check:
+            // jitLaunch may legitimately return with the process alive
+            // (no enabler configured, user cancelled), and those paths
+            // already report themselves.
+            try await Task.sleep(nanoseconds: 5_000_000_000)
+            throw LaunchError.relaunchNoResponse
         }
         
         // Record the launch time
@@ -332,6 +370,7 @@ class LCAppModel: ObservableObject, Hashable {
     /// flag again — harmless.
     @MainActor func resetStuckLaunch() {
         isAppRunning = false
+        launchStage = ""
     }
 
     func forceResign() async throws {

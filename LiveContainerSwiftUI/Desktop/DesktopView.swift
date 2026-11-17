@@ -224,8 +224,13 @@ struct DesktopView: View {
                 }
             }
             // Icon-zoom opening (460 ms wait), then runApp.
-            if let icon, let origin = iconCenter(for: icon) {
+            // 0.0.9: the zoom is the tap receipt — always show it when
+            // an icon was tapped, even if the cell frame was never
+            // recorded (iconCenter nil); otherwise a tap with no frame
+            // looks exactly like a dead tap. Fall back to screen centre.
+            if let icon {
                 let screen = UIScreen.main.bounds
+                let origin = iconCenter(for: icon) ?? CGPoint(x: screen.width / 2, y: screen.height / 2)
                 let zoomIcon = icon.appModel?.appInfo.iconIsDarkIcon(false)
                 await MainActor.run {
                     zoomIconImage = zoomIcon
@@ -254,8 +259,11 @@ struct DesktopView: View {
                     // isAppRunning true forever, so every retry after
                     // this alert would die silently at runApp's top
                     // guard. Reset it so the next tap starts fresh.
+                    // 0.0.9 (spec C6): read the stage before resetting
+                    // it — the timeout alert names where the launch died.
+                    let stage = app.launchStage
                     app.resetStuckLaunch()
-                    alertMessage = "启动超时，请重试"
+                    alertMessage = stage.isEmpty ? "启动超时，请重试" : "启动超时（卡在：\(stage)），请重试"
                 }
             }
             do {
