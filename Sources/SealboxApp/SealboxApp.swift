@@ -156,6 +156,16 @@ struct VMRootView: View {
                     secondaryButton: .cancel(Text("留在软件源"))
                 )
             }
+            if let appToDelete = alert.deleteApp {
+                return Alert(
+                    title: Text(alert.title),
+                    message: Text(alert.message),
+                    primaryButton: .destructive(Text("删除该应用")) {
+                        coordinator.deleteApp(appToDelete)
+                    },
+                    secondaryButton: .cancel(Text("取消"))
+                )
+            }
             return Alert(
                 title: Text(alert.title),
                 message: Text(alert.message),

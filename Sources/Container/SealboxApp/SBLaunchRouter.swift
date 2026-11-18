@@ -32,10 +32,35 @@ enum SBLaunchRouter {
         }
     }
 
+    /// 0.2.9：启动时对账——记录在 App Group UserDefaults 里，包在宿主自己的
+    /// Documents 里，两边寿命不一样：宿主删了重装会换数据容器，包没了，记录
+    /// 还在（KYNS 真机实证：记录与收据都在 App Group 里活着，包在新容器
+    /// 里没有）。包不在的记录标 needsReimport——只标、不删：用户导入的包
+    /// 永不自动回收。标灰后点图标进详情页，给“重新安装 / 删除此应用”。
+    /// 安装只在包落位后才入库，所以启动时包不在即记录已失效，不存在误删。
+    static func reconcileInstalledAppsWithDisk() {
+        let apps = SBStore.shared.loadInstalledApps()
+        var updated = apps
+        var changed = false
+        for i in updated.indices {
+            let app = updated[i]
+            if app.needsReimport || app.diskDirectoryName.isEmpty { continue }
+            if !FileManager.default.fileExists(atPath: app.bundleURL.path) {
+                updated[i].needsReimport = true
+                changed = true
+                SBDiagLog.log("启动对账：\(app.bundleID) 包不在磁盘，标为需重新导入")
+            }
+        }
+        if changed {
+            SBStore.shared.saveInstalledApps(updated)
+        }
+    }
+
     /// App 启动时调用一次。若本次是“重起进客 App”，尝试加载客 App；
     /// 加载失败时清掉选中标记、留收据，回桌面弹错（由桌面在 appear 时按收据弹）。
     static func routeOnLaunchIfNeeded() {
         ensureGuestHooksDylib()
+        reconcileInstalledAppsWithDisk()
         guard SBGuestLoader.isGuestLaunchRequested() else {
             // 客已退出或闪退过：收据残留 guest-loaded 时静默清除，不弹错、不记失败，
             // 避免下次启动误判（设计 §5.5 的 guest-loaded 过期清理）。

@@ -14,6 +14,10 @@ final class SBAppCoordinator: ObservableObject {
         /// 安装成功时为 true：弹窗给“去看看”按钮，点后回桌面第 2 页
         /// （已装应用那页）；“留在软件源”只关弹窗。
         var goToDesktop = false
+        /// 0.2.9：包不在磁盘时为该应用：弹窗给“删除该应用”按钮（destructive），
+        /// 点后直接删记录（SBAppDeletion 本就容忍包不在），不再只给
+        /// “重新导入”一条死胡同；其余情况为 nil。
+        var deleteApp: SBInstalledApp? = nil
     }
 
     struct DuplicatePending: Identifiable {
@@ -363,12 +367,21 @@ final class SBAppCoordinator: ObservableObject {
             self.isLaunching = false
             let stage = (error as NSError).userInfo[SBGuestLoaderErrorStageKey] as? String ?? "启动失败"
             Task { @MainActor in
-                // 证书门拦截（无证书 / 证书被删 / 证书过期）给“去导入证书”按钮，
-                // 点后关弹窗并打开设置页（证书区在设置页内）。
-                self.activeAlert = CoordinatorAlert(
-                    title: stage,
-                    message: error.localizedDescription,
-                    goToSettings: stage == "证书检查")
+                if (error as NSError).code == SBGuestLoaderErrorCode.bundleNotFound.rawValue {
+                    // 0.2.9：包不在磁盘（记录还在，多为宿主重装换了容器）——
+                    // 不要只给“重新导入”死胡同，弹窗直接给“删除该应用”。
+                    self.activeAlert = CoordinatorAlert(
+                        title: stage,
+                        message: error.localizedDescription,
+                        deleteApp: app)
+                } else {
+                    // 证书门拦截（无证书 / 证书被删 / 证书过期）给“去导入证书”按钮，
+                    // 点后关弹窗并打开设置页（证书区在设置页内）。
+                    self.activeAlert = CoordinatorAlert(
+                        title: stage,
+                        message: error.localizedDescription,
+                        goToSettings: stage == "证书检查")
+                }
             }
         }
         // 证书门与包检查已同步跑完：回调还没来 = 已通过证书门，进入重启请求阶段。

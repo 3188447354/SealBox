@@ -189,6 +189,22 @@ NSError *SBGuestLoaderErrorMake(SBGuestLoaderErrorCode code,
         ![stage isEqualToString:SBReceiptStageRestartConfirmed]) {
         return NO;
     }
+    // 0.2.9：restart-requested 收据过期即不算待处理——重启请求发出后 5 秒
+    // 内必兑现（正常重启约 1 秒）；超时的收据是上次没兑现的旧收据（重启
+    // 请求被系统丢弃、或宿主在此期间被更新/重装，包已不在当前容器里——
+    // KYNS 真机实证），再拿它去加载只会多一次无谓的失败。过期收据由
+    // SBLaunchRouter 的 else 分支记失败、清选中标记，不再尝试加载。
+    // restart-confirmed 是本进程刚写的，不过期；createdAt 缺失时不拦
+    // （按旧行为尝试加载）。
+    if ([stage isEqualToString:SBReceiptStageRestartRequested]) {
+        NSNumber *createdAt = receipt[@"createdAt"];
+        if ([createdAt isKindOfClass:[NSNumber class]]) {
+            NSTimeInterval age = [[NSDate date] timeIntervalSince1970] - [createdAt doubleValue];
+            if (age > SBRestartDeadlineSeconds) {
+                return NO;
+            }
+        }
+    }
     NSString *receiptBundleID = receipt[@"guestBundleID"];
     if (receiptBundleID.length == 0 || ![receiptBundleID isEqualToString:selectedBundleID]) {
         return NO;
