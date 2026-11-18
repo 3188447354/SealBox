@@ -187,7 +187,9 @@ static BOOL SBParseCodeDirectory(const uint8_t *data, size_t len,
         }
         if (type == SBCSlotCodeDirectory && cd == NULL) {
             cd = sig + offset;
-            if (sigSize - offset < 4) {
+            // 0.2.3: 读 magic（cd+0）+ length（cd+4）需要 8 字节，不是 4 字节；
+            // 只保证 4 字节时 cd+4 的读会越界（损坏的签名才触发）。
+            if (sigSize - offset < 8) {
                 *outReason = @"CodeDirectory 越界";
                 return NO;
             }
@@ -221,10 +223,20 @@ static BOOL SBParseCodeDirectory(const uint8_t *data, size_t len,
     out->hashType = cd[37];
     out->pageSizeLog2 = cd[39];
     out->hasSignatureSlot = hasSignatureSlot;
+    // 0.2.3: teamOffset（cd+48）需要 cdLength ≥ 52，preEncryptOffset（cd+92）
+    // 需要 cdLength ≥ 96；只校验 ≥44 时，损坏的签名会在这里越读。
     if (out->version >= 0x20200) {
+        if (cdLength < 52) {
+            *outReason = @"CodeDirectory 太短，没有 teamOffset";
+            return NO;
+        }
         out->teamOffset = SBReadBE32(cd + 48);
     }
     if (out->version >= 0x20500) {
+        if (cdLength < 96) {
+            *outReason = @"CodeDirectory 太短，没有 preEncryptOffset";
+            return NO;
+        }
         out->preEncryptOffset = SBReadBE32(cd + 92);
     }
     // 代码表起点：0x20500+ 且有 pre-encrypt 表时取它，否则取 hashOffset。

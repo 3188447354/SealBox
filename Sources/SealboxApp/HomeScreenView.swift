@@ -1,11 +1,17 @@
 import SwiftUI
 
-// Home screen (0.1.4): two manually paged pages.
+// Home screen (0.1.4): two paged pages.
 // Page 1: the three built-in apps. Page 2: installed apps from the source.
-// Paging is a plain HStack with an offset — no TabView — and the swipe
-// is always on (0.2.1: it used to be gated on the custom-gestures plugin
-// switch, whose stored value was false on real phones, so swiping was
-// dead out of the box; the switch is gone, swiping is unconditional).
+// Paging is TabView + PageTabViewStyle (0.2.3): the manual HStack+offset
+// +drag pager failed on device three times (0.2.0 gated switch, 0.2.1
+// simultaneousGesture, 0.2.2 unchanged) — its gesture arbitration with
+// the icon Buttons and page 2's ScrollView is framework-internal and
+// not provable from code. TabView paging is UIKit-native (UIScrollView-
+// backed): horizontal paging, button taps, and the vertical list
+// disambiguate by direction, as in every paged iOS UI. No switch, no
+// custom gesture, no manual offset — nothing for a child gesture to
+// outrank, and swiping and the dots below share the one vm.homePage
+// binding, so they can never disagree.
 struct HomeScreenView: View {
     @EnvironmentObject private var vm: VMState
     @EnvironmentObject private var coordinator: SBAppCoordinator
@@ -59,21 +65,26 @@ struct HomeScreenView: View {
                 Spacer()
                     .frame(height: 54)
 
-                // Two pages, side by side, slid by offset.
+                // Two pages, standard paging (0.2.3): TabView +
+                // PageTabViewStyle. The manual HStack+offset+drag pager
+                // failed on device twice (0.2.1 simultaneousGesture,
+                // 0.2.2 unchanged) — its gesture arbitration with the
+                // icon Buttons and page 2's vertical ScrollView is
+                // framework-internal and not provable from code.
+                // TabView paging is UIKit-native (UIScrollView-backed):
+                // horizontal paging, button taps, and the vertical list
+                // disambiguate by direction, as in every paged iOS UI.
+                // Selection is the single vm.homePage binding, so swiping
+                // and the dots below always agree; no switch, no custom
+                // gesture, nothing for a child gesture to outrank.
                 GeometryReader { geo in
-                    HStack(spacing: 0) {
+                    TabView(selection: $vm.homePage) {
                         builtInPage(width: geo.size.width)
+                            .tag(0)
                         installedPage(width: geo.size.width)
+                            .tag(1)
                     }
-                    .offset(x: -CGFloat(vm.homePage) * geo.size.width)
-                    .animation(.easeInOut(duration: 0.28), value: vm.homePage)
-                    // simultaneousGesture, not .gesture: page 2 holds a
-                    // vertical ScrollView whose own drag would otherwise
-                    // outrank this parent gesture, so swiping back from
-                    // page 2 could not reach the pager. Delivered to both:
-                    // vertical drags scroll the list (onEnded ignores them,
-                    // |width| < 50), horizontal drags flip the page.
-                    .simultaneousGesture(pageDragGesture)
+                    .tabViewStyle(.page(indexDisplayMode: .never))
                 }
 
                 // Page dots: iOS standard position, just above the Dock.
@@ -259,21 +270,6 @@ struct HomeScreenView: View {
         } else {
             coordinator.launchApp(app)
         }
-    }
-
-    // MARK: - Paging gesture
-
-    /// Always attached and always live (0.2.1): no plugin switch gates it,
-    /// so it works on phones that already stored the old switch as false.
-    private var pageDragGesture: some Gesture {
-        DragGesture(minimumDistance: 20)
-            .onEnded { value in
-                if value.translation.width < -50 {
-                    vm.homePage = min(1, vm.homePage + 1)
-                } else if value.translation.width > 50 {
-                    vm.homePage = max(0, vm.homePage - 1)
-                }
-            }
     }
 
     // MARK: - Icon theme (light vs. dark)

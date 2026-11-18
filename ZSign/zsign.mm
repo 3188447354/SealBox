@@ -20,6 +20,36 @@
 #include "Utils.hpp"
 #include "zsigner.h"
 
+// 0.2.3: serialize all ZSign operations process-wide. ZSign keeps
+// process-global mutable state (ZLog::logs; OpenSSL globals), and two
+// overlapping sign/check calls corrupt the heap — 0.2.2 launch crash:
+// the seed install signing Via raced ensureHooks signing the hooks dylib
+// (both fire at startup when a certificate is imported). Every entry
+// point below holds this semaphore for the duration of its synchronous
+// ZSign work. Async entry points release it before invoking their
+// completion handler, so no callback can re-enter and deadlock; the
+// semaphore is never held across a callback. checkCert runs its body on
+// a worker thread (its caller may be the main thread — Settings page
+// refresh), and the other entry points are only ever called from
+// background tasks, so the lock is never taken on the main thread.
+static dispatch_semaphore_t SBZSignSerialSemaphore(void) {
+    static dispatch_semaphore_t semaphore = NULL;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        semaphore = dispatch_semaphore_create(1);
+    });
+    return semaphore;
+}
+
+// RAII holder for the serial semaphore: signals on scope exit, so every
+// early return in the synchronous entry points releases it.
+struct SBZSignScopedLock {
+    SBZSignScopedLock() { dispatch_semaphore_wait(SBZSignSerialSemaphore(), DISPATCH_TIME_FOREVER); }
+    ~SBZSignScopedLock() { dispatch_semaphore_signal(SBZSignSerialSemaphore()); }
+    SBZSignScopedLock(const SBZSignScopedLock&) = delete;
+    SBZSignScopedLock& operator=(const SBZSignScopedLock&) = delete;
+};
+
 // copy, remove and rename back the file to prevent crash due to kernel signature cache
 // see https://developer.apple.com/documentation/security/updating-mac-software
 void refreshFile(NSString* path) {
@@ -39,18 +69,30 @@ extern "C" {
 int checkCert(NSData *key,
               NSString *pass,
               void(^completionHandler)(int status, NSDate* expirationDate, NSString* organizationalUnitName, NSString *error)) {
+    // 0.2.3: run the whole check on a worker thread, never on the
+    // caller's thread: the sync part below takes the serial ZSign lock,
+    // and the caller may be the main thread (Settings page refresh calls
+    // checkCertRaw from a SwiftUI .task). Blocking main for a sign job's
+    // duration would freeze the UI. The int return is ignored by every
+    // caller (Swift checkCertRaw and the ObjC self-test use only the
+    // completion handler), so always return 1 (task dispatched).
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
     const char* strPKeyFileData = (const char*)[key bytes];
 
     string strPassword = [pass cStringUsingEncoding:NSUTF8StringEncoding];
-    
-    ZLog::logs.clear();
+
+    // 0.2.3: hold the serial lock for the synchronous part of this call
+    // (InitSimple + issuer checks + request build); the OCSP completion
+    // below only touches per-call locals, so it runs after release.
+    SBZSignScopedLock sbZSignLock;
+    ZLog::ClearLogs();
 
     __block ZSignAsset zSignAsset;
-    
+
     if (!zSignAsset.InitSimple(strPKeyFileData, (int)[key length], nil, 0, strPassword)) {
-        ZLog::logs.clear();
+        ZLog::ClearLogs();
         completionHandler(2, nil, nil, @"Unable to initialize certificate. Please check your password.");
-        return -1;
+        return;
     }
     
     X509* cert = (X509*)zSignAsset.m_x509Cert;
@@ -62,20 +104,20 @@ int checkCert(NSData *key,
         brother1 = BIO_new_mem_buf(ZSignAsset::s_szAppleDevCACertG3, (int)strlen(ZSignAsset::s_szAppleDevCACertG3));
     } else {
         completionHandler(2, nil, nil, @"Unable to determine issuer of the certificate. Is it signed by Apple Developer?");
-        return -2;
+        return;
     }
     
     if (!brother1)
     {
         completionHandler(2, nil, nil, @"Unable to initialize issuer certificate.");
-        return -3;
+        return;
     }
     
     X509 *issuer = PEM_read_bio_X509(brother1, NULL, 0, NULL);
     
     if (!cert || !issuer) {
         completionHandler(2, nil, nil, @"Error loading cert or issuer");
-        return -4;
+        return;
     }
 
     
@@ -83,7 +125,7 @@ int checkCert(NSData *key,
     STACK_OF(ACCESS_DESCRIPTION)* aia = (STACK_OF(ACCESS_DESCRIPTION)*)X509_get_ext_d2i((X509*)cert, NID_info_access, 0, 0);
     if (!aia) {
         completionHandler(2, nil, nil, @"No AIA (OCSP) extension found in certificate");
-        return -5;
+        return;
     }
     
     ASN1_IA5STRING* uri = nullptr;
@@ -100,7 +142,7 @@ int checkCert(NSData *key,
     
     if (!uri) {
         completionHandler(2, nil, nil, @"No OCSP URI found in certificate.");
-        return -6;
+        return;
     }
 
     OCSP_REQUEST* req = OCSP_REQUEST_new();
@@ -182,6 +224,7 @@ int checkCert(NSData *key,
     }];
 
     [task resume];
+    });
     return 1;
 }
 
@@ -189,8 +232,13 @@ int checkCert(NSData *key,
 + (NSProgress*)signMachOPathArr:(NSArray<NSString*>*)machoPathArr bundleId:(NSString *)bundleId cert:(NSData *)key
                             pass:(NSString *)pass completionHandler:(void(^)(BOOL success, NSError *error))completionHandler {
     NSProgress* progress = [NSProgress progressWithTotalUnitCount:(int64_t)machoPathArr.count];
-    ZLog::logs.clear();
+    ZLog::ClearLogs();
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        // 0.2.3: hold the serial lock for the whole signing job, from
+        // InitSimple through the last file task. The per-file tasks run
+        // on the global queue but belong to this one job; the wait is
+        // inside the dispatched block, never on the caller's thread.
+        dispatch_semaphore_wait(SBZSignSerialSemaphore(), DISPATCH_TIME_FOREVER);
         ZSignAsset* pSignAsset = new ZSignAsset();
         const char* strPKeyFileData = (const char*)[key bytes];
         const char* strPassword = [pass cStringUsingEncoding:NSUTF8StringEncoding];
@@ -202,6 +250,8 @@ int checkCert(NSData *key,
             NSError* initError = [NSError errorWithDomain:@"Failed to Sign" code:-1 userInfo:@{
                 NSLocalizedDescriptionKey: @"Failed to initialize zSignAsset. Maybe wrong password?"
             }];
+            // 0.2.3: release the serial lock before the callback.
+            dispatch_semaphore_signal(SBZSignSerialSemaphore());
             dispatch_async(dispatch_get_main_queue(), ^{
                 completionHandler(NO, initError);
             });
@@ -245,6 +295,9 @@ int checkCert(NSData *key,
         dispatch_group_wait(group, DISPATCH_TIME_FOREVER);
 
         delete pSignAsset;
+        // 0.2.3: release the serial lock before invoking the completion
+        // handler — the callback must never run while the lock is held.
+        dispatch_semaphore_signal(SBZSignSerialSemaphore());
         if (errorList.count > 0) {
             NSError* signingError = [NSError errorWithDomain:@"Failed to Sign" code:-1 userInfo:@{
                 NSLocalizedDescriptionKey: [errorList componentsJoinedByString:@"\n"]
@@ -285,7 +338,9 @@ int checkCert(NSData *key,
 }
 
 + (BOOL)adhocSignMachOAtPath:(NSString *)path bundleId:(NSString*)bundleId entitlementData:(NSData *)entitlementData {
-    ZLog::logs.clear();
+    // 0.2.3: serialize with all other ZSign operations (see top of file).
+    SBZSignScopedLock sbZSignLock;
+    ZLog::ClearLogs();
     
     ZSignAsset zSignAsset;
     zSignAsset.InitAdhoc([entitlementData bytes], (int)[entitlementData length]);
@@ -311,13 +366,15 @@ int checkCert(NSData *key,
     const char* strPKeyFileData = (const char*)[cert bytes];
 
     strPassword = [pass cStringUsingEncoding:NSUTF8StringEncoding];
-    
-    ZLog::logs.clear();
+
+    // 0.2.3: serialize with all other ZSign operations (see top of file).
+    SBZSignScopedLock sbZSignLock;
+    ZLog::ClearLogs();
 
     __block ZSignAsset zSignAsset;
-    
+
     if (!zSignAsset.InitSimple(strPKeyFileData, (int)[cert length], nil, 0, strPassword)) {
-        ZLog::logs.clear();
+        ZLog::ClearLogs();
         return nil;
     }
     NSString* teamId = [NSString stringWithUTF8String:zSignAsset.m_strTeamId.c_str()];

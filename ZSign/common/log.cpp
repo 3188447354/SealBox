@@ -148,6 +148,11 @@ void ZLog::DebugV(const char* szFormat, ...)
 vector<string> ZLog::logs;
 std::mutex ZLog::logsMutex;
 
+void ZLog::ClearLogs() {
+    std::lock_guard<std::mutex> lock(logsMutex);
+    logs.clear();
+}
+
 void ZLog::writeToLogFile(const std::string& message) {
     std::lock_guard<std::mutex> lock(logsMutex);
     logs.push_back(message);

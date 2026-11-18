@@ -32,6 +32,11 @@ public:
 	static void SetLogLever(int nLogLevel) { g_nLogLevel = nLogLevel; }
     static vector<std::string> logs;
     static std::mutex logsMutex;
+    /// 0.2.3: clear the log buffer under the same mutex writeToLogFile
+    /// uses. The old call sites did `logs.clear()` bare, racing the
+    /// push_backs from concurrent signing threads (heap corruption,
+    /// 0.2.2 launch crash) — never clear the vector without this.
+    static void ClearLogs();
 
 private:
 	static void _Print(const char* szLog, int nColor = 0);
