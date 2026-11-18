@@ -429,6 +429,11 @@ void restoreExecutablePath(void) {
     g_structField = NULL;
     g_structLengthCacheField = 0;
     // 替身不卸载，但 g_guestExecPath 清掉后它返回宿主路径，与原函数一致。
-    free(g_guestExecPath);
+    // 0.2.6：先置 NULL 再 free——free 在先时，客线程若在两者之间调被
+    // litehook 挂住的 _NSGetExecutablePath，会读到已释放的内存。
+    // （与 SBGuestBootstrap 里 _CFGetProgname 的 free-then-strdup 同款时序；
+    // NULL 在先把竞态窗口缩到“读指针与解引用之间恰好被 free 插队”这一种。）
+    char *oldGuestExecPath = g_guestExecPath;
     g_guestExecPath = NULL;
+    free(oldGuestExecPath);
 }

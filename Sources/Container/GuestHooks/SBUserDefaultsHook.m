@@ -25,7 +25,10 @@ NSUserDefaults *SBGuestDefaults(void);
 - (instancetype)sb_guest_init {
     // 交换后 [[NSUserDefaults alloc] init] 走到这里：直接返回客实例。
     // 刚 alloc 出来的 self 会被丢弃（一次泄漏，可接受）；initWithSuiteName 不受影响。
-    return SBGuestDefaults();
+    // 0.2.6：init 家族方法按约定返回 +1 引用。旧代码直接返回静态实例
+    // （+0），调用方按 +1 释放一次后静态实例被提前销毁，之后再用即
+    // use-after-free。这里补一个 CFRetain，把 +1 交给调用方。
+    return (NSUserDefaults *)CFRetain((__bridge CFTypeRef)SBGuestDefaults());
 }
 
 @end

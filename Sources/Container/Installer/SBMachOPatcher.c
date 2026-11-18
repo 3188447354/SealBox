@@ -663,3 +663,82 @@ int32_t SBMachOPatchARM64eFile(const char *path) {
     free(buffer);
     return result;
 }
+
+/// 一个 thin 切片里有没有 LC_ID_DYLIB（只认 64 位头；越界即判为无）。
+static int sb_slice_has_id_dylib(const uint8_t *base, size_t size) {
+    if (size < sizeof(struct mach_header_64)) {
+        return 0;
+    }
+    if (*(const uint32_t *)base != MH_MAGIC_64) {
+        return 0;
+    }
+    const struct mach_header_64 *header = (const struct mach_header_64 *)base;
+    if (header->cputype != CPU_TYPE_ARM64) {
+        return 0;
+    }
+    size_t offset = sizeof(struct mach_header_64);
+    for (uint32_t i = 0; i < header->ncmds; i++) {
+        if (!sb_range_ok(offset, 8, size)) {
+            return 0;
+        }
+        uint32_t cmd = *(const uint32_t *)(base + offset);
+        uint32_t cmdsize = *(const uint32_t *)(base + offset + 4);
+        if (cmdsize < 8 || !sb_range_ok(offset, cmdsize, size)) {
+            return 0;
+        }
+        if (cmd == LC_ID_DYLIB) {
+            return 1;
+        }
+        offset += cmdsize;
+    }
+    return 0;
+}
+
+int SBMachOHasIDDylib(const char *path) {
+    if (!path || !*path) {
+        return 0;
+    }
+    size_t size = 0;
+    uint8_t *buffer = sb_read_file(path, &size);
+    if (!buffer) {
+        return 0;
+    }
+    int result = 0;
+    uint32_t magic = *(uint32_t *)buffer;
+    if (magic == FAT_MAGIC || magic == FAT_CIGAM) {
+        // fat 包：每个 arm64 切片都必须带 LC_ID_DYLIB。
+        if (size >= sizeof(struct fat_header)) {
+            uint32_t narch = OSSwapBigToHostInt32(((struct fat_header *)buffer)->nfat_arch);
+            int arm64_slices = 0;
+            int ok = 1;
+            for (uint32_t i = 0; i < narch; i++) {
+                size_t arch_off = sizeof(struct fat_header) + (size_t)i * sizeof(struct fat_arch);
+                if (!sb_range_ok(arch_off, sizeof(struct fat_arch), size)) {
+                    ok = 0;
+                    break;
+                }
+                const struct fat_arch *arch = (const struct fat_arch *)(buffer + arch_off);
+                uint32_t cputype = OSSwapBigToHostInt32(arch->cputype);
+                if (cputype != CPU_TYPE_ARM64) {
+                    continue;
+                }
+                uint32_t off = OSSwapBigToHostInt32(arch->offset);
+                uint32_t arch_size = OSSwapBigToHostInt32(arch->size);
+                if (!sb_range_ok(off, arch_size, size)) {
+                    ok = 0;
+                    break;
+                }
+                arm64_slices++;
+                if (!sb_slice_has_id_dylib(buffer + off, arch_size)) {
+                    ok = 0;
+                    break;
+                }
+            }
+            result = (ok && arm64_slices > 0) ? 1 : 0;
+        }
+    } else if (magic == MH_MAGIC_64) {
+        result = sb_slice_has_id_dylib(buffer, size);
+    }
+    free(buffer);
+    return result;
+}

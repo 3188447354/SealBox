@@ -108,6 +108,14 @@ public enum SBInstaller {
                 throw patchError(for: patchResult)
             }
             let segCountMismatch = segMismatch != 0
+            // 0.2.6：打补丁后必须校验 LC_ID_DYLIB 在位——打补丁器在空间实在不够时
+            // 是静默跳过 LC_ID_DYLIB 的（与 LC 一致），缺了它 dlopen 必败
+            //（0.2.5 真机：pip_swift 已是 MH_DYLIB 但缺 LC_ID_DYLIB）。
+            // 装一个注定打不开的包不如安装时直接报错。
+            guard SBMachOHasIDDylib(executablePath) != 0 else {
+                throw SBError.patchFailed(
+                    reason: "可执行文件没有足够空间插入 LC_ID_DYLIB，装了也打不开")
+            }
             // 0.2.5：全包 arm64e 修正——包内 .dylib 与 framework 可执行文件补
             // LIB64 标记（LiveContainer 的 LCPatchAppBundleFixupARM64eSlice 同款做法）。
             // 尽力而为：某文件失败不阻塞安装。
@@ -244,6 +252,132 @@ public enum SBInstaller {
             }
             throw error
         }
+    }
+
+    // MARK: - 已装应用重打补丁（0.2.6）
+
+    /// 给已装应用重新打补丁 + 重签（0.2.6，修 0.2.5 真机报的
+    /// "MH_DYLIB is missing LC_ID_DYLIB"）。
+    ///
+    /// 根因：0.2.4 及更早的打补丁器只改 filetype，不插 LC_ID_DYLIB；0.2.5 的
+    /// 新打补丁器只在新安装时跑。`SBConstants.patchRevision` 从 1 升到 2 时
+    /// 没有任何接线让已装应用重打补丁——`patchRevision` 只写不读。
+    /// 于是 0.2.4 或更早装的包一直带着无 LC_ID_DYLIB 的 MH_DYLIB，
+    /// 0.2.5 上点图标 dlopen 必败。
+    ///
+    /// 做法：用当前打补丁器对主可执行文件再打一次（已打过的内容会跳过，
+    /// 幂等）、校验 LC_ID_DYLIB 在位、全包 arm64e 修正、再用导入证书全包
+    /// 重签 + 主程序 / appex 各用自己的 entitlements 再签一次（与安装
+    /// 同款）。成功后把记录的 patchRevision 升到当前值并入库。
+    ///
+    /// 失败时把主可执行文件从备份还原（打补丁改过的文件原样还原），
+    /// 记录不动，调用方按错误提示用户，不启动。
+    /// - Returns: 更新后的安装记录。
+    static func repatchInstalledApp(_ record: SBInstalledApp) async throws -> SBInstalledApp {
+        let fileManager = FileManager.default
+        let appPath = record.bundleURL.path
+        let executablePath = record.executableURL.path
+        guard fileManager.fileExists(atPath: executablePath) else {
+            throw SBError.patchFailed(reason: "找不到可执行文件 \(record.executableName)")
+        }
+        guard let certData = certificateData(),
+              let password = certificatePassword(),
+              !password.isEmpty else {
+            throw SBError.signFailed(reason: "没有导入证书，无法重签")
+        }
+        // 先备份主可执行文件：打补丁会使原签名失效，之后任一步失败都把
+        // 备份还原，应用回到重打补丁前的状态（而不是留一个签坏的包）。
+        let backupURL = fileManager.temporaryDirectory
+            .appendingPathComponent("SBRepatchBackup-\(UUID().uuidString)")
+        do {
+            try fileManager.copyItem(atPath: executablePath, toPath: backupURL.path)
+        } catch {
+            throw SBError.patchFailed(reason: "备份可执行文件失败")
+        }
+        defer { try? fileManager.removeItem(at: backupURL) }
+
+        var segCountMismatch = record.segCountMismatch
+        var signed = false
+        var signingCertFingerprint: String? = nil
+        do {
+            let hooksDylibPath = "@loader_path/../../Tweaks/\(SBConstants.guestHooksDylibName)"
+            var segMismatch: Int32 = 0
+            let patchResult = SBMachOPatchExecutable(executablePath, hooksDylibPath, &segMismatch)
+            guard patchResult == SB_MACHO_PATCH_OK else {
+                throw patchError(for: patchResult)
+            }
+            segCountMismatch = segMismatch != 0
+            guard SBMachOHasIDDylib(executablePath) != 0 else {
+                throw SBError.patchFailed(
+                    reason: "重打补丁后仍缺少 LC_ID_DYLIB，该应用无法启动")
+            }
+            fixupBundleARM64e(appPath: appPath)
+            try Task.checkCancellation()
+
+            // 重签（与安装同款：先取各可执行文件的 entitlements，再全包重签，
+            // 最后主程序与 appex 各用自己的 entitlements 再签一次）。
+            var executablesToResign: [(path: String, bundleID: String, entitlements: String)] = []
+            if let teamID = SBSigner.teamID(withCertData: certData, password: password) {
+                if let mainEntitlements = SBGuestEntitlementsForExecutableAtPath(
+                    executablePath, teamID, record.bundleID) {
+                    executablesToResign.append(
+                        (path: executablePath, bundleID: record.bundleID,
+                         entitlements: mainEntitlements))
+                }
+                executablesToResign.append(
+                    contentsOf: appexExecutablesToResign(appPath: appPath, teamID: teamID))
+            }
+            try await signApp(
+                appPath: appPath,
+                bundleID: record.bundleID,
+                certData: certData,
+                password: password,
+                progress: Progress(totalUnitCount: 1)
+            )
+            signed = true
+            signingCertFingerprint = certificateFingerprint(certData: certData, password: password)
+            for entry in executablesToResign {
+                try? await signMachOWithEntitlements(
+                    path: entry.path,
+                    bundleID: entry.bundleID,
+                    certData: certData,
+                    password: password,
+                    entitlementXML: entry.entitlements
+                )
+            }
+        } catch {
+            // 任一步失败：主可执行文件还原，记录不动。
+            if fileManager.fileExists(atPath: executablePath) {
+                _ = try? fileManager.replaceItemAt(
+                    URL(fileURLWithPath: executablePath), withItemAt: backupURL)
+            } else {
+                try? fileManager.copyItem(atPath: backupURL.path, toPath: executablePath)
+            }
+            throw error
+        }
+
+        let updated = SBInstalledApp(
+            recordID: record.recordID,
+            bundleID: record.bundleID,
+            displayName: record.displayName,
+            version: record.version,
+            shortVersion: record.shortVersion,
+            executableName: record.executableName,
+            containerUUID: record.containerUUID,
+            keychainGroup: record.keychainGroup,
+            installedDate: record.installedDate,
+            patchRevision: SBConstants.patchRevision,
+            signed: signed,
+            needsJIT: record.needsJIT,
+            segCountMismatch: segCountMismatch,
+            lastLaunchResult: record.lastLaunchResult,
+            signingCertFingerprint: signingCertFingerprint,
+            needsReimport: record.needsReimport,
+            diskDirectoryName: record.diskDirectoryName,
+            sourceIPAFileName: record.sourceIPAFileName
+        )
+        SBStore.shared.upsertApp(updated)
+        return updated
     }
 
     /// 从解析出的 .app 路径反推解析时的临时根目录：往上找到名字以

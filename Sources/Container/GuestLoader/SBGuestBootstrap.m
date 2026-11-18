@@ -27,7 +27,18 @@ static const NSInteger SBKeychainGroupCount = 128;
 // processName 有公开 setter；_CFGetProgname() 直写 CF 的进程名全局量。
 // _CFGetProcessPath() 的直写已在第 5 步的 overwriteExecutablePath 里做过，不重复。
 // 任何一步失败都不阻断启动——客 App 读到的进程身份不完整也比启动失败强。
+//
+// 0.2.6：改写必须可恢复——客加载失败后宿主进程继续跑 UI，进程身份留在客名
+// 上是错的；_CFGetProgname 的 free-then-strdup 在第二次点图标时会 free 掉
+// CF 全局量还指着的缓冲（0.2.5 修过的 g_guestExecPath 同款问题）。
+// 所以改写前先存原始值（原 IMP、原 processName、原 progname 指针），
+// 失败 / 客 main 返回时 SBRestoreProcessIdentity 全数还原。
+// strdup 新名字在先、再赋值、最后才 free 旧缓冲：中间没有悬空指针。
 static NSArray *g_sbGuestArguments = nil;
+static IMP g_originalArgumentsIMP = NULL;
+static NSString *g_originalProcessName = nil;
+static char *g_originalProgname = NULL;
+static char *g_guestProgname = NULL;
 
 static NSArray *SBGuestProcessInfoArguments(id self, SEL _cmd) {
     (void)self;
@@ -39,32 +50,88 @@ static void SBRewriteProcessIdentity(NSString *guestExecPath) {
     if (guestExecPath.length == 0) {
         return;
     }
-    // arguments：swizzle getter。
+    // arguments：swizzle getter（先存原 IMP，恢复时换回去）。
     @try {
         Method argumentsMethod = class_getInstanceMethod([NSProcessInfo class], @selector(arguments));
         if (argumentsMethod) {
+            if (!g_originalArgumentsIMP) {
+                g_originalArgumentsIMP = method_getImplementation(argumentsMethod);
+            }
             g_sbGuestArguments = @[ guestExecPath ];
             method_setImplementation(argumentsMethod, (IMP)SBGuestProcessInfoArguments);
         }
     } @catch (NSException *exception) {
         NSLog(@"[Sealbox] 改写 NSProcessInfo.arguments 失败：%@", exception.reason);
     }
-    // processName：公开 setter。
+    // processName：公开 setter（先存原名）。
     @try {
+        if (!g_originalProcessName) {
+            g_originalProcessName = [[NSProcessInfo processInfo] processName];
+        }
         [[NSProcessInfo processInfo] setProcessName:[guestExecPath lastPathComponent]];
     } @catch (NSException *exception) {
         NSLog(@"[Sealbox] 改写 processName 失败：%@", exception.reason);
     }
     // _CFGetProgname()：直写 CF 进程名全局量（通常是可执行文件名）。
+    // 先 strdup 新名字、再赋值、最后 free 旧的客名字缓冲：*progname 在任何
+    // 时刻都指着有效内存；原 progname 指针存起来，恢复时指回去。
     char **progname = _CFGetProgname();
     if (progname && *progname) {
-        static char *guestProgname = NULL;
-        free(guestProgname);
-        guestProgname = strdup([[guestExecPath lastPathComponent] UTF8String]);
-        if (guestProgname) {
-            *progname = guestProgname;
+        if (!g_originalProgname) {
+            g_originalProgname = *progname;
+        }
+        char *newName = strdup([[guestExecPath lastPathComponent] UTF8String]);
+        if (newName) {
+            char *oldGuestName = g_guestProgname;
+            g_guestProgname = newName;
+            *progname = newName;
+            free(oldGuestName);
         }
     }
+}
+
+/// 把进程身份还原成宿主自己的（客加载失败 / 客 main 返回时调）。
+/// 未改写过时是空操作；恢复失败也不抛，尽力而为。
+static void SBRestoreProcessIdentity(void) {
+    @try {
+        Method argumentsMethod = class_getInstanceMethod([NSProcessInfo class], @selector(arguments));
+        if (argumentsMethod && g_originalArgumentsIMP) {
+            method_setImplementation(argumentsMethod, g_originalArgumentsIMP);
+            g_originalArgumentsIMP = NULL;
+        }
+    } @catch (NSException *exception) {
+        NSLog(@"[Sealbox] 恢复 NSProcessInfo.arguments 失败：%@", exception.reason);
+    }
+    @try {
+        if (g_originalProcessName) {
+            [[NSProcessInfo processInfo] setProcessName:g_originalProcessName];
+            g_originalProcessName = nil;
+        }
+    } @catch (NSException *exception) {
+        NSLog(@"[Sealbox] 恢复 processName 失败：%@", exception.reason);
+    }
+    // progname 先指回原指针，再 free 客名字缓冲（顺序反了会悬空）。
+    char **progname = _CFGetProgname();
+    if (progname && g_originalProgname) {
+        *progname = g_originalProgname;
+        g_originalProgname = NULL;
+    }
+    if (g_guestProgname) {
+        free(g_guestProgname);
+        g_guestProgname = NULL;
+    }
+    g_sbGuestArguments = nil;
+}
+
+/// 清掉第 3 步设的客环境变量：失败后宿主继续跑，留着它们会让之后加载的
+/// Hook 件误以为还在客上下文里（SB_GUEST_BUNDLE_ID 是 Hook 件 constructor
+/// 的安装开关）。恢复失败路径不依赖它，但清掉更干净。
+static void SBClearGuestEnvironment(void) {
+    unsetenv("SB_GUEST_BUNDLE_ID");
+    unsetenv("SB_GUEST_CONTAINER_PATH");
+    unsetenv("SB_GUEST_EXEC_PATH");
+    unsetenv("SB_GUEST_KEYCHAIN_GROUP");
+    unsetenv("SB_HOST_BUNDLE_ID");
 }
 
 @implementation SBGuestBootstrap
@@ -278,23 +345,15 @@ static void SBRewriteProcessIdentity(NSString *guestExecPath) {
     SBRewriteProcessIdentity(guestExecPath);
     SBDiagLogLine("客加载：进程身份已改写为客应用");
 
-    // —— 6. 预加载客端 Hook dylib ————————————————————————————————
-    // 安装时 Installer 已把 SBGuestHooks.dylib 注入客可执行的 LC_LOAD_DYLIB，
-    // dlopen 客可执行时它会自动加载；这里先试一次，失败不致命（dlopen 客可执行时还会再带一次）。
-    NSString *hooksPath = [[documents stringByAppendingPathComponent:@"Tweaks"]
-                           stringByAppendingPathComponent:@"SBGuestHooks.dylib"];
-    if ([fileManager fileExistsAtPath:hooksPath]) {
-        void *hooksHandle = dlopen([hooksPath UTF8String], RTLD_LAZY | RTLD_GLOBAL);
-        if (!hooksHandle) {
-            const char *dlerrorString = dlerror();
-            SBDiagLogLine([[NSString stringWithFormat:@"客加载：预加载 Hook 失败（继续启动）：%s", dlerrorString ? dlerrorString : "未知错误"] UTF8String]);
-            NSLog(@"[Sealbox] 预加载客端 Hook 失败：%s", dlerrorString ? dlerrorString : "未知错误");
-        } else {
-            SBDiagLogLine("客加载：预加载 Hook 成功");
-        }
-    } else {
-        SBDiagLogLine("客加载：Tweaks 里没有 Hook 件，跳过预加载");
-    }
+    // —— 6. 预加载客端 Hook dylib：0.2.6 已删除 —————————————————————
+    // 0.2.5 在这里 dlopen SBGuestHooks.dylib，但它的 constructor 会把
+    // 4 组 Hook（NSUserDefaults / NSFileManager 方法交换、钥匙串重绑、
+    // 底部横杠回桌面浮层）装进宿主进程；客加载随后失败时这些 Hook 没有
+    // 卸载路径——宿主 UI 带着客 Hook 跑：设置读客 suite、底部上滑直接
+    // exit(0)，看上去就是“报错后又闪退”（0.2.5 真机追加报）。
+    // 删掉预加载不丢功能：安装时 Hook 件已注入客可执行的 LC_LOAD_DYLIB，
+    // 第 7 步 dlopen 客可执行时 dyld 会把它当依赖加载，constructor 在客
+    // 上下文里装 Hook；客加载失败时 Hook 件根本不进宿主进程。
 
     // —— 7. dlopen 客可执行 ——————————————————————————————————————
     NSError *dlopenError = nil;
@@ -303,6 +362,8 @@ static void SBRewriteProcessIdentity(NSString *guestExecPath) {
         restoreMainCFBundle();
         restoreMainNSBundle();
         restoreExecutablePath();
+        SBRestoreProcessIdentity();
+        SBClearGuestEnvironment();
         if (error) {
             *error = dlopenError;
         }
@@ -313,6 +374,8 @@ static void SBRewriteProcessIdentity(NSString *guestExecPath) {
         restoreMainCFBundle();
         restoreMainNSBundle();
         restoreExecutablePath();
+        SBRestoreProcessIdentity();
+        SBClearGuestEnvironment();
         return [self failWithError:error
                               code:SBGuestLoaderErrorGuestLoadFailed
                            message:[NSString stringWithFormat:@"客 App 加载失败：%@", bundleLoadError.localizedDescription]
@@ -326,6 +389,8 @@ static void SBRewriteProcessIdentity(NSString *guestExecPath) {
         restoreMainCFBundle();
         restoreMainNSBundle();
         restoreExecutablePath();
+        SBRestoreProcessIdentity();
+        SBClearGuestEnvironment();
         if (error) {
             *error = entryError;
         }
@@ -336,6 +401,8 @@ static void SBRewriteProcessIdentity(NSString *guestExecPath) {
         restoreMainCFBundle();
         restoreMainNSBundle();
         restoreExecutablePath();
+        SBRestoreProcessIdentity();
+        SBClearGuestEnvironment();
         if (error) {
             *error = entryError;
         }
@@ -357,6 +424,8 @@ static void SBRewriteProcessIdentity(NSString *guestExecPath) {
     restoreMainCFBundle();
     restoreMainNSBundle();
     restoreExecutablePath();
+    SBRestoreProcessIdentity();
+    SBClearGuestEnvironment();
     [SBGuestLoader clearLaunchRequest];
     SBDiagLogLine([[NSString stringWithFormat:@"客 App 已退出（返回码 %d），回到桌面", guestResult] UTF8String]);
     NSLog(@"[Sealbox] 客 App 已退出（返回码 %d），回到桌面", guestResult);

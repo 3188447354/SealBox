@@ -250,6 +250,11 @@ final class SBAppCoordinator: ObservableObject {
     /// 请求；签名失败直接弹错，不发重启（否则客 App 在新进程里加载注入件时
     /// 会被 dyld 以 Team 不一致拒绝——0.2.1 自测 dlopen 报的同一个根）。
     /// 无证书时跳过这一步，由重启请求里的证书门弹“去导入证书”。
+    ///
+    /// 0.2.6 重打补丁门：patchRevision 比当前低的已装应用（0.2.4 及更早装的
+    /// 包，主可执行文件缺 LC_ID_DYLIB，dlopen 必败——0.2.5 真机实证），
+    /// 先走 SBInstaller.repatchInstalledApp 重打补丁 + 重签，成功才继续；
+    /// 失败弹错，不发重启请求。
     func launchApp(_ app: SBInstalledApp) {
         if app.needsReimport {
             activeAlert = CoordinatorAlert(
@@ -270,10 +275,27 @@ final class SBAppCoordinator: ObservableObject {
         isLaunching = true
         if SBCertificate.hasCertificate {
             Task {
+                // 0.2.6：旧版本装的包先重打补丁 + 重签（patchRevision < 2 的
+                // 包主可执行文件缺 LC_ID_DYLIB，dlopen 必败——0.2.5 真机实证）。
+                // 重打失败直接弹错，不发重启请求。
+                var appToLaunch = app
+                if app.patchRevision < SBConstants.patchRevision {
+                    do {
+                        appToLaunch = try await SBInstaller.repatchInstalledApp(app)
+                    } catch {
+                        await MainActor.run {
+                            self.isLaunching = false
+                            self.activeAlert = CoordinatorAlert(
+                                title: "启动失败",
+                                message: "旧版本应用升级失败：\(error.localizedDescription)，请删除后重新导入")
+                        }
+                        return
+                    }
+                }
                 let ok = await SBCertificate.ensureHooksDylibSigned()
                 await MainActor.run {
                     if ok {
-                        self.requestRestart(app: app)
+                        self.requestRestart(app: appToLaunch)
                     } else {
                         self.isLaunching = false
                         self.activeAlert = CoordinatorAlert(

@@ -63,6 +63,17 @@ int32_t SBMachOPatchExecutable(const char *path, const char *hooks_dylib_path,
 /// - Returns: `SB_MACHO_PATCH_OK` 为成功，`SB_MACHO_PATCH_ERR_IO` 为读写失败。
 int32_t SBMachOPatchARM64eFile(const char *path);
 
+/// 检查 Mach-O 文件里每个 arm64 / arm64e 切片是否都有 LC_ID_DYLIB。
+/// 0.2.6 新增：打补丁后校验用——dlopen 一个 MH_DYLIB 时 dyld 要求它带
+/// LC_ID_DYLIB，缺了启动必败（0.2.5 真机：pip_swift 已是 MH_DYLIB 但
+/// 缺 LC_ID_DYLIB，dlopen 报 "MH_DYLIB is missing LC_ID_DYLIB"）。
+/// 打补丁器在空间实在不够时是静默跳过 LC_ID_DYLIB 的（与 LC 一致），
+/// 所以调用方打完补丁必须用这个函数校验，缺了就报明确错误，别装坏包。
+/// - Returns: 至少一个 arm64 切片、且每个 arm64 切片都有 LC_ID_DYLIB
+///   时返回 1；否则返回 0（读不到、不是 Mach-O、没有 arm64 切片、
+///   任一切片缺 LC_ID_DYLIB 均返回 0）。
+int SBMachOHasIDDylib(const char *path);
+
 #ifdef __cplusplus
 }
 #endif
