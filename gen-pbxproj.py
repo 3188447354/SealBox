@@ -23,6 +23,13 @@ Transformations applied to the base (0.2.0 step 1: container skeleton):
      (the 0.1.1 base allowed iPhone landscape; the shell does not).
   5. Scheme: the 0.1.1 scheme verbatim (3 BuildActionEntries); its
      BlueprintIdentifiers must match the target IDs in the new pbxproj.
+  6. Container/SealboxApp sync group (0.2.0 step 6 fix): SBAppCoordinator.swift
+     and SBLaunchRouter.swift moved Sources/SealboxApp ->
+     Sources/Container/SealboxApp in step 1, but no sync group covered that
+     directory, so both files silently dropped out of the app target (nothing
+     referenced them, CI stayed green until step 6 wired the launch router).
+     New sync group ID 5EED00000000000000000053, added to the main group
+     children and to the app target's fileSystemSynchronizedGroups.
 
 Kept exactly as the base: Security.framework in the app and SBGuestHooks
 Frameworks phases; Embed Frameworks (ZSign.dylib, SBGuestHooks.dylib,
@@ -62,6 +69,9 @@ REMOVED_GROUPS = {
     "5EED0000000000000000001D": "Desktop",
     "5EED0000000000000000001E": "Settings",
 }
+# Sync-group object ID for Sources/Container/SealboxApp (step 6 fix).
+# ...53 is above every ID used in the 0.1.1 base, so it cannot collide.
+CONTAINER_SEALBOXAPP_GROUP_ID = "5EED00000000000000000053"
 # App target XCBuildConfiguration object IDs (Debug, Release).
 APP_CONFIGS = ("5EED00000000000000000040", "5EED00000000000000000041")
 # Paths provided by CI-cloned submodules, not present in a plain checkout.
@@ -151,6 +161,47 @@ def transform_pbxproj(base):
             "UIInterfaceOrientationPortrait;",
             cfg)
         text = text[:start] + block + text[end:]
+
+    # 5. Container/SealboxApp sync group (step 6 fix): SBAppCoordinator.swift
+    #    and SBLaunchRouter.swift moved Sources/SealboxApp ->
+    #    Sources/Container/SealboxApp in step 1, but no sync group covered
+    #    that directory, so both files silently dropped out of the app
+    #    target (nothing referenced them, CI stayed green until step 6
+    #    wired the launch router). New group ID ...53, unused in the base.
+    new_group = (
+        "\t\t%s /* SealboxApp */ = {\n"
+        "\t\t\tisa = PBXFileSystemSynchronizedRootGroup;\n"
+        "\t\t\texplicitFileTypes = {};\n"
+        "\t\t\texplicitFolders = ();\n"
+        "\t\t\tpath = \"Sources/Container/SealboxApp\";\n"
+        "\t\t\tsourceTree = \"<group>\";\n"
+        "\t\t};\n" % CONTAINER_SEALBOXAPP_GROUP_ID
+    )
+    cert_group_end = (
+        "\t\t\tpath = \"Sources/Container/Certificate\";\n"
+        "\t\t\tsourceTree = \"<group>\";\n"
+        "\t\t};\n"
+    )
+    text = replace_once(text, cert_group_end, cert_group_end + new_group,
+                        "Certificate sync-group block")
+    text = replace_once(
+        text,
+        "5EED0000000000000000001C /* Certificate */, "
+        "5EED0000000000000000001F /* GuestHooks */, ",
+        "5EED0000000000000000001C /* Certificate */, "
+        "%s /* SealboxApp */, "
+        "5EED0000000000000000001F /* GuestHooks */, "
+        % CONTAINER_SEALBOXAPP_GROUP_ID,
+        "main group children")
+    text = replace_once(
+        text,
+        "5EED0000000000000000001C /* Certificate */, "
+        "5EED00000000000000000022 /* litehook */, ",
+        "5EED0000000000000000001C /* Certificate */, "
+        "%s /* SealboxApp */, "
+        "5EED00000000000000000022 /* litehook */, "
+        % CONTAINER_SEALBOXAPP_GROUP_ID,
+        "app target fileSystemSynchronizedGroups")
 
     return text
 

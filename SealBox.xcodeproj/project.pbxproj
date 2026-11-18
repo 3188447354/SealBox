@@ -280,6 +280,13 @@
 			path = "Sources/Container/Certificate";
 			sourceTree = "<group>";
 		};
+		5EED00000000000000000053 /* SealboxApp */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			explicitFileTypes = {};
+			explicitFolders = ();
+			path = "Sources/Container/SealboxApp";
+			sourceTree = "<group>";
+		};
 		5EED0000000000000000001F /* GuestHooks */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			explicitFileTypes = {};
@@ -339,7 +346,7 @@
 		};
 		5EED00000000000000000025 /* SealBox */ = {
 			isa = PBXGroup;
-			children = (5EED00000000000000000016 /* SealboxApp */, 5EED00000000000000000017 /* Store */, 5EED00000000000000000018 /* Shared */, 5EED00000000000000000019 /* Importer */, 5EED0000000000000000001A /* Installer */, 5EED0000000000000000001B /* GuestLoader */, 5EED0000000000000000001C /* Certificate */, 5EED0000000000000000001F /* GuestHooks */, 5EED00000000000000000020 /* ZSign */, 5EED00000000000000000023 /* Resources */, 5EED00000000000000000021 /* xcconfigs */, 5EED00000000000000000002 /* entitlements.xml */, 5EED00000000000000000003 /* README.md */, 5EED00000000000000000004 /* LICENSE */, 5EED00000000000000000005 /* .gitignore */, 5EED00000000000000000006 /* .gitmodules */, 5EED0000000000000000000E /* OpenSSL.xcframework */, 5EED00000000000000000022 /* litehook */, 5EED00000000000000000024 /* Products */, );
+			children = (5EED00000000000000000016 /* SealboxApp */, 5EED00000000000000000017 /* Store */, 5EED00000000000000000018 /* Shared */, 5EED00000000000000000019 /* Importer */, 5EED0000000000000000001A /* Installer */, 5EED0000000000000000001B /* GuestLoader */, 5EED0000000000000000001C /* Certificate */, 5EED00000000000000000053 /* SealboxApp */, 5EED0000000000000000001F /* GuestHooks */, 5EED00000000000000000020 /* ZSign */, 5EED00000000000000000023 /* Resources */, 5EED00000000000000000021 /* xcconfigs */, 5EED00000000000000000002 /* entitlements.xml */, 5EED00000000000000000003 /* README.md */, 5EED00000000000000000004 /* LICENSE */, 5EED00000000000000000005 /* .gitignore */, 5EED00000000000000000006 /* .gitmodules */, 5EED0000000000000000000E /* OpenSSL.xcframework */, 5EED00000000000000000022 /* litehook */, 5EED00000000000000000024 /* Products */, );
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -356,7 +363,7 @@
 			buildPhases = (5EED00000000000000000035 /* Sources */, 5EED00000000000000000036 /* Frameworks */, 5EED00000000000000000037 /* Resources */, 5EED00000000000000000038 /* Embed Frameworks */, );
 			buildRules = ();
 			dependencies = (5EED00000000000000000050 /* ZSign */, 5EED00000000000000000052 /* SBGuestHooks */, );
-			fileSystemSynchronizedGroups = (5EED00000000000000000016 /* SealboxApp */, 5EED00000000000000000017 /* Store */, 5EED00000000000000000018 /* Shared */, 5EED00000000000000000019 /* Importer */, 5EED0000000000000000001A /* Installer */, 5EED0000000000000000001B /* GuestLoader */, 5EED0000000000000000001C /* Certificate */, 5EED00000000000000000022 /* litehook */, );
+			fileSystemSynchronizedGroups = (5EED00000000000000000016 /* SealboxApp */, 5EED00000000000000000017 /* Store */, 5EED00000000000000000018 /* Shared */, 5EED00000000000000000019 /* Importer */, 5EED0000000000000000001A /* Installer */, 5EED0000000000000000001B /* GuestLoader */, 5EED0000000000000000001C /* Certificate */, 5EED00000000000000000053 /* SealboxApp */, 5EED00000000000000000022 /* litehook */, );
 			name = "SealBox";
 			packageProductDependencies = ();
 			productName = "SealBox";
