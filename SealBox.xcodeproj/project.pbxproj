@@ -46,6 +46,10 @@
 			isa = PBXBuildFile;
 			fileRef = 5EED00000000000000000007 /* Assets.xcassets */;
 		};
+		5EED00000000000000000055 /* Via-1.9.0.ipa */ = {
+			isa = PBXBuildFile;
+			fileRef = 5EED00000000000000000054 /* Via-1.9.0.ipa */;
+		};
 		5EED00000000000000000030 /* ZSign.dylib */ = {
 			isa = PBXBuildFile;
 			fileRef = 5EED00000000000000000013 /* ZSign.dylib */;
@@ -121,6 +125,13 @@
 			lastKnownFileType = "folder.assetcatalog";
 			name = "Assets.xcassets";
 			path = "Assets.xcassets";
+			sourceTree = "<group>";
+		};
+		5EED00000000000000000054 /* Via-1.9.0.ipa */ = {
+			isa = PBXFileReference;
+			lastKnownFileType = file;
+			name = "Via-1.9.0.ipa";
+			path = "SeedApps/Via-1.9.0.ipa";
 			sourceTree = "<group>";
 		};
 		5EED00000000000000000008 /* Global.xcconfig */ = {
@@ -333,7 +344,7 @@
 /* Begin PBXGroup section */
 		5EED00000000000000000023 /* Resources */ = {
 			isa = PBXGroup;
-			children = (5EED00000000000000000007 /* Assets.xcassets */, );
+			children = (5EED00000000000000000007 /* Assets.xcassets */, 5EED00000000000000000054 /* Via-1.9.0.ipa */, );
 			name = "Resources";
 			path = "Resources";
 			sourceTree = "<group>";
@@ -429,7 +440,7 @@
 /* Begin PBXResourcesBuildPhase section */
 		5EED00000000000000000037 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
-			files = (5EED0000000000000000002F /* Assets.xcassets */, );
+			files = (5EED0000000000000000002F /* Assets.xcassets */, 5EED00000000000000000055 /* Via-1.9.0.ipa */, );
 		};
 /* End PBXResourcesBuildPhase section */
 /* Begin PBXSourcesBuildPhase section */

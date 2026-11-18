@@ -30,6 +30,9 @@ Transformations applied to the base (0.2.0 step 1: container skeleton):
      referenced them, CI stayed green until step 6 wired the launch router).
      New sync group ID 5EED00000000000000000053, added to the main group
      children and to the app target's fileSystemSynchronizedGroups.
+  7. Seed app (0.2.1): Via-1.9.0.ipa as a plain resource (explicit file
+     reference ...54 + build file ...55, in the Resources group and the
+     Resources build phase), so SBSeedApps can install it on first launch.
 
 Kept exactly as the base: Security.framework in the app and SBGuestHooks
 Frameworks phases; Embed Frameworks (ZSign.dylib, SBGuestHooks.dylib,
@@ -72,6 +75,11 @@ REMOVED_GROUPS = {
 # Sync-group object ID for Sources/Container/SealboxApp (step 6 fix).
 # ...53 is above every ID used in the 0.1.1 base, so it cannot collide.
 CONTAINER_SEALBOXAPP_GROUP_ID = "5EED00000000000000000053"
+# Seed-app resource (0.2.1, step 7): Via IPA bundled as a plain resource.
+# ...54 (file reference) and ...55 (build file) are above ...53.
+VIA_IPA_FILEREF_ID = "5EED00000000000000000054"
+VIA_IPA_BUILDFILE_ID = "5EED00000000000000000055"
+VIA_IPA_PATH = "Resources/SeedApps/Via-1.9.0.ipa"
 # App target XCBuildConfiguration object IDs (Debug, Release).
 APP_CONFIGS = ("5EED00000000000000000040", "5EED00000000000000000041")
 # Paths provided by CI-cloned submodules, not present in a plain checkout.
@@ -203,6 +211,62 @@ def transform_pbxproj(base):
         % CONTAINER_SEALBOXAPP_GROUP_ID,
         "app target fileSystemSynchronizedGroups")
 
+    # 7. Seed app (0.2.1): bundle Via-1.9.0.ipa as a plain resource so the
+    # app can install it on first launch (SBSeedApps). Explicit file
+    # reference + build file, NOT a sync group: Resources is a plain
+    # PBXGroup in the base, and a synced group would drag the whole
+    # directory (including the .xcassets) into the target a second way.
+    # The file lands at the bundle root as Via-1.9.0.ipa (group paths are
+    # flattened for resources); SBSeedApps also tries SeedApps/ as fallback.
+    via_fileref = (
+        "\t\t%s /* Via-1.9.0.ipa */ = {\n"
+        "\t\t\tisa = PBXFileReference;\n"
+        "\t\t\tlastKnownFileType = file;\n"
+        "\t\t\tname = \"Via-1.9.0.ipa\";\n"
+        "\t\t\tpath = \"SeedApps/Via-1.9.0.ipa\";\n"
+        "\t\t\tsourceTree = \"<group>\";\n"
+        "\t\t};\n" % VIA_IPA_FILEREF_ID
+    )
+    assets_fileref_end = (
+        "\t\t5EED00000000000000000007 /* Assets.xcassets */ = {\n"
+        "\t\t\tisa = PBXFileReference;\n"
+        "\t\t\tlastKnownFileType = \"folder.assetcatalog\";\n"
+        "\t\t\tname = \"Assets.xcassets\";\n"
+        "\t\t\tpath = \"Assets.xcassets\";\n"
+        "\t\t\tsourceTree = \"<group>\";\n"
+        "\t\t};\n"
+    )
+    text = replace_once(text, assets_fileref_end,
+                        assets_fileref_end + via_fileref,
+                        "Assets file reference block")
+    via_buildfile = (
+        "\t\t%s /* Via-1.9.0.ipa */ = {\n"
+        "\t\t\tisa = PBXBuildFile;\n"
+        "\t\t\tfileRef = %s /* Via-1.9.0.ipa */;\n"
+        "\t\t};\n" % (VIA_IPA_BUILDFILE_ID, VIA_IPA_FILEREF_ID)
+    )
+    assets_buildfile = (
+        "\t\t5EED0000000000000000002F /* Assets.xcassets */ = {\n"
+        "\t\t\tisa = PBXBuildFile;\n"
+        "\t\t\tfileRef = 5EED00000000000000000007 /* Assets.xcassets */;\n"
+        "\t\t};\n"
+    )
+    text = replace_once(text, assets_buildfile,
+                        assets_buildfile + via_buildfile,
+                        "Assets build file block")
+    text = replace_once(
+        text,
+        "children = (5EED00000000000000000007 /* Assets.xcassets */, );",
+        "children = (5EED00000000000000000007 /* Assets.xcassets */, "
+        "%s /* Via-1.9.0.ipa */, );" % VIA_IPA_FILEREF_ID,
+        "Resources group children")
+    text = replace_once(
+        text,
+        "files = (5EED0000000000000000002F /* Assets.xcassets */, );",
+        "files = (5EED0000000000000000002F /* Assets.xcassets */, "
+        "%s /* Via-1.9.0.ipa */, );" % VIA_IPA_BUILDFILE_ID,
+        "Resources build phase files")
+
     return text
 
 
@@ -244,6 +308,17 @@ def self_check(pbxproj, scheme):
     # Quoted DYLIB_INSTALL_NAME_BASE kept (4x: ZSign + Hooks, Dbg + Rel).
     if pbxproj.count('DYLIB_INSTALL_NAME_BASE = "@rpath";') != 4:
         errors.append("DYLIB_INSTALL_NAME_BASE quoted form not x4")
+
+    # Seed Via IPA (0.2.1): file on disk, file reference + build file in
+    # the pbxproj, and membership in the Resources build phase.
+    if not os.path.exists(os.path.join(ROOT, VIA_IPA_PATH)):
+        errors.append("seed Via IPA missing on disk: %s" % VIA_IPA_PATH)
+    if VIA_IPA_FILEREF_ID not in defined:
+        errors.append("Via IPA file reference %s missing" % VIA_IPA_FILEREF_ID)
+    if VIA_IPA_BUILDFILE_ID not in defined:
+        errors.append("Via IPA build file %s missing" % VIA_IPA_BUILDFILE_ID)
+    if pbxproj.count("%s /* Via-1.9.0.ipa */" % VIA_IPA_BUILDFILE_ID) != 2:
+        errors.append("Via IPA not in Resources build phase files")
 
     # Version / target markers.
     if pbxproj.count("MARKETING_VERSION = 0.2.1;") != 2:

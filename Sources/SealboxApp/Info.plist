@@ -6,6 +6,8 @@
 	<string>en</string>
 	<key>CFBundleDisplayName</key>
 	<string>虚拟机</string>
+	<key>NSFaceIDUsageDescription</key>
+	<string>使用面容 ID 解锁虚拟机。</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>

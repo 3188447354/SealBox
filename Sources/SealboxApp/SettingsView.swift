@@ -109,7 +109,7 @@ struct SettingsView: View {
                     VStack(alignment: .leading, spacing: 3) {
                         Text("虚拟机用户")
                             .font(.title3)
-                        Text("Apple 账号")
+                        Text("未登录")
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
                     }
@@ -406,9 +406,8 @@ private struct HotspotSettingsView: View {
                     hotspotPassword = VMPasswords.randomHotspotPassword()
                     copied = false
                 }
-                LabeledRow(label: "最多连接数", value: "5 台设备")
             } footer: {
-                Text("开启个人热点后，其他设备可通过无线局域网加入并共享蜂窝数据。点一下密码可复制到剪贴板。")
+                Text("虚拟机内不真的开启热点，这里只保存开关与密码；点一下密码可复制到剪贴板。")
             }
         }
         .navigationTitle("个人热点")
@@ -473,10 +472,9 @@ private struct GeneralSettingsView: View {
 
 /// Checks only this VM app's own version. The version shown is the app's
 /// real Bundle version — never an invented iOS version number.
+/// 0.2.1：删掉了假的“检查更新”按钮——它只睡 1.2 秒就报“已是最新版本”，
+/// 什么都没检查。没有可用的更新检查服务，不装样子。
 private struct SoftwareUpdateView: View {
-    @State private var checking = false
-    @State private var checked = false
-
     var body: some View {
         List {
             Section {
@@ -486,36 +484,8 @@ private struct SoftwareUpdateView: View {
                     Text(VMDevice.appVersionString)
                         .foregroundStyle(.secondary)
                 }
-                if checked {
-                    HStack {
-                        Image(systemName: "checkmark.circle.fill")
-                            .foregroundStyle(.green)
-                        Text("已是最新版本")
-                    }
-                }
             } footer: {
-                Text("这里只检查虚拟机 App 自身的版本，不检查 iOS 系统版本。")
-            }
-            Section {
-                Button {
-                    checking = true
-                    checked = false
-                    Task { @MainActor in
-                        try? await Task.sleep(nanoseconds: 1_200_000_000)
-                        checking = false
-                        checked = true
-                    }
-                } label: {
-                    if checking {
-                        HStack {
-                            ProgressView()
-                            Text("正在检查更新…")
-                        }
-                    } else {
-                        Text("检查更新")
-                    }
-                }
-                .disabled(checking)
+                Text("没有可用的更新检查服务；新版本随 IPA 文件发放。")
             }
         }
         .navigationTitle("软件更新")
@@ -794,6 +764,9 @@ private struct DisplaySettingsView: View {
                 Toggle("原彩显示", isOn: $trueTone)
             } header: {
                 Text("外观")
+            } footer: {
+                // 0.2.1：原彩开关只保存设置，App 改不了本机原彩，旧版没写明。
+                Text("原彩显示只保存开关，改不了本机原彩设置。")
             }
         }
         .navigationTitle("显示与亮度")
@@ -985,7 +958,10 @@ private struct FaceIDSettingsView: View {
             Section {
                 Toggle("面容 ID", isOn: $faceID)
             } footer: {
-                Text(faceID ? "面容 ID 已设置，可用于解锁与 App Store 购买。" : "未设置面容 ID。开启后可用于解锁与 App Store 购买。")
+                // 0.2.1：旧文案“可用于解锁与 App Store 购买”是假的——
+                // 虚拟机没有录入面容，也买不了东西。开着只表示：设了密码后，
+                // 启动时可用本机面容 ID 解锁虚拟机。
+                Text("开启后，设置密码时可用本机面容 ID 解锁虚拟机。")
             }
             Section {
                 NavigationLink {
@@ -997,7 +973,7 @@ private struct FaceIDSettingsView: View {
                     )
                 }
             } footer: {
-                Text(passcode.isEmpty ? "未设置虚拟机密码。" : "已设置虚拟机 4 位密码。")
+                Text(passcode.isEmpty ? "未设置虚拟机密码。" : "已设置虚拟机 4 位密码，每次启动虚拟机时需要输入。")
             }
         }
         .navigationTitle("面容 ID 与密码")

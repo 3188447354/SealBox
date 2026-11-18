@@ -1,4 +1,5 @@
 import SwiftUI
+import LocalAuthentication
 
 // PhoneVM home-screen shell (0.1.4): full-function build.
 // Navigation: home icons open apps full-screen (slide from right);
@@ -22,8 +23,14 @@ struct VMRootView: View {
     @EnvironmentObject private var coordinator: SBAppCoordinator
     @AppStorage("vm.appearanceDark") private var appearanceDark = true
     @AppStorage("vm.plugin.statusBarFancy") private var statusBarFancy = false
+    @AppStorage("vm.settings.passcode") private var passcode = ""
+    @AppStorage("vm.settings.faceID") private var faceIDOn = false
     @State private var didRouteLaunch = false
     @State private var didMigrate = false
+    @State private var didDecideLock = false
+    @State private var didSeedCheck = false
+    @State private var showLock = false
+    @State private var unlocked = false
 
     var body: some View {
         ZStack {
@@ -42,12 +49,25 @@ struct VMRootView: View {
                 FancyStatusBar()
                     .zIndex(2)
             }
+
+            // 密码锁（0.2.1）：盖在最上层；解锁前桌面和各应用页都点不到。
+            if showLock && !unlocked {
+                VMLockView(passcode: passcode, faceIDOn: faceIDOn) {
+                    unlocked = true
+                }
+                .zIndex(3)
+            }
         }
         .animation(.easeInOut(duration: 0.28), value: vm.openApp)
         .preferredColorScheme(appearanceDark ? .dark : .light)
         .statusBar(hidden: statusBarFancy)
         .overlay(alignment: .bottom) { homeSwipeZone }
         .onAppear {
+            // 0.2.1：删掉的“自定义手势”开关在旧手机上还留着一个死值，清掉。
+            UserDefaults.standard.removeObject(forKey: "vm.plugin.customGestures")
+            // 密码锁的决定必须在启动路由之前做：路由会消费重起收据，
+            // 之后再查 isGuestLaunchRequested 就永远是 false，锁会错挡客 App。
+            let guestLaunchPending = SBGuestLoader.isGuestLaunchRequested()
             // 桌面先读一次 SBStore（单源头），再跑启动路由与旧记录迁移。
             SBStore.shared.loadInstalledApps()
             // 启动路由只跑一次：重起进客 App 时兑现收据加载客 App，
@@ -66,6 +86,21 @@ struct VMRootView: View {
                     await MainActor.run {
                         SBStore.shared.loadInstalledApps()
                     }
+                }
+            }
+            // 密码锁（0.2.1）：设了密码才锁；重起进客 App 的那次启动不锁，
+            // 否则客 App 出不来。只决定一次，解锁状态跟随本次进程。
+            if !didDecideLock {
+                didDecideLock = true
+                if !passcode.isEmpty && !guestLaunchPending {
+                    showLock = true
+                }
+            }
+            // 种子应用（0.2.1：Via）：后台装一次，不阻塞启动；装完桌面刷新。
+            if !didSeedCheck {
+                didSeedCheck = true
+                Task {
+                    await SBSeedApps.installIfNeeded(coordinator: coordinator)
                 }
             }
         }
@@ -171,5 +206,135 @@ struct VMRootView: View {
                         }
                     }
             )
+    }
+}
+
+// MARK: - 密码锁（0.2.1）
+
+/// 设了虚拟机密码后，每次冷启动都要输密码才能进桌面；面容 ID 开关开着时，
+/// 可用本机面容 ID 解锁。重起进客 App 时不显示（VMRootView 在 onAppear 里、
+/// 启动路由之前决定 showLock）。输错只报错不锁死；忘密码只能删 App 重装
+/// （密码存在本机 UserDefaults，删 App 即清）。
+private struct VMLockView: View {
+    let passcode: String
+    let faceIDOn: Bool
+    let onUnlock: () -> Void
+    @State private var entry = ""
+    @State private var error = ""
+    @State private var faceIDError = ""
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.94).ignoresSafeArea()
+            VStack(spacing: 28) {
+                Spacer()
+                Image(systemName: "lock.fill")
+                    .font(.system(size: 44))
+                    .foregroundStyle(.white)
+                Text("输入密码")
+                    .font(.title3)
+                    .foregroundStyle(.white)
+                HStack(spacing: 16) {
+                    ForEach(0..<4, id: \.self) { index in
+                        Circle()
+                            .fill(index < entry.count ? Color.white : Color.white.opacity(0.4))
+                            .frame(width: 14, height: 14)
+                    }
+                }
+                if !error.isEmpty {
+                    Text(error)
+                        .foregroundStyle(.red)
+                }
+                keypad
+                if faceIDOn {
+                    Button("使用面容 ID") {
+                        authenticateWithFaceID()
+                    }
+                    .foregroundStyle(.white)
+                    if !faceIDError.isEmpty {
+                        Text(faceIDError)
+                            .font(.footnote)
+                            .foregroundStyle(.red)
+                    }
+                }
+                Spacer()
+            }
+        }
+    }
+
+    private var keypad: some View {
+        let keys: [[String]] = [
+            ["1", "2", "3"],
+            ["4", "5", "6"],
+            ["7", "8", "9"],
+            ["", "0", "⌫"],
+        ]
+        return VStack(spacing: 16) {
+            ForEach(keys, id: \.self) { row in
+                HStack(spacing: 28) {
+                    ForEach(row, id: \.self) { key in
+                        if key.isEmpty {
+                            Color.clear.frame(width: 64, height: 64)
+                        } else if key == "⌫" {
+                            Button {
+                                if !entry.isEmpty { entry.removeLast() }
+                            } label: {
+                                Image(systemName: "delete.left.fill")
+                                    .font(.system(size: 24))
+                                    .foregroundStyle(.white)
+                                    .frame(width: 64, height: 64)
+                            }
+                            .buttonStyle(.plain)
+                        } else {
+                            Button { pressDigit(key) } label: {
+                                Text(key)
+                                    .font(.system(size: 28, weight: .light))
+                                    .foregroundStyle(.white)
+                                    .frame(width: 64, height: 64)
+                                    .background(Color.white.opacity(0.15), in: Circle())
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func pressDigit(_ digit: String) {
+        guard entry.count < 4 else { return }
+        entry.append(digit)
+        guard entry.count == 4 else { return }
+        if entry == passcode {
+            error = ""
+            onUnlock()
+        } else {
+            error = "密码不对"
+            entry = ""
+        }
+    }
+
+    private func authenticateWithFaceID() {
+        let context = LAContext()
+        var evalError: NSError?
+        guard context.canEvaluatePolicy(
+            .deviceOwnerAuthenticationWithBiometrics, error: &evalError) else {
+            faceIDError = "本机面容 ID 不可用"
+            return
+        }
+        Task {
+            do {
+                let ok = try await context.evaluatePolicy(
+                    .deviceOwnerAuthenticationWithBiometrics,
+                    localizedReason: "解锁虚拟机")
+                if ok {
+                    await MainActor.run { onUnlock() }
+                }
+            } catch let error as LAError where error.code == .userCancel {
+                // 用户取消，不报错。
+            } catch {
+                await MainActor.run { faceIDError = "面容 ID 验证失败" }
+            }
+        }
     }
 }

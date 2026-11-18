@@ -18,6 +18,8 @@ final class SBStore: ObservableObject {
         static let launchReceipt = "SBLaunchReceipt"
         static let certificateImportedDate = "SBCertificateImportedDate"
         static let displayNameOverrides = "SBDisplayNameOverrides"
+        /// 种子应用 Via 已装过（0.2.1）：置位后不再自动种；用户删了也不补。
+        static let seedViaInstalled = "SBSeedViaInstalled"
     }
 
     init(defaults: UserDefaults? = nil) {
@@ -188,5 +190,13 @@ final class SBStore: ObservableObject {
     var certificateImportedDate: Date? {
         get { defaults.object(forKey: Key.certificateImportedDate) as? Date }
         set { defaults.set(newValue, forKey: Key.certificateImportedDate) }
+    }
+
+    // MARK: - 种子应用（0.2.1：Via）
+
+    /// Via 种子已装过：置位后首次启动不再自动种；用户删了也不补。
+    var seedViaInstalled: Bool {
+        get { defaults.bool(forKey: Key.seedViaInstalled) }
+        set { defaults.set(newValue, forKey: Key.seedViaInstalled) }
     }
 }
