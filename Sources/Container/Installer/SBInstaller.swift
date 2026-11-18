@@ -345,6 +345,11 @@ public enum SBInstaller {
                     entitlementXML: entry.entitlements
                 )
             }
+            // 0.2.7 签后验签：重签完立刻在本地验一遍主可执行文件，确认签名真能
+            // 被系统接受再记 patchRevision——不要等到 dlopen 那步才由 dyld 报
+            // 一个无法定位的 code signature invalid。任一失败都抛错，外层
+            // catch 会把主可执行文件还原回备份（重打补丁前的状态）。
+            try verifyResignedExecutable(executablePath)
         } catch {
             // 任一步失败：主可执行文件还原，记录不动。
             if fileManager.fileExists(atPath: executablePath) {
@@ -378,6 +383,38 @@ public enum SBInstaller {
         )
         SBStore.shared.upsertApp(updated)
         return updated
+    }
+
+    /// 0.2.7 签后验签：重签完立刻校验主可执行文件，两项都过才算签好了。
+    /// ① 结构校验（SBCodesignCheck）：superblob/CodeDirectory 可解析、每页
+    /// 内容哈希与 CodeDirectory 一致、CMS 签名块存在。任一不过，dyld 在
+    /// dlopen 时一定报 code signature invalid——在这里拦住比在启动时报
+    /// 一个无法定位的错强得多。
+    /// ② Team 一致：客主程序的 Team 必须与宿主进程的 Team 一致（dyld 的
+    /// Team 校验）；两边都有 Team 且不同时，系统一定拒绝加载。宿主没有
+    /// Team（CI 自签原样安装）时跳过这一项——没有 Team 的宿主不触发 dyld
+    /// 的 Team 校验，判不一致是误报。
+    /// 只抛错、不静默：调用方在 do 块内，抛错会走 catch 还原备份。
+    private static func verifyResignedExecutable(_ executablePath: String) throws {
+        do {
+            // ObjC 的 validateSignatureAtPath:error: 在 Swift 侧以 throws
+            // 形式导入；失败时 error 即校验原因。
+            try SBCodesignCheck.validateSignature(atPath: executablePath)
+        } catch {
+            throw SBError.signFailed(
+                reason: "重签后验签失败：\(error.localizedDescription)"
+            )
+        }
+        let guestTeam = SBCodesignCheck.teamIdentifier(atPath: executablePath)
+        let hostExecutablePath = Bundle.main.executableURL?.path
+        let hostTeam = hostExecutablePath.flatMap { SBCodesignCheck.teamIdentifier(atPath: $0) }
+        NSLog("[SBInstaller] repatch verify: guestTeam=%@ hostTeam=%@",
+              guestTeam ?? "(nil)", hostTeam ?? "(nil)")
+        if let guestTeam = guestTeam, let hostTeam = hostTeam, guestTeam != hostTeam {
+            throw SBError.signFailed(
+                reason: "重签后验签失败：客应用签名 Team（\(guestTeam)）与宿主 Team（\(hostTeam)）不一致，系统会拒绝加载"
+            )
+        }
     }
 
     /// 从解析出的 .app 路径反推解析时的临时根目录：往上找到名字以

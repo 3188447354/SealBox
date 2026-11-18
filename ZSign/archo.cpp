@@ -428,7 +428,16 @@ bool ZArchO::BuildCodeSignature(ZSignAsset* pSignAsset,
 
 	string strCMSSignatureSlot;
 	if (!pSignAsset->m_bAdhoc) { //adhoc remove cms signature slot
-		ZSign::SlotBuildCMSSignature(pSignAsset, strCodeDirectorySlot, strAltnateCodeDirectorySlot, strCMSSignatureSlot);
+		// 0.2.7：CMS 生成失败必须是致命错误。之前这里忽略返回值：证书颁发者
+		// 不是已知的两个 Apple 开发 CA（或 CMS 生成出错）时 GenerateCMS 返回
+		// false，strCMSSignatureSlot 留空，签名照常“成功”——但产出的超块里没有
+		// CMS 签名槽，dyld 加载时以 code signature invalid 拒绝，报错却落在
+		// dlopen 那步、与真正的签名损坏无法区分。失败时直接返回 false，调用方
+		//（重打补丁/安装）会还原备份并报签名失败，而不是留一个卸不掉的坏签名。
+		if (!ZSign::SlotBuildCMSSignature(pSignAsset, strCodeDirectorySlot, strAltnateCodeDirectorySlot, strCMSSignatureSlot) || strCMSSignatureSlot.empty()) {
+			ZLog::Error(">>> Build CMS signature failed! (unknown issuer or CMS error)\n");
+			return false;
+		}
 	}
 
 	uint32_t uCodeDirectorySlotLength = (uint32_t)strCodeDirectorySlot.size();
@@ -555,7 +564,13 @@ bool ZArchO::Sign(ZSignAsset* pSignAsset,
 	}
 
 	string strCodeSignBlob;
-	BuildCodeSignature(pSignAsset, bForce, strBundleId, strInfoSHA1, strInfoSHA256, strCodeResourcesSHA1, strCodeResourcesSHA256, strCodeSignBlob);
+	// 0.2.7：BuildCodeSignature 的返回值必须检查——之前只看 strCodeSignBlob
+	// 是否为空；CMS 生成失败这类错误若将来在 strOutput 已有内容时返回，
+	// 空串检查会漏掉，坏签名照样写盘。
+	if (!BuildCodeSignature(pSignAsset, bForce, strBundleId, strInfoSHA1, strInfoSHA256, strCodeResourcesSHA1, strCodeResourcesSHA256, strCodeSignBlob)) {
+		ZLog::Error(">>> Build CodeSignature failed!\n");
+		return false;
+	}
 	if (strCodeSignBlob.empty()) {
 		ZLog::Error(">>> Build CodeSignature failed!\n");
 		return false;
