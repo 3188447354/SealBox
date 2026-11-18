@@ -172,6 +172,13 @@ NSString *SBGuestEntitlementsRewrittenForTeam(NSString *entitlementsXML, NSStrin
     if ([teamValue isKindOfClass:[NSString class]]) {
         oldTeam = (NSString *)teamValue;
     }
+    // Via 这类 App 没有 team-identifier，只有 com.apple.developer.team-identifier。
+    if (!oldTeam) {
+        id devTeamValue = dict[@"com.apple.developer.team-identifier"];
+        if ([devTeamValue isKindOfClass:[NSString class]]) {
+            oldTeam = (NSString *)devTeamValue;
+        }
+    }
     if (!oldTeam) {
         id appID = dict[@"application-identifier"];
         if ([appID isKindOfClass:[NSString class]]) {
@@ -186,6 +193,11 @@ NSString *SBGuestEntitlementsRewrittenForTeam(NSString *entitlementsXML, NSStrin
         dict[@"application-identifier"] = SBEntRewritePrefixedString((NSString *)appID, oldTeam, teamID);
     }
     dict[@"team-identifier"] = teamID;
+    // com.apple.developer.team-identifier 与 team-identifier 是同一个 Team 的
+    // 两种写法：原包有哪个就改哪个，不能留一个旧 Team 在 entitlements 里。
+    if (dict[@"com.apple.developer.team-identifier"] != nil) {
+        dict[@"com.apple.developer.team-identifier"] = teamID;
+    }
     for (NSString *key in @[@"keychain-access-groups", @"application-groups"]) {
         id groups = dict[key];
         if (![groups isKindOfClass:[NSArray class]]) {

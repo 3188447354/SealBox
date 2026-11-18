@@ -22,9 +22,12 @@ NSString * _Nullable SBGuestEntitlementsExtractMachOAtPath(NSString *path);
 
 /// 把 entitlements XML 里的 Team 前缀换成 teamID。
 /// 改写项：application-identifier（前缀）、team-identifier（整值）、
-/// keychain-access-groups 与 application-groups 里以旧 Team 开头的元素。
-/// 旧 Team 从原 XML 的 team-identifier 取，取不到时从 application-identifier
-/// 的首段取；两个都取不到时只补 team-identifier。
+/// com.apple.developer.team-identifier（整值；Via 这类 App 只有这个键，
+/// 没有 team-identifier）、keychain-access-groups 与 application-groups
+/// 里以旧 Team 开头的元素。
+/// 旧 Team 从原 XML 的 team-identifier 取，取不到时从
+/// com.apple.developer.team-identifier 取，再取不到从 application-identifier
+/// 的首段取；三个都取不到时只补 team-identifier。
 /// XML 解析失败或序列化失败时返回 nil（调用方改用最小项合成）。
 NSString * _Nullable SBGuestEntitlementsRewrittenForTeam(NSString *entitlementsXML,
                                                         NSString *teamID);
