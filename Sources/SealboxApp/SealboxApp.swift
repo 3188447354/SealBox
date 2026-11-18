@@ -29,6 +29,7 @@ struct VMRootView: View {
     @State private var didMigrate = false
     @State private var didDecideLock = false
     @State private var didSeedCheck = false
+    @State private var didEnsureHooks = false
     @State private var showLock = false
     @State private var unlocked = false
 
@@ -101,6 +102,15 @@ struct VMRootView: View {
                 didSeedCheck = true
                 Task {
                     await SBSeedApps.installIfNeeded(coordinator: coordinator)
+                }
+            }
+            // 注入件签名（0.2.2）：启动时后台尽力而为一次——保证 Tweaks 里的
+            // SBGuestHooks.dylib 带着当前证书的 Team；失败不弹错（点图标启动前
+            // 与自测里还会再拦一次），只让件提前就位。
+            if !didEnsureHooks {
+                didEnsureHooks = true
+                Task.detached {
+                    _ = await SBCertificate.ensureHooksDylibSigned()
                 }
             }
         }

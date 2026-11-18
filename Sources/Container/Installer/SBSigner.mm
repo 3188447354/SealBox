@@ -5,6 +5,25 @@
 
 @implementation SBSigner
 
++ (void)signMachOAtPath:(NSString *)path
+               bundleID:(NSString *)bundleID
+               certData:(NSData *)certData
+               password:(NSString *)password
+             completion:(void (^)(BOOL success, NSError * _Nullable error))completion {
+    [ZSigner signMachOPathArr:@[ path ]
+                     bundleId:bundleID
+                         cert:certData
+                         pass:password
+            completionHandler:^(BOOL success, NSError *error) {
+                completion(success, error);
+            }];
+}
+
++ (nullable NSString *)teamIDWithCertData:(NSData *)certData
+                                 password:(NSString *)password {
+    return [ZSigner getTeamIdWithCert:certData pass:password];
+}
+
 + (void)signAppAtPath:(NSString *)appPath
              bundleID:(NSString *)bundleID
              certData:(NSData *)certData

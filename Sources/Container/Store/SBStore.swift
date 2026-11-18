@@ -50,64 +50,90 @@ final class SBStore: ObservableObject {
 
     // MARK: - 已装应用
 
+    /// 0.2.2 闪退根因修：`installedApps` 是 @Published、被桌面（HomeScreenView
+    /// 的 @ObservedObject）观察，但安装 / 迁移 / 删除管线都在后台线程跑
+    /// （种子安装 Task、SBMigration 的 Task.detached、ZSign 回调所在的全局队列）。
+    /// 0.2.1 之前这些后台线程直接写 `installedApps`，SwiftUI 禁止后台线程发布
+    /// 变更，设备上间歇闪退——0.2.1 首启 Via 种子安装必经此路，所以一开就崩。
+    /// 以下所有读写 `installedApps` 的方法一律经 `onMain` 回主线程；已在主线程
+    /// 时直接跑，不发同步派发。主线程从不阻塞等这些后台任务（全是 Task / await），
+    /// 所以 main.sync 不会死锁；嵌套调用时内层见已在主线程、直接跑。
+    /// UserDefaults 直读直写的字段（顺序、收据、旗标）本身线程安全，不走这里。
+    private func onMain<T>(_ work: () -> T) -> T {
+        if Thread.isMainThread {
+            return work()
+        }
+        return DispatchQueue.main.sync(execute: work)
+    }
+
     @Published private(set) var installedApps: [SBInstalledApp] = []
 
     func loadInstalledApps() -> [SBInstalledApp] {
-        guard let data = defaults.data(forKey: Key.installedApps) else {
-            installedApps = []
-            return []
+        onMain {
+            guard let data = defaults.data(forKey: Key.installedApps) else {
+                installedApps = []
+                return []
+            }
+            let apps = (try? Self.jsonDecoder.decode([SBInstalledApp].self, from: data)) ?? []
+            installedApps = apps
+            return apps
         }
-        let apps = (try? Self.jsonDecoder.decode([SBInstalledApp].self, from: data)) ?? []
-        installedApps = apps
-        return apps
     }
 
     func saveInstalledApps(_ apps: [SBInstalledApp]) {
-        installedApps = apps
-        if let data = try? Self.jsonEncoder.encode(apps) {
-            defaults.set(data, forKey: Key.installedApps)
+        onMain {
+            installedApps = apps
+            if let data = try? Self.jsonEncoder.encode(apps) {
+                defaults.set(data, forKey: Key.installedApps)
+            }
         }
     }
 
     func app(with bundleID: String) -> SBInstalledApp? {
-        installedApps.first { $0.bundleID == bundleID }
+        onMain { installedApps.first { $0.bundleID == bundleID } }
     }
 
     /// 同 Bundle ID 的全部记录（平行安装时多条共存）。
     func apps(with bundleID: String) -> [SBInstalledApp] {
-        installedApps.filter { $0.bundleID == bundleID }
+        onMain { installedApps.filter { $0.bundleID == bundleID } }
     }
 
     /// 按 recordID 匹配：平行安装的两条同 Bundle ID 记录必须共存，
     /// 原按 Bundle ID 替换会把平行安装的另一条吃掉（0.1.0 缺陷）。
     func upsertApp(_ app: SBInstalledApp) {
-        var apps = installedApps
-        if let index = apps.firstIndex(where: { $0.recordID == app.recordID }) {
-            apps[index] = app
-        } else {
-            apps.append(app)
+        onMain {
+            var apps = installedApps
+            if let index = apps.firstIndex(where: { $0.recordID == app.recordID }) {
+                apps[index] = app
+            } else {
+                apps.append(app)
+            }
+            saveInstalledApps(apps)
         }
-        saveInstalledApps(apps)
     }
 
     /// 只删记录，不删文件（文件删除由 Installer/Uninstaller 做）。
     /// 按 recordID 删，并同步清理桌面顺序与 Dock 顺序里该 recordID。
     func removeAppRecord(recordID: UUID) {
-        let recordIDString = recordID.uuidString
-        saveInstalledApps(installedApps.filter { $0.recordID != recordID })
-        var order = desktopIconOrder
-        order.removeAll { $0 == recordIDString }
-        desktopIconOrder = order
-        var dock = desktopDockOrder
-        dock.removeAll { $0 == recordIDString }
-        desktopDockOrder = dock
+        onMain {
+            let recordIDString = recordID.uuidString
+            saveInstalledApps(installedApps.filter { $0.recordID != recordID })
+            var order = desktopIconOrder
+            order.removeAll { $0 == recordIDString }
+            desktopIconOrder = order
+            var dock = desktopDockOrder
+            dock.removeAll { $0 == recordIDString }
+            desktopDockOrder = dock
+        }
     }
 
     func recordLaunchResult(bundleID: String, success: Bool, message: String) {
-        guard var app = app(with: bundleID) else { return }
-        app.lastLaunchResult = SBLaunchResult(
-            success: success, date: Date(), message: message)
-        upsertApp(app)
+        onMain {
+            guard var app = app(with: bundleID) else { return }
+            app.lastLaunchResult = SBLaunchResult(
+                success: success, date: Date(), message: message)
+            upsertApp(app)
+        }
     }
 
     func incrementLaunchCount(bundleID: String) {

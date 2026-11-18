@@ -1300,7 +1300,7 @@ private struct CertificateSettingsSection: View {
         } header: {
             Text("证书")
         } footer: {
-            Text("免费开发证书有效期 7 天，到期后需重新生成并重新导入，已装应用需重新签名。")
+            Text("免费开发证书有效期 7 天，到期后需重新生成并重新导入，已装应用需重新签名。自测校验签名有效性，不把测试件加载进宿主进程。")
         }
         .task { await refresh() }
         .alert(Text(alertTitle), isPresented: $showingAlert) {

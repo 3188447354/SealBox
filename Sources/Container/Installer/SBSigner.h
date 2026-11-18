@@ -9,6 +9,24 @@ NS_ASSUME_NONNULL_BEGIN
 
 @interface SBSigner : NSObject
 
+/// 对单个 Mach-O 签名（转发 `ZSigner signMachOPathArr`，单文件）。
+/// - Parameters:
+///   - path: Mach-O 文件的完整路径。
+///   - bundleID: 写进签名标识的 Bundle ID。
+///   - certData: p12 证书数据（NSData 传入，不走文件路径）。
+///   - password: p12 密码。
+///   - completion: 完成回调；成功时 error 为 nil。回调线程为 ZSign 内部队列，
+///     调用方自行回到需要的线程。
++ (void)signMachOAtPath:(NSString *)path
+               bundleID:(NSString *)bundleID
+               certData:(NSData *)certData
+               password:(NSString *)password
+             completion:(void (^)(BOOL success, NSError * _Nullable error))completion;
+
+/// 取 p12 证书的 Team ID（证书 subject 的 OU；取不到返回 nil）。
++ (nullable NSString *)teamIDWithCertData:(NSData *)certData
+                                 password:(NSString *)password;
+
 /// 对整个 .app 重签（转发 `ZSigner signWithAppPath`）。
 /// - Parameters:
 ///   - appPath: .app 在磁盘上的完整路径。

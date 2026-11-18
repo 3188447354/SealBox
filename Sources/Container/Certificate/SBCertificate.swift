@@ -251,6 +251,8 @@ public enum SBCertificate {
                 sawCertificate = true
                 cachedStatusText = expiration.map { statusText(for: $0) } ?? "证书已导入，有效期未知"
             }
+            // 证书刚换过：后台把注入件重签成新证书的 Team（0.2.2），下次点图标不用等。
+            Task.detached { _ = await SBCertificate.ensureHooksDylibSigned() }
         } catch {
             try? fileManager.removeItem(at: destination)
             throw error
@@ -280,7 +282,8 @@ public enum SBCertificate {
     // MARK: - 启动链自测（F1）
 
     /// 启动链自测：先查应用共享目录（App Group 权限缺失时当场报，不走到证书门），
-    /// 再过证书门，再调 SBGuestLoader 自测入口。
+    /// 再过证书门，再调 SBGuestLoader 自测入口（收据读写、证书校验、签名测试件、
+    /// 静态校验签名），最后校验注入件 Team（第 ⑥ 步）。
     /// 自测内部用信号量等 ZSign 回调，必须在后台线程跑，本方法已把调用派到全局队列，
     /// 调用方在主线程调本方法即可。设置页证书区直接调本入口。
     /// internal 即可：设置页与本文件在同一 App target 内；改成 public 会因返回
@@ -305,7 +308,13 @@ public enum SBCertificate {
         do {
             let passed = try await runSelfTestOnBackground(data: data, password: password)
             if passed {
-                return .success(())
+                // ⑥ 注入件 Team 校验（0.2.2）：客主程序与注入件必须同 Team 才能在新进程
+                // 里加载；ensureHooksDylibSigned 会在 Team 不一致时用当前证书重签
+                // Tweaks 里的件，重签后仍不一致才报红。
+                if await ensureHooksDylibSigned() {
+                    return .success(())
+                }
+                return .failure(.selfTestFailed(stage: "自测", reason: "注入组件签名失败：无法用当前证书签名 SBGuestHooks.dylib，请重新导入证书后重试"))
             }
             return .failure(.selfTestFailed(stage: "自测", reason: "自测未通过，请重试"))
         } catch let nsError as NSError {
@@ -330,6 +339,108 @@ public enum SBCertificate {
             return .certificateDeleted
         }
         return .missingCertificate
+    }
+
+    // MARK: - 注入组件签名（0.2.2）
+
+    /// 保证 Documents/Tweaks/SBGuestHooks.dylib 带着当前证书的 Team。
+    ///
+    /// 背景（0.2.1 自测失败的根因）：客 App 主程序由导入证书签名（Team = 证书
+    /// Team），新进程里 dyld 加载注入件时要求注入件与主程序同 Team；宿主包内的件
+    /// 带着安装时签名——CI 自签证书无 OU（Team 为空，0.2.1 IPA 实测）或 Seal 重签
+    /// 为用户 Team，与客主程序的 Team 不一定相同。之前没有任何代码用导入证书签
+    /// Tweaks 里的件（SBSigner.adhocSignMachOAtPath 零调用），所以客 App 在新进程
+    /// 里加载注入件时会被拒，与自测 dlopen 报的错是同一个根。
+    ///
+    /// 做法：先把包内件同步到 Tweaks，再比对 Team，不一致就用当前证书重签一次；
+    /// 签完再读一次 Team，确认一致才返回 true。并发调用会合并成一次签名
+    /// （HooksSignGate），不让两个 ZSign 同时写同一文件。
+    /// - Returns: true = 已确认同 Team；false = 无证书、文件缺失、取不到 Team
+    ///   或签名失败。调用方按失败处理：启动门直接拦、自测直接报红；首启后台
+    ///   调用只尽力而为，不弹错。
+    static func ensureHooksDylibSigned() async -> Bool {
+        await HooksSignGate.shared.ensure {
+            await performEnsureHooksDylibSigned()
+        }
+    }
+
+    /// 串行化注入件签名的 actor：同一时间只跑一次 ensure，不同调用方共用结果。
+    private actor HooksSignGate {
+        static let shared = HooksSignGate()
+        private var currentID: UUID?
+        private var currentTask: Task<Bool, Never>?
+
+        func ensure(_ work: @escaping () async -> Bool) async -> Bool {
+            if let running = currentTask {
+                return await running.value
+            }
+            let id = UUID()
+            let task = Task.detached { await work() }
+            currentID = id
+            currentTask = task
+            let result = await task.value
+            if currentID == id {
+                currentID = nil
+                currentTask = nil
+            }
+            return result
+        }
+    }
+
+    private static func performEnsureHooksDylibSigned() async -> Bool {
+        guard let data = currentCertificateData(),
+              let password = storedPassword, !password.isEmpty,
+              let certTeamID = SBSigner.teamID(withCertData: data, password: password),
+              !certTeamID.isEmpty else {
+            return false
+        }
+        // 先保证 Tweaks 里有件（包内新了就覆盖拷一份）。
+        SBLaunchRouter.ensureGuestHooksDylib()
+        let tweaksURL = SBConstants.tweaksHookDylibURL(documentsURL: SBConstants.documentsURL)
+        guard FileManager.default.fileExists(atPath: tweaksURL.path) else {
+            return false
+        }
+        if teamIDOfSignedMachO(at: tweaksURL) == certTeamID {
+            return true
+        }
+        // Team 不一致（或无签名）：用当前证书重签，再读一次 Team 确认。
+        let signed = await signMachO(at: tweaksURL.path, bundleID: "com.mjorb.sealbox", certData: data, password: password)
+        guard signed else { return false }
+        return teamIDOfSignedMachO(at: tweaksURL) == certTeamID
+    }
+
+    /// 当前导入证书的 p12 数据；无证书返回 nil。
+    private static func currentCertificateData() -> Data? {
+        guard let url = certificateFileURL else { return nil }
+        return try? Data(contentsOf: url)
+    }
+
+    /// 读一个已签名 Mach-O 的 Team ID（Security 静态校验信息；无签名返回 nil）。
+    /// 读不到不抛错，只返回 nil，调用方按“未签名”处理。
+    static func teamIDOfSignedMachO(at url: URL) -> String? {
+        var staticCode: SecStaticCode?
+        guard SecStaticCodeCreateWithPath(url as CFURL, SecCSFlags(rawValue: 0), &staticCode) == errSecSuccess,
+              let staticCode = staticCode else {
+            return nil
+        }
+        var infoRef: CFDictionary?
+        guard SecCodeCopySigningInformation(staticCode, SecCSFlags(rawValue: kSecCSSigningInformation), &infoRef) == errSecSuccess,
+              let info = infoRef as? [CFString: Any],
+              let teamID = info[kSecCodeInfoTeamIdentifier] as? String,
+              !teamID.isEmpty else {
+            return nil
+        }
+        return teamID
+    }
+
+    /// 用给定证书签单个 Mach-O（SBSigner 转发 ZSign）；ZSign 回调在全局队列，
+    /// 这里用 continuation 接回调用方。
+    private static func signMachO(at path: String, bundleID: String, certData: Data, password: String) async -> Bool {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+            SBSigner.signMachO(atPath: path, bundleID: bundleID, certData: certData, password: password) { success, _ in
+                continuation.resume(returning: success)
+            }
+        }
     }
 
     /// 自测入口放后台队列跑（内部阻塞等回调，绝不在主线程调）。

@@ -64,7 +64,7 @@ NSError *SBGuestLoaderErrorMake(SBGuestLoaderErrorCode code,
 
 /// 启动链自测（F1，不依赖任何客 App）：
 /// ① 收据读写自检；② 证书链自检——把 SBGuestHooks.dylib 复制到 tmp，
-/// 用给定证书签名，再 dlopen 验证。
+/// 用给定证书签名，再静态校验签名有效性（0.2.2 前是 dlopen；见 .m ⑤ 的注释）。
 /// 失败时 error 带中文原因（阶段：自测 或 证书检查）。
 /// 注意：内部用信号量等 ZSign 异步回调，请在后台线程调用，不要在主线程调用。
 + (BOOL)runSelfTestWithCertificate:(NSData *)p12

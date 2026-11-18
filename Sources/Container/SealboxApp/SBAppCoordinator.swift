@@ -233,6 +233,9 @@ final class SBAppCoordinator: ObservableObject {
     private var launchStage: String?
     /// 30 秒后备看门狗：正常路径（成功 → 进程 exit(0)；失败 → 回调弹错）都会先取消它。
     private var launchWatchdog: DispatchWorkItem?
+    /// 防重复点：点一次图标只发一次重启请求；失败 / 超时后清零，
+    /// 成功时进程 exit(0)，旗标随进程一起没了。
+    private var isLaunching = false
 
     /// 点图标后的真实启动：证书门与 5 秒看门狗在 GuestLoader 侧，失败回调里弹错。
     /// 另加 30 秒后备计时（F5）：从点图标起算，30 秒内无完成回调（进程未死、
@@ -241,6 +244,12 @@ final class SBAppCoordinator: ObservableObject {
     /// L2 JIT 预检（设计 §3.4，步骤 6 留下的债）：未签名（signed=false）或
     /// 需 JIT（needsJIT）的应用，先查 SBGuestLoader.isJITEnabled；未启用时
     /// 弹“该应用需要 JIT 才能运行”，不发启动请求、不假装启动。
+    ///
+    /// 0.2.2 注入件签名门：有证书时先跑 SBCertificate.ensureHooksDylibSigned，
+    /// 保证 Tweaks 里的 SBGuestHooks.dylib 带着当前证书的 Team，成功才发重启
+    /// 请求；签名失败直接弹错，不发重启（否则客 App 在新进程里加载注入件时
+    /// 会被 dyld 以 Team 不一致拒绝——0.2.1 自测 dlopen 报的同一个根）。
+    /// 无证书时跳过这一步，由重启请求里的证书门弹“去导入证书”。
     func launchApp(_ app: SBInstalledApp) {
         if app.needsReimport {
             activeAlert = CoordinatorAlert(
@@ -257,6 +266,29 @@ final class SBAppCoordinator: ObservableObject {
                 return
             }
         }
+        guard !isLaunching else { return }
+        isLaunching = true
+        if SBCertificate.hasCertificate {
+            Task {
+                let ok = await SBCertificate.ensureHooksDylibSigned()
+                await MainActor.run {
+                    if ok {
+                        self.requestRestart(app: app)
+                    } else {
+                        self.isLaunching = false
+                        self.activeAlert = CoordinatorAlert(
+                            title: "启动失败",
+                            message: "注入组件签名失败：无法用当前证书签名 SBGuestHooks.dylib，请重新导入证书后重试")
+                    }
+                }
+            }
+            return
+        }
+        requestRestart(app: app)
+    }
+
+    /// 发重启请求（launchApp 的后半段，签名门通过后才进）。
+    private func requestRestart(app: SBInstalledApp) {
         launchWatchdog?.cancel()
         launchWatchdog = nil
         launchStage = "证书检查"
@@ -265,6 +297,7 @@ final class SBAppCoordinator: ObservableObject {
             let stage = self.launchStage ?? "重启请求"
             self.launchStage = nil
             self.launchWatchdog = nil
+            self.isLaunching = false
             self.activeAlert = CoordinatorAlert(title: "启动超时", message: "启动超时（卡在：\(stage)），请重试")
         }
         launchWatchdog = watchdog
@@ -280,6 +313,7 @@ final class SBAppCoordinator: ObservableObject {
             self.launchWatchdog = nil
             self.launchStage = nil
             guard let error = error else { return }
+            self.isLaunching = false
             let stage = (error as NSError).userInfo[SBGuestLoaderErrorStageKey] as? String ?? "启动失败"
             Task { @MainActor in
                 // 证书门拦截（无证书 / 证书被删 / 证书过期）给“去导入证书”按钮，

@@ -46,6 +46,18 @@ NSError *SBGuestLoaderErrorMake(SBGuestLoaderErrorCode code,
     return [NSError errorWithDomain:SBGuestLoaderErrorDomain code:code userInfo:userInfo];
 }
 
+/// OSStatus → 可读文案（自测第 ⑤ 步静态校验失败时用）；SecCopyErrorMessageString
+/// 返回 nil 时退回数值写法，保证文案永远有内容。
+static NSString *SBGuestLoaderErrorMessageForOSStatus(OSStatus status) {
+    CFStringRef message = SecCopyErrorMessageString(status, NULL);
+    if (message != NULL) {
+        NSString *result = [NSString stringWithFormat:@"%@（%d）", (__bridge NSString *)message, (int)status];
+        CFRelease(message);
+        return result;
+    }
+    return [NSString stringWithFormat:@"OSStatus %d", (int)status];
+}
+
 @interface SBGuestLoader ()
 @end
 
@@ -578,7 +590,7 @@ NSError *SBGuestLoaderErrorMake(SBGuestLoaderErrorCode code,
         return NO;
     }
 
-    // ④ 用证书签测试件，再 dlopen 验证签名能被系统认可。
+    // ④ 用证书签测试件，再静态校验签名能被系统认可（0.2.2 前是 dlopen，见 ⑤）。
     __block BOOL signSuccess = NO;
     __block NSError *signError = nil;
     dispatch_semaphore_t signSema = dispatch_semaphore_create(0);
@@ -615,22 +627,43 @@ NSError *SBGuestLoaderErrorMake(SBGuestLoaderErrorCode code,
         return NO;
     }
 
-    // 自测 dlopen：constructor 里有 SB_GUEST_BUNDLE_ID 环境变量守卫，
-    // 自测进程里该变量不存在，Hook 不会装上，只验证签名与加载本身。
-    void *handle = dlopen([tmpPath UTF8String], RTLD_LAZY);
-    if (!handle) {
-        const char *dlerrorString = dlerror();
-        NSString *detail = dlerrorString ? [NSString stringWithUTF8String:dlerrorString] : @"未知错误";
+    // ⑤ 静态校验签名，不再 dlopen。
+    // 0.2.2 改：0.2.1 自测在这里 dlopen(tmpPath)，MJ 的 0.2.1 报
+    // code signature invalid——不是签名坏了（blob 存在、签名步骤已成功），
+    // 而是 dyld 要求进程内 dlopen 的 dylib 与宿主进程同 Team：测试件用导入
+    // 证书签（Team Wan），宿主进程是 CI 自签（无 Team），Team 不一致就被拒。
+    // dlopen 测的是“宿主进程能不能加载它”，而真正决定客 App 能不能打开的
+    // 是“客主程序与注入件同不同 Team”——那是自测第 ⑥ 步（Swift 侧，
+    // SBCertificate.ensureHooksDylibSigned）校验的。所以这里改成静态校验
+    // SecStaticCodeCheckValidity：只验证签名本身有效、可被系统认可，
+    // 不把测试件加载进宿主进程；自测仍在，仍会红，不是删自测掩盖问题。
+    SecStaticCodeRef staticCode = NULL;
+    OSStatus createStatus = SecStaticCodeCreateWithPath(
+        (__bridge CFURLRef)[NSURL fileURLWithPath:tmpPath],
+        kSecCSDefaultFlags, &staticCode);
+    if (createStatus != errSecSuccess || staticCode == NULL) {
         [fileManager removeItemAtPath:tmpPath error:nil];
         if (error) {
             *error = SBGuestLoaderErrorMake(SBGuestLoaderErrorSelfTestFailed,
                                             @"自测",
-                                            [NSString stringWithFormat:@"证书链自测失败：签名后的测试件无法加载（%@）", detail],
+                                            [NSString stringWithFormat:@"证书链自测失败：无法读取签名后的测试件（%@）", SBGuestLoaderErrorMessageForOSStatus(createStatus)],
                                             @"请检查证书后重试");
         }
         return NO;
     }
-    dlclose(handle);
+    OSStatus validityStatus = SecStaticCodeCheckValidity(
+        staticCode, kSecCSDefaultFlags, NULL);
+    CFRelease(staticCode);
+    if (validityStatus != errSecSuccess) {
+        [fileManager removeItemAtPath:tmpPath error:nil];
+        if (error) {
+            *error = SBGuestLoaderErrorMake(SBGuestLoaderErrorSelfTestFailed,
+                                            @"自测",
+                                            [NSString stringWithFormat:@"证书链自测失败：签名后的测试件未通过系统校验（%@）", SBGuestLoaderErrorMessageForOSStatus(validityStatus)],
+                                            @"请检查证书后重试");
+        }
+        return NO;
+    }
     [fileManager removeItemAtPath:tmpPath error:nil];
     return YES;
 }
