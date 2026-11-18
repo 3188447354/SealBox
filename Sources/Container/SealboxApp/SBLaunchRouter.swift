@@ -56,11 +56,49 @@ enum SBLaunchRouter {
         }
     }
 
+    /// 0.2.10：收据与对账的接线——对账刚把记录标灰，路由紧接着就按收据去
+    /// 加载，最后还是报“找不到安装包”（0.2.9 真机实证：com.xuncorp.sp）。
+    /// 收据可能在记录标灰之前写下（旧版本点图标、或看门狗刷新 createdAt
+    /// 后残留），只拦“写收据时”不够。路由处理收据前先看这张收据的包还
+    /// 在不在：包不在就不加载，清掉收据，不记失败、不弹启动失败；记录已
+    /// 标灰，点图标进详情页（重新安装 / 删除此应用）。
+    /// guest-failed 收据同样处理：包不在的失败是旧的孤儿收据，清掉，
+    /// 不再弹一次启动失败。
+    private static func clearStaleReceiptIfPackageMissing() {
+        guard let receipt = SBStore.shared.launchReceipt else { return }
+        guard receipt.stage == "restart-requested"
+            || receipt.stage == "restart-confirmed"
+            || receipt.stage == "guest-failed" else { return }
+        // 记录已标 needsReimport 即不再启动——哪怕包还在磁盘上（占位记录）。
+        let record = SBStore.shared.installedApps.first {
+            $0.bundleID == receipt.guestBundleID
+            && $0.diskDirectoryName == receipt.diskDirectoryName
+        } ?? SBStore.shared.app(with: receipt.guestBundleID)
+        if record?.needsReimport == true {
+            SBDiagLog.log("启动路由：\(receipt.guestBundleID) 已标需重新导入，跳过客加载并清掉过期收据")
+            SBStore.shared.launchReceipt = nil
+            SBStore.shared.clearGuestSelection()
+            return
+        }
+        // 收据自带的目录名就是加载器要用的路径（平行安装靠它区分），直接验盘。
+        let dirName = receipt.diskDirectoryName.isEmpty
+            ? receipt.guestBundleID + ".app" : receipt.diskDirectoryName
+        let packageURL = SBConstants.documentsURL
+            .appendingPathComponent(SBConstants.guestAppsDirectoryName)
+            .appendingPathComponent(dirName)
+        if !FileManager.default.fileExists(atPath: packageURL.path) {
+            SBDiagLog.log("启动路由：\(receipt.guestBundleID) 包不在磁盘，跳过客加载并清掉过期收据")
+            SBStore.shared.launchReceipt = nil
+            SBStore.shared.clearGuestSelection()
+        }
+    }
+
     /// App 启动时调用一次。若本次是“重起进客 App”，尝试加载客 App；
     /// 加载失败时清掉选中标记、留收据，回桌面弹错（由桌面在 appear 时按收据弹）。
     static func routeOnLaunchIfNeeded() {
         ensureGuestHooksDylib()
         reconcileInstalledAppsWithDisk()
+        clearStaleReceiptIfPackageMissing()
         guard SBGuestLoader.isGuestLaunchRequested() else {
             // 客已退出或闪退过：收据残留 guest-loaded 时静默清除，不弹错、不记失败，
             // 避免下次启动误判（设计 §5.5 的 guest-loaded 过期清理）。
