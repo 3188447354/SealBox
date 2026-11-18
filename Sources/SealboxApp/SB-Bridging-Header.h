@@ -10,4 +10,5 @@
 #import "SBCodesignCheck.h"
 #import "SBMachOPatcher.h"
 #import "SBUnzip.h"
+#import "SBDiagLog.h"
 #import "zsigner.h"

@@ -51,6 +51,7 @@ enum SBMigration {
         }
         // 跑过一次不再重复跑。
         if appGroupDefaults.bool(forKey: completedKey) {
+            SBDiagLog.log("迁移已完成过，跳过")
             return
         }
 
@@ -138,6 +139,7 @@ enum SBMigration {
             apps.append(contentsOf: newRecords)
             SBStore.shared.saveInstalledApps(apps)
         }
+        SBDiagLog.log("迁移解析完成，新建 \(newRecords.count) 条记录")
         appGroupDefaults.set(Array(migratedKeys), forKey: migratedFilesKey)
         appGroupDefaults.set(true, forKey: completedKey)
     }

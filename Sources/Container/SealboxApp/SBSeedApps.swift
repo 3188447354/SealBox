@@ -14,11 +14,16 @@ enum SBSeedApps {
 
     /// 种子安装入口：不阻塞启动，调用方放后台 Task 里跑。
     static func installIfNeeded(coordinator: SBAppCoordinator) async {
-        guard !SBStore.shared.seedViaInstalled else { return }
-        if SBStore.shared.app(with: viaBundleID) != nil {
-            SBStore.shared.seedViaInstalled = true
+        guard !SBStore.shared.seedViaInstalled else {
+            SBDiagLog.log("种子安装：已装过，跳过")
             return
         }
+        if SBStore.shared.app(with: viaBundleID) != nil {
+            SBStore.shared.seedViaInstalled = true
+            SBDiagLog.log("种子安装：Via 已在桌面，跳过")
+            return
+        }
+        SBDiagLog.log("种子安装开始：Via")
         guard !coordinator.isInstalling else { return }
         guard let bundleURL = seedIPAURL() else { return }
         let destination = SBConstants.documentsURL
@@ -42,6 +47,9 @@ enum SBSeedApps {
         // installIPA 返回时安装已结束（成功或失败）：记录入库了才置旗。
         if SBStore.shared.app(with: viaBundleID) != nil {
             SBStore.shared.seedViaInstalled = true
+            SBDiagLog.log("种子安装完成：Via 已上桌面")
+        } else {
+            SBDiagLog.log("种子安装失败：下次启动重试")
         }
     }
 

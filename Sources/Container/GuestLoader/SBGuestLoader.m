@@ -9,6 +9,7 @@
 #import <unistd.h>
 
 #import "SBCodesignCheck.h"
+#import "SBDiagLog.h"
 #import "SBGuestBootstrap.h"
 #import "zsigner.h"
 
@@ -327,6 +328,7 @@ NSError *SBGuestLoaderErrorMake(SBGuestLoaderErrorCode code,
                                       stage:SBReceiptStageRestartRequested
                                   requestID:requestID
                                      detail:nil];
+    SBDiagLogLine([[NSString stringWithFormat:@"点图标：请求启动 %@，已写收据", bundleID] UTF8String]);
 
     __block BOOL finished = NO;
     void (^finish)(NSError * _Nullable) = ^(NSError * _Nullable error) {
@@ -373,6 +375,7 @@ NSError *SBGuestLoaderErrorMake(SBGuestLoaderErrorCode code,
                                        options:@{}
                              completionHandler:^(BOOL success) {
         if (!success) {
+            SBDiagLogLine("重启请求失败：系统拒绝 openURL");
             [SBGuestLoader markReceiptStage:SBReceiptStageRestartRequested
                                      detail:@"系统没有重启应用，请重试"];
             finish(SBGuestLoaderErrorMake(SBGuestLoaderErrorRestartRequestFailed,
@@ -383,6 +386,7 @@ NSError *SBGuestLoaderErrorMake(SBGuestLoaderErrorCode code,
         }
         // 请求已接下：先把成功交回调用方，再延迟退出，让系统带收据重起本进程。
         finish(nil);
+        SBDiagLogLine("重启请求已发出，0.6 秒后退出进程");
         [[SBGuestLoader sharedDefaults] synchronize];
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(SBExitDelaySeconds * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
@@ -413,6 +417,7 @@ NSError *SBGuestLoaderErrorMake(SBGuestLoaderErrorCode code,
     }
 
     // 重启已确认：先写收据，再加载客 App。
+    SBDiagLogLine([[NSString stringWithFormat:@"新进程：收到客启动请求 %@，收据已确认，开始加载客 App", bundleID] UTF8String]);
     [SBGuestLoader markReceiptStage:SBReceiptStageRestartConfirmed detail:nil];
 
     NSError *error = nil;
@@ -433,6 +438,7 @@ NSError *SBGuestLoaderErrorMake(SBGuestLoaderErrorCode code,
     if (message.length == 0) {
         message = @"客 App 加载失败";
     }
+    SBDiagLogLine([[NSString stringWithFormat:@"客加载失败：%@", message] UTF8String]);
     [SBGuestLoader markReceiptStage:SBReceiptStageGuestFailed detail:message];
     NSUserDefaults *defaults = [SBGuestLoader sharedDefaults];
     [defaults removeObjectForKey:SBKeySelectedGuestBundleID];

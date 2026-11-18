@@ -9,6 +9,13 @@ struct SealboxApp: App {
     @StateObject private var vm = VMState()
     @StateObject private var coordinator = SBAppCoordinator()
 
+    init() {
+        // 启动诊断日志（0.2.4）：进程启动最先做轮转 + 写第一行；
+        // 崩了下次启动能看到死在哪一步。
+        SBDiagLog.beginRun()
+        SBDiagLog.log("进程启动 \(VMDevice.appVersionString)")
+    }
+
     var body: some Scene {
         WindowGroup {
             VMRootView()
@@ -70,20 +77,25 @@ struct VMRootView: View {
             // 之后再查 isGuestLaunchRequested 就永远是 false，锁会错挡客 App。
             let guestLaunchPending = SBGuestLoader.isGuestLaunchRequested()
             // 桌面先读一次 SBStore（单源头），再跑启动路由与旧记录迁移。
+            SBDiagLog.log("读已装应用")
             SBStore.shared.loadInstalledApps()
             // 启动路由只跑一次：重起进客 App 时兑现收据加载客 App，
             // 过期 restart-requested 收据记失败、残留 guest-loaded 收据静默清除。
             // 路由跑完立刻按收据弹一次错（收据随即清除，不重复弹）。
             if !didRouteLaunch {
                 didRouteLaunch = true
+                SBDiagLog.log("启动路由开始")
                 SBLaunchRouter.routeOnLaunchIfNeeded()
+                SBDiagLog.log("启动路由完成")
                 coordinator.showGuestFailedReceiptIfNeeded()
             }
             // 旧记录迁移只跑一次：后台线程重解析 Documents/IPAs，跑完刷新 SBStore。
             if !didMigrate {
                 didMigrate = true
                 Task {
+                    SBDiagLog.log("迁移开始")
                     await SBMigration.migrateIfNeeded()
+                    SBDiagLog.log("迁移完成")
                     await MainActor.run {
                         SBStore.shared.loadInstalledApps()
                     }
@@ -95,6 +107,9 @@ struct VMRootView: View {
                 didDecideLock = true
                 if !passcode.isEmpty && !guestLaunchPending {
                     showLock = true
+                    SBDiagLog.log("密码锁：已设置，显示锁屏")
+                } else {
+                    SBDiagLog.log("密码锁：未设置或客启动，不锁")
                 }
             }
             // 种子应用（0.2.1：Via）：后台装一次，不阻塞启动；装完桌面刷新。
@@ -110,9 +125,13 @@ struct VMRootView: View {
             if !didEnsureHooks {
                 didEnsureHooks = true
                 Task.detached {
-                    _ = await SBCertificate.ensureHooksDylibSigned()
+                    SBDiagLog.log("注入件签名检查开始")
+                    let ok = await SBCertificate.ensureHooksDylibSigned()
+                    SBDiagLog.log("注入件签名检查完成：\(ok ? "已就位" : "失败（不拦启动）")")
                 }
             }
+            SBDiagLog.log("界面出现")
+            SBDiagLog.markStartupComplete()
         }
         // 协调器弹窗：阶段名作标题、中文原因作正文；证书门拦截给“去导入证书”。
         .alert(item: $coordinator.activeAlert) { alert in

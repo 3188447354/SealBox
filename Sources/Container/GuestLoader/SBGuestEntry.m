@@ -10,6 +10,7 @@
 #import <mach/machine.h>
 #import <string.h>
 
+#import "SBDiagLog.h"
 #import "SBGuestLoader.h"
 
 // LC_DYLD_CHAINED_FIXUPS 在公开头文件里有定义；这里只用它做段数不匹配的诊断提示。
@@ -216,10 +217,12 @@ BOOL getAppEntryPoint(NSString *machOPath, uint64_t *entryoffOut, NSError **erro
 void *dlopenGuest(NSString *path, NSError **error) {
     void *handle = dlopen([path UTF8String], RTLD_LAZY | RTLD_GLOBAL | RTLD_FIRST);
     if (handle) {
+        SBDiagLogLine([[NSString stringWithFormat:@"客加载：dlopen 客可执行成功：%@", path] UTF8String]);
         return handle;
     }
     const char *dlerrorString = dlerror();
     NSString *detail = dlerrorString ? [NSString stringWithUTF8String:dlerrorString] : @"未知错误";
+    SBDiagLogLine([[NSString stringWithFormat:@"客加载：dlopen 客可执行失败：%@", detail] UTF8String]);
     NSInteger majorVersion = [[NSProcessInfo processInfo] operatingSystemVersion].majorVersion;
     NSString *message = nil;
     NSString *recovery = @"请重试，或重新导入该应用";
@@ -264,27 +267,44 @@ BOOL runtimeAddressForImageAtPath(NSString *imagePath,
         *addressOut = 0;
     }
     NSString *wantedName = [imagePath lastPathComponent];
-    uint32_t count = _dyld_image_count();
-    for (uint32_t i = 0; i < count; i++) {
-        const char *imageName = _dyld_get_image_name(i);
-        if (!imageName) {
-            continue;
+    // 两遍匹配：先精确全路径，再退到同名——同名不同路径的镜像（如
+    // 同名 framework）先被扫到会算错入口。
+    for (int pass = 0; pass < 2; pass++) {
+        uint32_t count = _dyld_image_count();
+        for (uint32_t i = 0; i < count; i++) {
+            const char *imageName = _dyld_get_image_name(i);
+            if (!imageName) {
+                continue;
+            }
+            NSString *loadedPath = [NSString stringWithUTF8String:imageName];
+            BOOL matches = (pass == 0)
+                ? [loadedPath isEqualToString:imagePath]
+                : [[loadedPath lastPathComponent] isEqualToString:wantedName];
+            if (!matches) {
+                continue;
+            }
+            const struct mach_header *header = _dyld_get_image_header(i);
+            if (!header) {
+                continue;
+            }
+            // 0.2.4 根因修：_dyld_get_image_header 返回的已是滑移后的
+            // 实际加载地址，LC_MAIN 的 entryoff 是从文件头的偏移，
+            // 入口 = header + entryoff。旧代码又加了一次 slide
+            // （header + slide + entryoff），入口偏了整整一个 slide，
+            // 跳过去必崩（EXC_BAD_ACCESS）——点客应用图标必闪退的根因，
+            // 0.2.0 起就有，真机从未验过。slide 只对从文件里读出的
+            // preferred vmaddr 才要加，这里不加。
+            intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+            uintptr_t entryAddress = (uintptr_t)header + (uintptr_t)fileOffset;
+            SBDiagLogLine([[NSString stringWithFormat:
+                @"客入口：镜像=%@ header=0x%lx slide=0x%lx entryoff=0x%llx 入口=0x%lx",
+                loadedPath, (unsigned long)header, (unsigned long)slide,
+                (unsigned long long)fileOffset, (unsigned long)entryAddress] UTF8String]);
+            if (addressOut) {
+                *addressOut = entryAddress;
+            }
+            return YES;
         }
-        NSString *loadedPath = [NSString stringWithUTF8String:imageName];
-        BOOL matches = [loadedPath isEqualToString:imagePath] ||
-                       [[loadedPath lastPathComponent] isEqualToString:wantedName];
-        if (!matches) {
-            continue;
-        }
-        const struct mach_header *header = _dyld_get_image_header(i);
-        intptr_t slide = _dyld_get_image_vmaddr_slide(i);
-        if (!header) {
-            continue;
-        }
-        if (addressOut) {
-            *addressOut = (uintptr_t)header + (uintptr_t)slide + (uintptr_t)fileOffset;
-        }
-        return YES;
     }
     if (error) {
         *error = SBEntryError(@"找不到客 App 入口：客 App 镜像未加载");

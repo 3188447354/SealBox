@@ -8,6 +8,7 @@
 
 #import "SBGuestEntry.h"
 #import "SBGuestLoader.h"
+#import "SBDiagLog.h"
 #import "SBBundleSpoof.h"
 #import "SBExecPathHook.h"
 
@@ -60,6 +61,7 @@ static const NSInteger SBKeychainGroupCount = 128;
         : [bundleID stringByAppendingPathExtension:@"app"];
     NSString *guestAppPath = [[[documents stringByAppendingPathComponent:@"Applications"]
                                stringByAppendingPathComponent:dirName] copy];
+    SBDiagLogLine([[NSString stringWithFormat:@"客加载：开始加载 %@（包 %@）", bundleID, guestAppPath] UTF8String]);
     NSString *containerPath = [[[documents stringByAppendingPathComponent:@"Data"]
                                 stringByAppendingPathComponent:@"Application"]
                                stringByAppendingPathComponent:containerUUID];
@@ -158,6 +160,7 @@ static const NSInteger SBKeychainGroupCount = 128;
     if (symlink([hostTmpDir UTF8String], [tmpLinkPath UTF8String]) != 0) {
         NSLog(@"[Sealbox] 客容器 tmp 软链创建失败（%@），继续启动", tmpLinkPath);
     }
+    SBDiagLogLine("客加载：数据容器就绪，HOME 已指向客容器");
 
     // —— 3. 给客端 Hook 留启动标记（环境变量随 dlopen 进客上下文） ———————
     NSString *hostBundleID = [[NSBundle mainBundle] bundleIdentifier] ?: @"com.mjorb.sealbox";
@@ -195,6 +198,7 @@ static const NSInteger SBKeychainGroupCount = 128;
     NSError *spoofError = nil;
     if (!overwriteMainNSBundle(guestBundle, &spoofError)) {
         NSString *reason = spoofError.localizedDescription ?: @"改写主 Bundle 失败";
+        SBDiagLogLine([[NSString stringWithFormat:@"客加载失败：NSBundle 伪装失败：%@", reason] UTF8String]);
         return [self failWithError:error
                               code:SBGuestLoaderErrorSpoofFailed
                            message:reason
@@ -203,16 +207,21 @@ static const NSInteger SBKeychainGroupCount = 128;
     if (!overwriteMainCFBundle(guestBundle, &spoofError)) {
         restoreMainNSBundle();
         NSString *reason = spoofError.localizedDescription ?: @"改写主 Bundle 失败";
+        SBDiagLogLine([[NSString stringWithFormat:@"客加载失败：CFBundle 伪装失败：%@", reason] UTF8String]);
         return [self failWithError:error
                               code:SBGuestLoaderErrorSpoofFailed
                            message:reason
                           recovery:@"该客 App 与当前系统版本不兼容，请换个版本重试"];
     }
+    SBDiagLogLine("客加载：主 Bundle 伪装完成");
 
     // —— 5. 改写可执行路径（尽力而为：失败只记日志，不阻断启动） ————————
     NSError *execPathError = nil;
     if (!overwriteExecutablePath(guestExecPath, &execPathError)) {
+        SBDiagLogLine([[NSString stringWithFormat:@"客加载：改写可执行路径失败（继续启动）：%@", execPathError.localizedDescription] UTF8String]);
         NSLog(@"[Sealbox] 改写可执行路径失败：%@，继续启动", execPathError.localizedDescription);
+    } else {
+        SBDiagLogLine("客加载：可执行路径已改写为客路径");
     }
 
     // —— 6. 预加载客端 Hook dylib ————————————————————————————————
@@ -224,8 +233,13 @@ static const NSInteger SBKeychainGroupCount = 128;
         void *hooksHandle = dlopen([hooksPath UTF8String], RTLD_LAZY | RTLD_GLOBAL);
         if (!hooksHandle) {
             const char *dlerrorString = dlerror();
+            SBDiagLogLine([[NSString stringWithFormat:@"客加载：预加载 Hook 失败（继续启动）：%s", dlerrorString ? dlerrorString : "未知错误"] UTF8String]);
             NSLog(@"[Sealbox] 预加载客端 Hook 失败：%s", dlerrorString ? dlerrorString : "未知错误");
+        } else {
+            SBDiagLogLine("客加载：预加载 Hook 成功");
         }
+    } else {
+        SBDiagLogLine("客加载：Tweaks 里没有 Hook 件，跳过预加载");
     }
 
     // —— 7. dlopen 客可执行 ——————————————————————————————————————
@@ -278,6 +292,7 @@ static const NSInteger SBKeychainGroupCount = 128;
     // 像正常 App 一样跑起来；直到它退出（横杠回桌面是 exit(0)，main 不返回；
     // 只有 main 正常返回时才会走到下面的恢复逻辑）。
     [SBGuestLoader markReceiptStage:@"guest-loaded" detail:nil];
+    SBDiagLogLine([[NSString stringWithFormat:@"客加载：跳入客 main（入口 0x%lx）", (unsigned long)entryAddress] UTF8String]);
 
     typedef int (*SBGuestMainFn)(int argc, char **argv, char **environ);
     SBGuestMainFn guestMain = (SBGuestMainFn)entryAddress;
@@ -289,6 +304,7 @@ static const NSInteger SBKeychainGroupCount = 128;
     restoreMainNSBundle();
     restoreExecutablePath();
     [SBGuestLoader clearLaunchRequest];
+    SBDiagLogLine([[NSString stringWithFormat:@"客 App 已退出（返回码 %d），回到桌面", guestResult] UTF8String]);
     NSLog(@"[Sealbox] 客 App 已退出（返回码 %d），回到桌面", guestResult);
     return YES;
 }

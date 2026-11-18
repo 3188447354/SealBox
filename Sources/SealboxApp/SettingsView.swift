@@ -161,6 +161,9 @@ struct SettingsView: View {
             // Certificate (container): status + real cert info + import/delete/self-test.
             CertificateSettingsSection()
 
+            // 启动诊断日志（0.2.4）：上次启动是否崩了 + 查看全文。
+            StartupDiagLogSection()
+
             // Group 3: other built-in apps (switch apps, not sub-pages)
             Section {
                 Button { vm.openApp = .source } label: {
