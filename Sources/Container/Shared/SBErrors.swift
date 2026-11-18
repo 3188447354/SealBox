@@ -127,7 +127,8 @@ enum SBError: LocalizedError {
         }
     }
 
-    /// 恢复建议：显示在报错弹窗的次要文案或按钮旁。    var recoverySuggestion: String? {
+    /// 恢复建议：显示在报错弹窗的次要文案或按钮旁。
+    var recoverySuggestion: String? {
         switch self {
         case .missingCertificate, .certificateDeleted, .certificateExpired:
             return "去导入证书"
