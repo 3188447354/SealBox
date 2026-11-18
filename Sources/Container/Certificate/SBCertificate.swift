@@ -144,11 +144,12 @@ public enum SBCertificate {
     public struct SBCertificateInfo {
         /// 主体（SecCertificateCopySubjectSummary），如 "iPhone Developer: xxx (TEAMID)"。
         public let subject: String?
-        /// 颁发者（SecCertificateCopyValues 的颁发者 CN），如
-        /// "Apple Worldwide Developer Relations Certification Authority"。
+        /// 颁发者：证书 DER 里 issuer 的 CN（如
+        /// "Apple Worldwide Developer Relations Certification Authority"）。
+        /// iOS SDK 不暴露 SecCertificateCopyValues（macOS 才有），改从 DER 解析。
         public let issuer: String?
-        /// 过期日：ZSigner.checkCert 回的 expirationDate，与 Security 的 NotAfter
-        /// 交叉核对过；不一致时以 Security 的值为准。
+        /// 过期日：ZSigner.checkCert 回的 expirationDate，与 DER 的 NotAfter
+        /// 交叉核对过；不一致时以 DER（Security 侧同一字段）的值为准。
         public let expirationDate: Date?
         /// Team ID：checkCert 回的 organizationalUnitName（OU 即 Team ID）；
         /// 取不到时退到主体括号里的部分（仍取自证书本身）。
@@ -160,7 +161,7 @@ public enum SBCertificate {
     /// 读当前证书的真实信息。无证书、读不到文件、钥匙串无密码、p12 解不开
     /// （如密码错）时返回 nil。
     /// checkCert 失败（如离线导致 OCSP 请求失败）不抹掉整份信息：过期日与
-    /// Team ID 退到 Security 框架的解析结果，状态文案另由 refreshStatusText
+    /// Team ID 退到 DER 解析结果，状态文案另由 refreshStatusText
     /// 按“证书校验失败”处理。
     public static func certificateInfo() async -> SBCertificateInfo? {
         guard let url = certificateFileURL,
@@ -173,19 +174,19 @@ public enum SBCertificate {
             return nil
         }
         let subject: String? = SecCertificateCopySubjectSummary(cert) as String?
-        let values = SecCertificateCopyValues(
-            cert,
-            [kSecOIDX509V1IssuerName, kSecOIDX509V1ValidityNotAfter] as CFArray,
-            nil) as? [String: Any]
-        let issuer = issuerName(from: values)
-        let securityNotAfter = notAfterDate(from: values)
+        // 颁发者 CN 与 NotAfter 从 DER 解析（见 certificateFieldsFromDER；
+        // SecCertificateCopyValues 在 iOS SDK 里不存在，CI run 44204688056 实证）。
+        let der = SecCertificateCopyData(cert) as Data?
+        let fields: (issuerCN: String?, notAfter: Date?) = der.map { certificateFieldsFromDER($0) } ?? (issuerCN: nil, notAfter: nil)
+        let issuer = fields.issuerCN
+        let securityNotAfter = fields.notAfter
 
         let check = await checkCertRaw(data: data, password: password)
         var expiration = check.expirationDate
         if let securityDate = securityNotAfter {
             if let checkDate = expiration {
                 if Swift.abs(checkDate.timeIntervalSince(securityDate)) > 60 {
-                    NSLog("[SBCertificate] checkCert 过期日与 Security NotAfter 不一致，以 Security 为准：checkCert=%@ Security=%@",
+                    NSLog("[SBCertificate] checkCert 过期日与 DER NotAfter 不一致，以 DER 为准：checkCert=%@ DER=%@",
                           checkDate as NSDate, securityDate as NSDate)
                     expiration = securityDate
                 }
@@ -282,10 +283,12 @@ public enum SBCertificate {
     /// 再过证书门，再调 SBGuestLoader 自测入口。
     /// 自测内部用信号量等 ZSign 回调，必须在后台线程跑，本方法已把调用派到全局队列，
     /// 调用方在主线程调本方法即可。设置页证书区直接调本入口。
+    /// internal 即可：设置页与本文件在同一 App target 内；改成 public 会因返回
+    /// 值里的 SBError 是 internal 类型而编译失败（CI run 44204688056 实证）。
     /// - Returns: 成功 `.success(())`；失败 `.failure(SBError)`，其中证书门失败为
     ///   `.missingCertificate` / `.certificateDeleted`，其余为
     ///   `.selfTestFailed(stage:reason:)`，stage 取自测返回的中文阶段名。
-    public static func runChainSelfTest() async -> Result<Void, SBError> {
+    static func runChainSelfTest() async -> Result<Void, SBError> {
         guard SBConstants.appGroupContainerURL != nil else {
             return .failure(.selfTestFailed(
                 stage: "应用共享目录",
@@ -476,40 +479,154 @@ public enum SBCertificate {
         return cert
     }
 
-    /// 从一次 SecCertificateCopyValues 的结果里取颁发者 CN：优先 CN 项，
-    /// 没有 CN 时取第一个字符串值；都没有返回 nil（不编）。
-    private static func issuerName(from values: [String: Any]?) -> String? {
-        guard let values = values,
-              let issuer = values[kSecOIDX509V1IssuerName as String] as? [String: Any],
-              let rdnArray = issuer[kSecPropertyKeyValue as String] as? [[String: Any]] else {
-            return nil
+    // MARK: - 私有：证书 DER 解析（iOS 侧）
+
+    /// 一个 DER TLV 的位置信息。
+    private typealias DERTLV = (tag: UInt8, contentOffset: Int, contentLength: Int, nextOffset: Int)
+
+    /// iOS SDK 不暴露 SecCertificateCopyValues（macOS 才有，CI run 44204688056
+    /// 实证：SecCertificateCopyValues / kSecOIDX509V1* / kSecPropertyKey* 全都
+    /// "cannot find in scope"），颁发者与 NotAfter 改从 SecCertificateCopyData
+    /// 的 DER 直接解析。DER 是严格定长编码，解析失败只返回 nil（该行不显示），
+    /// 绝不崩、不编值。
+    ///
+    /// 结构（RFC 5280）：Certificate SEQ { tbsCertificate SEQ, … }；
+    /// tbsCertificate SEQ { [0] version（可选）, INTEGER serial, SEQ signature,
+    /// SEQ issuer, SEQ validity, … }；issuer 是 Name（SEQ OF SET OF SEQ { OID,
+    /// value }）；validity 是 SEQ { notBefore Time, notAfter Time }。
+    private static func certificateFieldsFromDER(_ der: Data) -> (issuerCN: String?, notAfter: Date?) {
+        guard let certTLV = readDERTLV(der, at: 0), certTLV.tag == 0x30 else {
+            return (issuerCN: nil, notAfter: nil)
         }
-        for entry in rdnArray {
-            if let label = entry[kSecPropertyKeyLabel as String] as? String,
-               label == "CN",
-               let value = entry[kSecPropertyKeyValue as String] as? String {
-                return value
+        let certChildren = derChildren(of: der, contentOffset: certTLV.contentOffset, contentLength: certTLV.contentLength)
+        guard let tbs = certChildren.first, tbs.tag == 0x30 else {
+            return (issuerCN: nil, notAfter: nil)
+        }
+        let tbsChildren = derChildren(of: der, contentOffset: tbs.contentOffset, contentLength: tbs.contentLength)
+        var index = 0
+        if index < tbsChildren.count, tbsChildren[index].tag == 0xA0 {
+            index += 1 // version [0]，可选
+        }
+        index += 1 // serial INTEGER
+        index += 1 // signature SEQ
+        guard index < tbsChildren.count else {
+            return (issuerCN: nil, notAfter: nil)
+        }
+        var issuerCN: String? = nil
+        let issuerTLV = tbsChildren[index]
+        index += 1
+        if issuerTLV.tag == 0x30 {
+            issuerCN = commonName(from: der, nameTLV: issuerTLV)
+        }
+        var notAfter: Date? = nil
+        if index < tbsChildren.count, tbsChildren[index].tag == 0x30 {
+            let validity = tbsChildren[index]
+            let validityChildren = derChildren(of: der, contentOffset: validity.contentOffset, contentLength: validity.contentLength)
+            if validityChildren.count >= 2 {
+                notAfter = timeDate(from: der, tlv: validityChildren[1])
             }
         }
-        for entry in rdnArray {
-            if let value = entry[kSecPropertyKeyValue as String] as? String {
-                return value
+        return (issuerCN: issuerCN, notAfter: notAfter)
+    }
+
+    /// 读一个 DER TLV：返回 tag 与内容/下一项位置；越界返回 nil。
+    /// 只处理单字节 tag（本结构里出现的 tag 都是单字节）与定长长度
+    /// （短式或最长 4 字节长式）。
+    private static func readDERTLV(_ data: Data, at offset: Int) -> DERTLV? {
+        guard offset + 2 <= data.count else {
+            return nil
+        }
+        let tag = data[offset]
+        var index = offset + 1
+        let firstLengthByte = data[index]
+        index += 1
+        var length = 0
+        if firstLengthByte & 0x80 == 0 {
+            length = Int(firstLengthByte)
+        } else {
+            let lengthByteCount = Int(firstLengthByte & 0x7F)
+            guard lengthByteCount > 0, lengthByteCount <= 4,
+                  index + lengthByteCount <= data.count else {
+                return nil
+            }
+            for i in 0..<lengthByteCount {
+                length = (length << 8) | Int(data[index + i])
+            }
+            index += lengthByteCount
+        }
+        guard index + length <= data.count else {
+            return nil
+        }
+        return (tag: tag, contentOffset: index, contentLength: length, nextOffset: index + length)
+    }
+
+    /// 取一个 SEQUENCE / SET 的直接子项 TLV 列表；中途越界即停（不抛错）。
+    private static func derChildren(of data: Data, contentOffset: Int, contentLength: Int) -> [DERTLV] {
+        var children: [DERTLV] = []
+        var offset = contentOffset
+        let end = contentOffset + contentLength
+        while offset < end {
+            guard let tlv = readDERTLV(data, at: offset) else {
+                break
+            }
+            children.append(tlv)
+            offset = tlv.nextOffset
+        }
+        return children
+    }
+
+    /// 从 issuer Name 里找 OID 2.5.4.3（CN）的值。
+    private static func commonName(from der: Data, nameTLV: DERTLV) -> String? {
+        let cnOID: [UInt8] = [0x06, 0x03, 0x55, 0x04, 0x03]
+        let rdns = derChildren(of: der, contentOffset: nameTLV.contentOffset, contentLength: nameTLV.contentLength)
+        for rdn in rdns where rdn.tag == 0x31 {
+            let pairs = derChildren(of: der, contentOffset: rdn.contentOffset, contentLength: rdn.contentLength)
+            for pair in pairs where pair.tag == 0x30 {
+                let fields = derChildren(of: der, contentOffset: pair.contentOffset, contentLength: pair.contentLength)
+                guard fields.count >= 2, fields[0].tag == 0x06 else {
+                    continue
+                }
+                let oidBytes = der[fields[0].contentOffset..<(fields[0].contentOffset + fields[0].contentLength)]
+                if Array(oidBytes) == cnOID {
+                    return stringValue(from: der, tlv: fields[1])
+                }
             }
         }
         return nil
     }
 
-    /// 从一次 SecCertificateCopyValues 的结果里取 NotAfter（Security 侧的过期日）。
-    private static func notAfterDate(from values: [String: Any]?) -> Date? {
-        guard let values = values,
-              let entry = values[kSecOIDX509V1ValidityNotAfter as String] as? [String: Any] else {
+    /// DER 字符串值按 tag 解码：UTF8 / Printable / Teletex / IA5 按 UTF-8，
+    /// BMPString 按 UTF-16BE；其它 tag 返回 nil。
+    private static func stringValue(from der: Data, tlv: DERTLV) -> String? {
+        let bytes = der[tlv.contentOffset..<(tlv.contentOffset + tlv.contentLength)]
+        switch tlv.tag {
+        case 0x0C, 0x13, 0x14, 0x16:
+            return String(bytes: bytes, encoding: .utf8)
+        case 0x1E:
+            return String(bytes: bytes, encoding: .utf16BigEndian)
+        default:
             return nil
         }
-        if let date = entry[kSecPropertyKeyValue as String] as? Date {
-            return date
+    }
+
+    /// DER Time 值转 Date：UTCTime "YYMMDDHHMMSSZ"（与 zsign.mm 的 "20" 前缀
+    /// 口径一致，即 20xx 年）、GeneralizedTime "YYYYMMDDHHMMSSZ"；
+    /// 秒缺失或其它格式解析失败返回 nil（调用方退到 checkCert 的过期日）。
+    private static func timeDate(from der: Data, tlv: DERTLV) -> Date? {
+        guard let text = stringValue(from: der, tlv: tlv) else {
+            return nil
         }
-        if let seconds = entry[kSecPropertyKeyValue as String] as? TimeInterval {
-            return Date(timeIntervalSince1970: seconds)
+        let formatter = DateFormatter()
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        if tlv.tag == 0x17 {
+            formatter.dateFormat = "yyMMddHHmmss'Z'"
+            return formatter.date(from: text)
+        }
+        if tlv.tag == 0x18 {
+            formatter.dateFormat = "yyyyMMddHHmmss'Z'"
+            return formatter.date(from: text)
         }
         return nil
     }
