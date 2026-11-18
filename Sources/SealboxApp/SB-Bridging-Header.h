@@ -7,6 +7,7 @@
 
 #import "SBGuestLoader.h"
 #import "SBSigner.h"
+#import "SBCodesignCheck.h"
 #import "SBMachOPatcher.h"
 #import "SBUnzip.h"
 #import "zsigner.h"

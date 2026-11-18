@@ -415,22 +415,12 @@ public enum SBCertificate {
         return try? Data(contentsOf: url)
     }
 
-    /// 读一个已签名 Mach-O 的 Team ID（Security 静态校验信息；无签名返回 nil）。
-    /// 读不到不抛错，只返回 nil，调用方按“未签名”处理。
+    /// 读一个已签名 Mach-O 的 Team ID（SBCodesignCheck 手动解析 CodeDirectory；
+    /// 无签名返回 nil）。读不到不抛错，只返回 nil，调用方按“未签名”处理。
+    /// 不用 SecStaticCode*：那是 macOS-only API，iOS SDK 里没有
+    /// （0.2.2 第一轮 CI 实证：cannot find in scope）。
     static func teamIDOfSignedMachO(at url: URL) -> String? {
-        var staticCode: SecStaticCode?
-        guard SecStaticCodeCreateWithPath(url as CFURL, SecCSFlags(rawValue: 0), &staticCode) == errSecSuccess,
-              let staticCode = staticCode else {
-            return nil
-        }
-        var infoRef: CFDictionary?
-        guard SecCodeCopySigningInformation(staticCode, SecCSFlags(rawValue: kSecCSSigningInformation), &infoRef) == errSecSuccess,
-              let info = infoRef as? [CFString: Any],
-              let teamID = info[kSecCodeInfoTeamIdentifier] as? String,
-              !teamID.isEmpty else {
-            return nil
-        }
-        return teamID
+        SBCodesignCheck.teamIdentifier(atPath: url.path)
     }
 
     /// 用给定证书签单个 Mach-O（SBSigner 转发 ZSign）；ZSign 回调在全局队列，
