@@ -303,10 +303,14 @@ final class SBAppCoordinator: ObservableObject {
                     }
                     return
                 }
+                // 0.2.8：Swift 6 下 @Sendable 闭包不能捕获 var——先把最终值
+                // 定格成 let 再进 MainActor.run（0.2.8 第一轮 CI 红于此，
+                // SBAppCoordinator.swift:309）。
+                let launchTarget = appToLaunch
                 let ok = await SBCertificate.ensureHooksDylibSigned()
                 await MainActor.run {
                     if ok {
-                        self.requestRestart(app: appToLaunch)
+                        self.requestRestart(app: launchTarget)
                     } else {
                         self.isLaunching = false
                         self.activeAlert = CoordinatorAlert(
