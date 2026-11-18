@@ -2,15 +2,19 @@
 //   上滑 ≥32pt 或快滑（速度 >140pt/s）→ 回桌面（清启动标记 + exit(0)）；
 //   按住 0.42s / 双击 / 上滑后停顿 0.35s → toast「切换器 v1 未提供」
 //   （v1 不做切换器，只提示，不静默吞手势）。
-// 实现：一只高层级透明 UIWindow，只在底部 44pt 的横杠条上接手势，
+// 实现：一只高层级透明 UIWindow，只在底部 28pt 的横杠条上接手势，
 // 其余区域 hitTest 返回 nil，触摸原样透给客 App。
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 #import <stdlib.h>
 
-// 与契约一致：横杠数值
-static const CGFloat SBHomeBarHeight = 44.0;      // 横杠条可点高度
+// 与契约一致：横杠数值。横杠条高 28pt，与壳子回主屏幕区（SealboxApp.swift
+// homeSwipeZone，28pt）一致：0.1.0 的 44pt 会盖住客 App 底部 28pt 以上
+// 区域的手势，改 28pt 后只占底部 28pt，与壳子同口径。
+// 不拦截 28pt 以上区域的手势：容器视图 SBHomeBarPassthroughView 的 hitTest
+// 只在触点落在 barView 内时返回 barView，其余一律返回 nil、原样透给客 App。
+static const CGFloat SBHomeBarHeight = 28.0;      // 横杠条可点高度
 static const CGFloat SBHomeBarSwipeDistance = 32.0; // 上滑回桌面的距离阈值（pt）
 static const CGFloat SBHomeBarFastSwipeVelocity = 140.0; // 快滑速度阈值（pt/s）
 static const NSTimeInterval SBHomeBarLongPressSeconds = 0.42; // 按住阈值

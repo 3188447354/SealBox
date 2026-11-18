@@ -219,6 +219,10 @@ NSError *SBGuestLoaderErrorMake(SBGuestLoaderErrorCode code,
 
 /// 证书门：App Group 下 Certificate.p12 存在且钥匙串里存了密码才算有证书。
 /// 返回 NO 时 error 置为缺证书（两者都没有）或证书已被删除（有密码无文件）。
+/// 文件与密码齐全后，再读 App Group UserDefaults 缓存的 SBCertificateExpiryDate
+///（步骤 5 证书导入/刷新时写入的过期日）：有缓存且过期日 < 现在 → 证书已过期，
+///拦启动（错误码 1010）。无缓存不拦——过期日未知时不误拦，证书页刷新时会更新缓存。
+/// 同步 BOOL 接口做不了 OCSP 在线校验，缓存过期日是 C3 债务的本步补法。
 - (BOOL)checkCertificateGate:(NSError **)error {
     NSString *password = [[self class] keychainCertificatePassword];
     BOOL hasPassword = password.length > 0;
@@ -228,6 +232,19 @@ NSError *SBGuestLoaderErrorMake(SBGuestLoaderErrorCode code,
     BOOL hasCertFile = certPath.length > 0 && [[NSFileManager defaultManager] fileExistsAtPath:certPath];
 
     if (hasCertFile && hasPassword) {
+        id expiryObject = [[SBGuestLoader sharedDefaults] objectForKey:@"SBCertificateExpiryDate"];
+        if ([expiryObject isKindOfClass:[NSDate class]]) {
+            NSDate *expiryDate = (NSDate *)expiryObject;
+            if ([expiryDate timeIntervalSinceNow] < 0) {
+                if (error) {
+                    *error = SBGuestLoaderErrorMake(SBGuestLoaderErrorCertificateExpired,
+                                                    @"证书检查",
+                                                    @"证书已过期，请重新导入",
+                                                    @"去导入证书");
+                }
+                return NO;
+            }
+        }
         return YES;
     }
     if (error) {

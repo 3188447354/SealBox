@@ -37,6 +37,13 @@ enum SBLaunchRouter {
     static func routeOnLaunchIfNeeded() {
         ensureGuestHooksDylib()
         guard SBGuestLoader.isGuestLaunchRequested() else {
+            // 客已退出或闪退过：收据残留 guest-loaded 时静默清除，不弹错、不记失败，
+            // 避免下次启动误判（设计 §5.5 的 guest-loaded 过期清理）。
+            if let receipt = SBStore.shared.launchReceipt, receipt.stage == "guest-loaded" {
+                SBStore.shared.launchReceipt = nil
+                SBStore.shared.clearGuestSelection()
+                return
+            }
             // 上次若留了未兑现的旧收据（重起请求被系统丢了），记一次失败，
             // 桌面出现时按收据提示“系统没有重启应用，请重试”。
             if var receipt = SBStore.shared.launchReceipt,

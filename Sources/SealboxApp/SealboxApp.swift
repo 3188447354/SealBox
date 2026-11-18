@@ -19,6 +19,7 @@ struct VMRootView: View {
     @EnvironmentObject private var vm: VMState
     @AppStorage("vm.appearanceDark") private var appearanceDark = true
     @AppStorage("vm.plugin.statusBarFancy") private var statusBarFancy = false
+    @State private var didRouteLaunch = false
 
     var body: some View {
         ZStack {
@@ -42,6 +43,15 @@ struct VMRootView: View {
         .preferredColorScheme(appearanceDark ? .dark : .light)
         .statusBar(hidden: statusBarFancy)
         .overlay(alignment: .bottom) { homeSwipeZone }
+        .onAppear {
+            // 启动路由只跑一次：重起进客 App 时兑现收据加载客 App，
+            // 过期 restart-requested 收据记失败、残留 guest-loaded 收据静默清除。
+            // 收据弹错弹窗的 UI 接线在步骤 8，本步只保证路由跑起来。
+            if !didRouteLaunch {
+                didRouteLaunch = true
+                SBLaunchRouter.routeOnLaunchIfNeeded()
+            }
+        }
     }
 
     @ViewBuilder

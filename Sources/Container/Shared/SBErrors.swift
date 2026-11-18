@@ -14,6 +14,7 @@ enum SBError: LocalizedError {
     case signFailed(reason: String)
     case missingCertificate
     case certificateDeleted
+    case certificateExpired
     case certificateInvalid(reason: String)
     case restartRequestFailed
     case guestLoadFailed(reason: String)
@@ -34,6 +35,7 @@ enum SBError: LocalizedError {
         case .signFailed: return "签名"
         case .missingCertificate: return "证书检查"
         case .certificateDeleted: return "证书检查"
+        case .certificateExpired: return "证书检查"
         case .certificateInvalid: return "证书检查"
         case .restartRequestFailed: return "重启请求"
         case .guestLoadFailed: return "加载客 App"
@@ -67,6 +69,8 @@ enum SBError: LocalizedError {
             return "未导入证书，请先导入证书"
         case .certificateDeleted:
             return "证书已被删除，请重新导入证书"
+        case .certificateExpired:
+            return "证书已过期，请重新导入"
         case .certificateInvalid(let reason):
             return "证书无效：\(reason)"
         case .restartRequestFailed:
@@ -85,7 +89,7 @@ enum SBError: LocalizedError {
     /// 恢复建议：显示在报错弹窗的次要文案或按钮旁。
     var recoverySuggestion: String? {
         switch self {
-        case .missingCertificate, .certificateDeleted:
+        case .missingCertificate, .certificateDeleted, .certificateExpired:
             return "去导入证书"
         case .restartRequestFailed, .guestLoadFailed:
             return "重试"

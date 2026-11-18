@@ -19,6 +19,7 @@ typedef NS_ENUM(NSInteger, SBGuestLoaderErrorCode) {
     SBGuestLoaderErrorSpoofFailed          = 1007, // 伪装主 Bundle / 可执行路径失败
     SBGuestLoaderErrorEntryPointNotFound   = 1008, // 找不到客 App 入口
     SBGuestLoaderErrorSelfTestFailed       = 1009, // 启动链自测失败
+    SBGuestLoaderErrorCertificateExpired   = 1010, // 证书已过期（缓存过期日 < 现在）
 };
 
 /// 构造一个带中文阶段名与中文文案的错误。recoverySuggestion 可为空。

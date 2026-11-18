@@ -93,6 +93,34 @@ static const NSInteger SBKeychainGroupCount = 128;
                            message:@"该应用是 32 位应用，需要 JIT 才能运行"
                           recovery:@"请用 Seal 开启 JIT 后重试，或换用 64 位版本"];
     }
+    // 最低系统版本检查（设计 §3.6 新增，0.1.0 未做）：读客 Info.plist 的
+    // MinimumOSVersion，与宿主当前系统版本比对；客要求高于宿主时拒绝启动，
+    // 文案带两个真实版本号。MinimumOSVersion 缺失或无法解析时不拦
+    //（无依据不误拦）。比对按数字分段：16.0 < 16.1 < 17.0，缺段按 0 计。
+    NSString *minimumOSVersion = infoPlist[@"MinimumOSVersion"];
+    if ([minimumOSVersion isKindOfClass:[NSString class]] && minimumOSVersion.length > 0) {
+        NSOperatingSystemVersion hostVersion = [[NSProcessInfo processInfo] operatingSystemVersion];
+        NSArray<NSString *> *guestParts = [minimumOSVersion componentsSeparatedByString:@"."];
+        NSInteger guestMajor = guestParts.count > 0 ? [guestParts[0] integerValue] : 0;
+        NSInteger guestMinor = guestParts.count > 1 ? [guestParts[1] integerValue] : 0;
+        NSInteger guestPatch = guestParts.count > 2 ? [guestParts[2] integerValue] : 0;
+        BOOL guestRequiresNewer = guestMajor > hostVersion.majorVersion ||
+            (guestMajor == hostVersion.majorVersion && guestMinor > hostVersion.minorVersion) ||
+            (guestMajor == hostVersion.majorVersion && guestMinor == hostVersion.minorVersion &&
+             guestPatch > hostVersion.patchVersion);
+        if (guestRequiresNewer) {
+            NSString *guestVersionText = guestParts.count > 2
+                ? [NSString stringWithFormat:@"%ld.%ld.%ld", (long)guestMajor, (long)guestMinor, (long)guestPatch]
+                : [NSString stringWithFormat:@"%ld.%ld", (long)guestMajor, (long)guestMinor];
+            NSString *hostVersionText = [NSString stringWithFormat:@"%ld.%ld",
+                                         (long)hostVersion.majorVersion, (long)hostVersion.minorVersion];
+            return [self failWithError:error
+                                  code:SBGuestLoaderErrorUnsupportedBinary
+                               message:[NSString stringWithFormat:@"该应用需要 iOS %@，当前系统为 iOS %@",
+                                        guestVersionText, hostVersionText]
+                              recovery:@"请换用适配当前系统的版本"];
+        }
+    }
 
     // —— 2. 搭数据容器：建目录、HOME、tmp 软链 —————————————————————
     NSArray<NSString *> *containerSubdirs = @[

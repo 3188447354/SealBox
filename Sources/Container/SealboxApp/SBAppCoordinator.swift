@@ -121,19 +121,50 @@ final class SBAppCoordinator: ObservableObject {
 
     // MARK: - 启动（A4 / B1–B4）
 
+    /// 当前启动阶段（30 秒看门狗超时提示用）：证书检查 / 重启请求 / 加载客 App 三档。
+    /// 旧进程只走得到前两档——证书门与包检查在 requestGuestLaunch 内同步跑，
+    /// 调用返回时回调还没来即已通过证书门，进入重启请求阶段；加载客 App 在新进程
+    /// 的 bootstrap 里，旧进程在那之前已 exit(0)，看门狗随进程一起没了。
+    private var launchStage: String?
+    /// 30 秒后备看门狗：正常路径（成功 → 进程 exit(0)；失败 → 回调弹错）都会先取消它。
+    private var launchWatchdog: DispatchWorkItem?
+
     /// 点图标后的真实启动：证书门与 5 秒看门狗在 GuestLoader 侧，失败回调里弹错。
+    /// 另加 30 秒后备计时（F5）：从点图标起算，30 秒内无完成回调（进程未死、
+    /// 无错误回调）则按当前阶段弹“启动超时（卡在：<阶段>），请重试”，超时后阶段清零。
     func launchApp(_ app: SBInstalledApp) {
+        launchWatchdog?.cancel()
+        launchWatchdog = nil
+        launchStage = "证书检查"
+        let watchdog = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            let stage = self.launchStage ?? "重启请求"
+            self.launchStage = nil
+            self.launchWatchdog = nil
+            self.activeAlert = CoordinatorAlert(title: "启动超时", message: "启动超时（卡在：\(stage)），请重试")
+        }
+        launchWatchdog = watchdog
+        DispatchQueue.main.asyncAfter(deadline: .now() + 30, execute: watchdog)
         SBGuestLoader.shared().requestGuestLaunch(
             withBundleID: app.bundleID,
             containerUUID: app.containerUUID,
             diskDirectoryName: app.diskDirectoryName,
             keychainGroup: app.keychainGroup
         ) { [weak self] error in
+            guard let self = self else { return }
+            self.launchWatchdog?.cancel()
+            self.launchWatchdog = nil
+            self.launchStage = nil
             guard let error = error else { return }
             let stage = (error as NSError).userInfo[SBGuestLoaderErrorStageKey] as? String ?? "启动失败"
             Task { @MainActor in
-                self?.activeAlert = CoordinatorAlert(title: stage, message: error.localizedDescription)
+                self.activeAlert = CoordinatorAlert(title: stage, message: error.localizedDescription)
             }
+        }
+        // 证书门与包检查已同步跑完：回调还没来 = 已通过证书门，进入重启请求阶段。
+        // （证书失败 / 包缺失时回调是同步调的，上面已把 launchStage 置 nil，不会误推进。）
+        if launchStage != nil {
+            launchStage = "重启请求"
         }
     }
 
