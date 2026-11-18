@@ -1,8 +1,14 @@
 // SBMachOPatcher.h — Mach-O 补丁器：把客 App 可执行文件改造成可在宿主进程内 dlopen 的形态。
 //
-// 做法（按设计规格 §1.2）：__PAGEZERO 改地址/大小；MH_EXECUTE → MH_DYLIB，
+// 做法（按设计规格 §1.2，0.2.5 对齐 LiveContainer 的 LCPatchExecSlice）：
+// __PAGEZERO 改地址/大小；MH_EXECUTE → MH_DYLIB，
 // 清 MH_PIE、置 MH_NO_REEXPORTED_DYLIBS；注入一条 LC_LOAD_DYLIB 加载客端 Hook 库；
-// 补 LC_RPATH；arm64e 切片 cpusubtype 置位；加密包直接拒绝。
+// 补 LC_RPATH；arm64e 切片 cpusubtype 置位；加密包直接拒绝；
+// 0.2.5 新增：插 LC_ID_DYLIB（放加载命令最前，install name 取可执行文件名，
+//   空间不足时复用 LC_LOAD_DYLINKER 槽；插不下就跳过，不报错——与 LC 一致）、
+//   dylib 去重（重复的 LC_LOAD_DYLIB 等改写为无效命令号 0x114515）、
+//   链式修正段数不匹配不再当安装失败（只置 segMismatchOut 标记，继续打补丁与签名，
+//   启动时 dyld 会按原文报错；iOS 27 的绕过 v1 没有，见 MODULE_NOTES）。
 //
 // 注意：打补丁会使原有代码签名失效，调用方（SBInstaller）打完补丁后必须重签。
 
@@ -27,8 +33,6 @@ extern "C" {
 #define SB_MACHO_PATCH_ERR_ENCRYPTED 4
 // 没有足够空间注入 LC_LOAD_DYLIB（加载命令区空闲不足，且复用 LC_LOAD_DYLINKER 空间后仍不足）。
 #define SB_MACHO_PATCH_ERR_NO_SPACE 5
-// LC_DYLD_CHAINED_FIXUPS 的段数与实际 LC_SEGMENT_64 数量不一致。
-#define SB_MACHO_PATCH_ERR_SEG_COUNT_MISMATCH 6
 // 非 arm64 / arm64e 架构（如只有 x86_64 切片的 fat 包）。
 #define SB_MACHO_PATCH_ERR_UNSUPPORTED_ARCH 7
 
@@ -42,12 +46,22 @@ extern "C" {
 ///   - path: 可执行文件路径（thin 包或 fat 包均可；fat 包只处理其中的 arm64 / arm64e 切片）。
 ///   - hooks_dylib_path: 要注入的 LC_LOAD_DYLIB 路径，例如
 ///     "@loader_path/../../Tweaks/SBGuestHooks.dylib"。
+///   - seg_mismatch_out: 可为 NULL；非 NULL 时，若链式修正里的段数与实际段数不一致，
+///     置 *seg_mismatch_out = 1（补丁照打、调用方继续装；启动时 dyld 会按原文报错）。
 /// - Returns: `SB_MACHO_PATCH_OK` 为成功，其余为上列错误码。
 ///   失败时文件不被写入（全部修改先在内存里完成，通过校验后才一次性写回），
 ///   其中加密检测在任何修改前完成，所以加密包原样不动。
 ///   同一路径已注入时不重复注入，直接返回成功。
 ///   只处理小端 arm64 / arm64e；32 位返回 `SB_MACHO_PATCH_ERR_UNSUPPORTED_32BIT`。
-int32_t SBMachOPatchExecutable(const char *path, const char *hooks_dylib_path);
+int32_t SBMachOPatchExecutable(const char *path, const char *hooks_dylib_path,
+                               int *seg_mismatch_out);
+
+/// 给单个 Mach-O 文件的 arm64e 切片补 CPU_SUBTYPE_LIB64 标记
+///（LiveContainer 的 LCPatchMachOFixupARM64eSlice 同款做法，包内 .dylib 与
+/// framework 可执行文件用；主可执行文件已由 SBMachOPatchExecutable 处理）。
+/// 不是 arm64e、已有 LIB64、不是 Mach-O 时直接返回成功（什么都不改）。
+/// - Returns: `SB_MACHO_PATCH_OK` 为成功，`SB_MACHO_PATCH_ERR_IO` 为读写失败。
+int32_t SBMachOPatchARM64eFile(const char *path);
 
 #ifdef __cplusplus
 }

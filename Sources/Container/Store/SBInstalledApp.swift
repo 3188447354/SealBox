@@ -32,6 +32,10 @@ struct SBInstalledApp: Codable, Identifiable, Equatable {
     var needsJIT: Bool
     var lastLaunchResult: SBLaunchResult?
 
+    /// 链式修正段数与实际段数不一致（0.2.5：不再当安装失败，照装；启动时 dyld
+    /// 会按原文报错，iOS 27 上大概率起不来）。记在记录里，供详情页 / 诊断参考。
+    var segCountMismatch: Bool
+
     /// 安装时所用证书的 SHA-256 指纹（SecCertificateCopyData 后取 SHA-256 hex）；
     /// 未签名安装时为 nil。证书更换后靠它判断是否需要重签（设计 §4.7）。
     var signingCertFingerprint: String?
@@ -59,6 +63,7 @@ struct SBInstalledApp: Codable, Identifiable, Equatable {
          patchRevision: Int = SBConstants.patchRevision,
          signed: Bool,
          needsJIT: Bool = false,
+         segCountMismatch: Bool = false,
          lastLaunchResult: SBLaunchResult? = nil,
          signingCertFingerprint: String? = nil,
          needsReimport: Bool = false,
@@ -76,6 +81,7 @@ struct SBInstalledApp: Codable, Identifiable, Equatable {
         self.patchRevision = patchRevision
         self.signed = signed
         self.needsJIT = needsJIT
+        self.segCountMismatch = segCountMismatch
         self.lastLaunchResult = lastLaunchResult
         self.signingCertFingerprint = signingCertFingerprint
         self.needsReimport = needsReimport
@@ -86,7 +92,7 @@ struct SBInstalledApp: Codable, Identifiable, Equatable {
     enum CodingKeys: String, CodingKey {
         case recordID, bundleID, displayName, version, shortVersion
         case executableName, containerUUID, keychainGroup, installedDate
-        case patchRevision, signed, needsJIT, lastLaunchResult
+        case patchRevision, signed, needsJIT, segCountMismatch, lastLaunchResult
         case signingCertFingerprint, needsReimport, diskDirectoryName
         case sourceIPAFileName
     }
@@ -106,6 +112,7 @@ struct SBInstalledApp: Codable, Identifiable, Equatable {
         patchRevision = try container.decode(Int.self, forKey: .patchRevision)
         signed = try container.decode(Bool.self, forKey: .signed)
         needsJIT = try container.decode(Bool.self, forKey: .needsJIT)
+        segCountMismatch = try container.decodeIfPresent(Bool.self, forKey: .segCountMismatch) ?? false
         lastLaunchResult = try container.decodeIfPresent(SBLaunchResult.self, forKey: .lastLaunchResult)
         signingCertFingerprint = try container.decodeIfPresent(String.self, forKey: .signingCertFingerprint)
         needsReimport = try container.decodeIfPresent(Bool.self, forKey: .needsReimport) ?? false

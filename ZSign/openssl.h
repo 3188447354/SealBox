@@ -50,6 +50,11 @@ public:
 	bool	m_bAdhoc;
 	bool	m_bSHA256Only;
 	bool	m_bSingleBinary;
+	// 0.2.5：强制给非 MH_EXECUTE 文件也写 entitlements。
+	// 客主程序打过补丁后是 MH_DYLIB，IsExecute() 为假，原来的门会把 entitlements
+	// 写成空；置位后（调用方在签主可执行文件 / appex 时置）按 m_strEntitleData 写。
+	// framework / dylib 不置位，仍为空。
+	bool	m_bForceEntitlements;
 	string	m_strTeamId;
 	string	m_strSubjectCN;
 	string	m_strProvData;

@@ -231,6 +231,13 @@ int checkCert(NSData *key,
 @implementation ZSigner
 + (NSProgress*)signMachOPathArr:(NSArray<NSString*>*)machoPathArr bundleId:(NSString *)bundleId cert:(NSData *)key
                             pass:(NSString *)pass completionHandler:(void(^)(BOOL success, NSError *error))completionHandler {
+    return [ZSigner signMachOPathArr:machoPathArr bundleId:bundleId cert:key pass:pass
+                      entitlementXML:nil completionHandler:completionHandler];
+}
+
++ (NSProgress*)signMachOPathArr:(NSArray<NSString*>*)machoPathArr bundleId:(NSString *)bundleId cert:(NSData *)key
+                            pass:(NSString *)pass entitlementXML:(nullable NSString *)entitlementXML
+             completionHandler:(void(^)(BOOL success, NSError *error))completionHandler {
     NSProgress* progress = [NSProgress progressWithTotalUnitCount:(int64_t)machoPathArr.count];
     ZLog::ClearLogs();
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
@@ -256,6 +263,11 @@ int checkCert(NSData *key,
                 completionHandler(NO, initError);
             });
             return;
+        }
+        // 0.2.5：带 entitlements 时强制写进签名（见 zsigner.h 与 archo.cpp 的门）。
+        if (entitlementXML != nil) {
+            pSignAsset->m_bForceEntitlements = true;
+            pSignAsset->m_strEntitleData = string(entitlementXML.UTF8String);
         }
 
         NSMutableArray<NSString *>* errorList = [NSMutableArray new];

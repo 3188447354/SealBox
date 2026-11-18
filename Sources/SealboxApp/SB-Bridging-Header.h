@@ -9,6 +9,7 @@
 #import "SBSigner.h"
 #import "SBCodesignCheck.h"
 #import "SBMachOPatcher.h"
+#import "SBGuestEntitlements.h"
 #import "SBUnzip.h"
 #import "SBDiagLog.h"
 #import "zsigner.h"

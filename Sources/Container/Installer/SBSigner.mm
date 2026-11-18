@@ -10,10 +10,25 @@
                certData:(NSData *)certData
                password:(NSString *)password
              completion:(void (^)(BOOL success, NSError * _Nullable error))completion {
+    [SBSigner signMachOAtPath:path
+                     bundleID:bundleID
+                     certData:certData
+                     password:password
+               entitlementXML:nil
+                   completion:completion];
+}
+
++ (void)signMachOAtPath:(NSString *)path
+               bundleID:(NSString *)bundleID
+               certData:(NSData *)certData
+               password:(NSString *)password
+         entitlementXML:(nullable NSString *)entitlementXML
+             completion:(void (^)(BOOL success, NSError * _Nullable error))completion {
     [ZSigner signMachOPathArr:@[ path ]
                      bundleId:bundleID
                          cert:certData
                          pass:password
+               entitlementXML:entitlementXML
             completionHandler:^(BOOL success, NSError *error) {
                 completion(success, error);
             }];

@@ -231,8 +231,10 @@ void *dlopenGuest(NSString *path, NSError **error) {
          [detail rangeOfString:@"fixup" options:NSCaseInsensitiveSearch].location != NSNotFound ||
          [detail rangeOfString:@"chained" options:NSCaseInsensitiveSearch].location != NSNotFound)) {
         // iOS 27 段数不匹配：v1 没有 dyld 内部绕过（需要私有符号，见 MODULE_NOTES），
-        // 给明确文案，不让用户对着原始 dlerror 猜。
-        message = @"客 App 加载失败：该应用的段数与当前系统不匹配（iOS 27），暂不支持";
+        // 报错里追加 dyld 原文（0.2.5 边界：报 dyld 原文，不替用户翻译掉）。
+        message = [NSString stringWithFormat:
+                   @"客 App 加载失败：该应用的段数与当前系统不匹配（iOS 27），暂不支持\ndyld 原文：%@",
+                   detail];
         recovery = @"请换用适配当前系统的版本，或等后续更新";
     } else {
         message = [NSString stringWithFormat:@"客 App 加载失败：%@", detail];

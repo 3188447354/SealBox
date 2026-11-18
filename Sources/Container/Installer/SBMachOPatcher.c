@@ -105,6 +105,21 @@ static void sb_write_dylib_command(uint8_t *dst, uint32_t cmdsize, const char *n
     memcpy(dst + sizeof(struct dylib_command), name, strlen(name) + 1);
 }
 
+// 在 dst 处写一条 LC_ID_DYLIB，install name 为 name（调用方保证是 basename）。
+// 名字字符串放在结构体之后（偏移 = sizeof(struct dylib_command)）。
+// current/compat version 取 0x10000，与 LiveContainer 一致。
+static void sb_write_id_dylib_command(uint8_t *dst, uint32_t cmdsize, const char *name) {
+    memset(dst, 0, cmdsize);
+    struct dylib_command *dc = (struct dylib_command *)dst;
+    dc->cmd = LC_ID_DYLIB;
+    dc->cmdsize = cmdsize;
+    dc->dylib.name.offset = (uint32_t)sizeof(struct dylib_command);
+    dc->dylib.timestamp = 2;
+    dc->dylib.current_version = 0x10000;
+    dc->dylib.compatibility_version = 0x10000;
+    memcpy(dst + sizeof(struct dylib_command), name, strlen(name) + 1);
+}
+
 // 在 dst 处写一条 LC_RPATH，路径为 rpath，cmdsize 由调用方保证足够。
 // 路径字符串放在结构体之后（偏移 = sizeof(struct rpath_command)）。
 static void sb_write_rpath_command(uint8_t *dst, uint32_t cmdsize, const char *rpath) {
@@ -134,7 +149,10 @@ static int32_t sb_add_rpath(uint8_t *base, struct mach_header_64 *header,
 
 // 对一个 thin 的 arm64/arm64e 切片打补丁（base 指向切片首字节，size 为切片长度）。
 // 只改内存，不写文件；返回 SB_MACHO_PATCH_OK 或错误码。
-static int32_t sb_patch_thin_slice(uint8_t *base, size_t size, const char *hooks_path) {
+// id_name 是可执行文件名（basename），用于 LC_ID_DYLIB；为 NULL 或空串时不插。
+// seg_mismatch_out 非 NULL 时，链式修正段数不一致只置标记、不报错（0.2.5，见头文件）。
+static int32_t sb_patch_thin_slice(uint8_t *base, size_t size, const char *hooks_path,
+                                   const char *id_name, int *seg_mismatch_out) {
     if (size < sizeof(struct mach_header_64)) {
         return SB_MACHO_PATCH_ERR_NOT_MACHO;
     }
@@ -172,6 +190,7 @@ static int32_t sb_patch_thin_slice(uint8_t *base, size_t size, const char *hooks
     uint32_t dylinker_size = 0;
     int has_dylinker = 0;
     int has_hooks_dylib = 0;
+    int has_id_dylib = 0;
     int has_rpath_tweaks = 0;
     int has_rpath_loader = 0;
     // 加载命令区末尾到第一份文件内容之间的空闲空间上界：
@@ -246,6 +265,10 @@ static int32_t sb_patch_thin_slice(uint8_t *base, size_t size, const char *hooks
                 dylinker_size = lc->cmdsize;
                 break;
             }
+            case LC_ID_DYLIB: {
+                has_id_dylib = 1;
+                break;
+            }
             case LC_LOAD_DYLIB:
             case LC_LOAD_WEAK_DYLIB:
             case LC_REEXPORT_DYLIB: {
@@ -292,6 +315,9 @@ static int32_t sb_patch_thin_slice(uint8_t *base, size_t size, const char *hooks
     }
 
     // ---- 链式修正段数校验：fixups 数据里的段数须等于实际段数。----
+    // 0.2.5（对齐 LiveContainer）：不一致只置标记、继续打补丁与签名，不再当安装失败；
+    // iOS 27 上 dyld 加载时会按原文报错（SBGuestEntry.dlopenGuest 会把原文带出来），
+    // v1 没有 dyld 内部绕过。标记经 seg_mismatch_out 交给调用方记在安装记录里。
     if (fixups_cmd != NULL) {
         uint32_t dataoff = fixups_cmd->dataoff;
         uint32_t datasize = fixups_cmd->datasize;
@@ -307,7 +333,9 @@ static int32_t sb_patch_thin_slice(uint8_t *base, size_t size, const char *hooks
         }
         uint32_t starts_seg_count = *(uint32_t *)(base + dataoff + starts_off);
         if (starts_seg_count != seg_count) {
-            return SB_MACHO_PATCH_ERR_SEG_COUNT_MISMATCH;
+            if (seg_mismatch_out) {
+                *seg_mismatch_out = 1;
+            }
         }
     }
 
@@ -323,6 +351,51 @@ static int32_t sb_patch_thin_slice(uint8_t *base, size_t size, const char *hooks
     if (pagezero_cmd != NULL) {
         pagezero_cmd->vmaddr = SB_MACHO_PATCH_PAGEZERO_VMADDR;
         pagezero_cmd->vmsize = SB_MACHO_PATCH_PAGEZERO_VMSIZE;
+    }
+
+    // ---- 插 LC_ID_DYLIB（LiveContainer 同款，0.2.5 新增）：放加载命令最前，
+    // install name 取可执行文件名；UE3 类游戏需要它在最前面。
+    // 空间不足时复用 LC_LOAD_DYLINKER 的槽位（名字截断放下）；两种都放不下就跳过，
+    // 不报错——与 LC 一致，LC_ID_DYLIB 是尽力而为。
+    // 注意：前插会让已有的加载命令整体后移，dylinker_off 是偏移量，要跟着加 id_needed。
+    if (!has_id_dylib && id_name != NULL && id_name[0] != '\0') {
+        uint32_t id_needed = sb_align_up_u32(
+            (uint32_t)sizeof(struct dylib_command) + (uint32_t)strlen(id_name) + 1, 8);
+        size_t cmds_end_now = sizeof(struct mach_header_64) + header->sizeofcmds;
+        size_t slack_now = (free_end > cmds_end_now) ? (free_end - cmds_end_now) : 0;
+        if (slack_now >= id_needed) {
+            memmove(base + sizeof(struct mach_header_64) + id_needed,
+                    base + sizeof(struct mach_header_64), header->sizeofcmds);
+            sb_write_id_dylib_command(base + sizeof(struct mach_header_64), id_needed, id_name);
+            header->ncmds += 1;
+            header->sizeofcmds += id_needed;
+            if (has_dylinker) {
+                dylinker_off += id_needed;
+            }
+        } else if (has_dylinker && dylinker_size >= id_needed) {
+            uint8_t *slot = base + dylinker_off;
+            memset(slot, 0, dylinker_size);
+            struct dylib_command *dc = (struct dylib_command *)slot;
+            dc->cmd = LC_ID_DYLIB;
+            dc->cmdsize = dylinker_size;
+            dc->dylib.name.offset = (uint32_t)sizeof(struct dylib_command);
+            dc->dylib.timestamp = 2;
+            dc->dylib.current_version = 0x10000;
+            dc->dylib.compatibility_version = 0x10000;
+            uint32_t name_room = dylinker_size - (uint32_t)sizeof(struct dylib_command);
+            if (name_room > 0) {
+                size_t copy_len = strlen(id_name);
+                if (copy_len > (size_t)name_room - 1) {
+                    copy_len = (size_t)name_room - 1;
+                }
+                memcpy(slot + sizeof(struct dylib_command), id_name, copy_len);
+                slot[sizeof(struct dylib_command) + copy_len] = '\0';
+            }
+            // ncmds/sizeofcmds 不变（同槽位、同大小）。
+            // 关键：dylinker 槽已被 ID 命令占了，后面的 LC_LOAD_DYLIB 注入
+            // 不能再复用它（否则会把刚写的 ID 命令盖掉），所以 has_dylinker 清零。
+            has_dylinker = 0;
+        }
     }
 
     // ---- 注入 LC_LOAD_DYLIB + 补 LC_RPATH（已有的不重复加）。----
@@ -385,11 +458,60 @@ static int32_t sb_patch_thin_slice(uint8_t *base, size_t size, const char *hooks
         }
     }
 
+    // ---- dylib 去重（LiveContainer 同款，0.2.5 新增）：重复的 LC_LOAD_DYLIB /
+    // LC_LOAD_WEAK_DYLIB / LC_REEXPORT_DYLIB / LC_LOAD_UPWARD_DYLIB 改写为
+    // 无效命令号 0x114515，dyld 会跳过。名字按字符串精确比对，命令格式不合法就跳过该条。
+    {
+        size_t count = header->ncmds;
+        const char **seen = (const char **)malloc((count > 0 ? count : 1) * sizeof(char *));
+        if (seen != NULL) {
+            size_t seen_count = 0;
+            size_t q = sizeof(struct mach_header_64);
+            size_t cmds_end_now = sizeof(struct mach_header_64) + header->sizeofcmds;
+            for (uint32_t i = 0; i < header->ncmds; i++) {
+                if (!sb_range_ok(q, sizeof(struct load_command), cmds_end_now)) {
+                    break;
+                }
+                struct load_command *lc = (struct load_command *)(base + q);
+                if (lc->cmdsize < sizeof(struct load_command) ||
+                    !sb_range_ok(q, lc->cmdsize, cmds_end_now)) {
+                    break;
+                }
+                if (lc->cmd == LC_LOAD_DYLIB || lc->cmd == LC_LOAD_WEAK_DYLIB ||
+                    lc->cmd == LC_REEXPORT_DYLIB || lc->cmd == LC_LOAD_UPWARD_DYLIB) {
+                    struct dylib_command *dc = (struct dylib_command *)lc;
+                    uint32_t name_off = dc->dylib.name.offset;
+                    if (name_off < lc->cmdsize) {
+                        const char *name = (const char *)base + q + name_off;
+                        size_t max_len = (size_t)lc->cmdsize - name_off;
+                        if (memchr(name, '\0', max_len) != NULL) {
+                            int dup = 0;
+                            for (size_t k = 0; k < seen_count; k++) {
+                                if (strcmp(name, seen[k]) == 0) {
+                                    dup = 1;
+                                    break;
+                                }
+                            }
+                            if (dup) {
+                                lc->cmd = 0x114515; // 无效命令号，dyld 会跳过
+                            } else {
+                                seen[seen_count++] = name;
+                            }
+                        }
+                    }
+                }
+                q += lc->cmdsize;
+            }
+            free(seen);
+        }
+    }
+
     return SB_MACHO_PATCH_OK;
 }
 
 // 处理 fat 包：逐个处理其中的 arm64/arm64e 切片；任一切片失败则整体失败。
-static int32_t sb_patch_fat(uint8_t *buffer, size_t size, const char *hooks_path) {
+static int32_t sb_patch_fat(uint8_t *buffer, size_t size, const char *hooks_path,
+                            const char *id_name, int *seg_mismatch_out) {
     if (size < sizeof(struct fat_header)) {
         return SB_MACHO_PATCH_ERR_NOT_MACHO;
     }
@@ -412,7 +534,8 @@ static int32_t sb_patch_fat(uint8_t *buffer, size_t size, const char *hooks_path
             if (!sb_range_ok(offset, arch_size, size)) {
                 return SB_MACHO_PATCH_ERR_NOT_MACHO;
             }
-            int32_t result = sb_patch_thin_slice(buffer + offset, arch_size, hooks_path);
+            int32_t result = sb_patch_thin_slice(buffer + offset, arch_size, hooks_path,
+                                                 id_name, seg_mismatch_out);
             if (result != SB_MACHO_PATCH_OK) {
                 return result;
             }
@@ -429,10 +552,17 @@ static int32_t sb_patch_fat(uint8_t *buffer, size_t size, const char *hooks_path
     return SB_MACHO_PATCH_OK;
 }
 
-int32_t SBMachOPatchExecutable(const char *path, const char *hooks_dylib_path) {
+int32_t SBMachOPatchExecutable(const char *path, const char *hooks_dylib_path,
+                               int *seg_mismatch_out) {
     if (path == NULL || hooks_dylib_path == NULL || hooks_dylib_path[0] == '\0') {
         return SB_MACHO_PATCH_ERR_NOT_MACHO;
     }
+    if (seg_mismatch_out) {
+        *seg_mismatch_out = 0;
+    }
+    // LC_ID_DYLIB 的 install name 取可执行文件名（basename）。
+    const char *id_name = strrchr(path, '/');
+    id_name = (id_name != NULL) ? id_name + 1 : path;
     size_t size = 0;
     uint8_t *buffer = sb_read_file(path, &size);
     if (buffer == NULL) {
@@ -443,14 +573,86 @@ int32_t SBMachOPatchExecutable(const char *path, const char *hooks_dylib_path) {
     if (size >= sizeof(uint32_t)) {
         uint32_t magic = *(uint32_t *)buffer;
         if (magic == FAT_MAGIC || magic == FAT_CIGAM) {
-            result = sb_patch_fat(buffer, size, hooks_dylib_path);
+            result = sb_patch_fat(buffer, size, hooks_dylib_path, id_name, seg_mismatch_out);
         } else {
-            result = sb_patch_thin_slice(buffer, size, hooks_dylib_path);
+            result = sb_patch_thin_slice(buffer, size, hooks_dylib_path, id_name, seg_mismatch_out);
         }
     }
 
     // 全部切片成功才写回；任一失败文件原样不动。
     if (result == SB_MACHO_PATCH_OK) {
+        if (!sb_write_file(path, buffer, size)) {
+            result = SB_MACHO_PATCH_ERR_IO;
+        }
+    }
+    free(buffer);
+    return result;
+}
+
+// 给单个 Mach-O 文件的 arm64e 切片补 CPU_SUBTYPE_LIB64 标记（见头文件）。
+// 只在内存里改、改了才写回；不是 arm64e / 已有 LIB64 / 不是 Mach-O 时不改不动。
+int32_t SBMachOPatchARM64eFile(const char *path) {
+    if (path == NULL) {
+        return SB_MACHO_PATCH_ERR_NOT_MACHO;
+    }
+    size_t size = 0;
+    uint8_t *buffer = sb_read_file(path, &size);
+    if (buffer == NULL) {
+        return SB_MACHO_PATCH_ERR_IO;
+    }
+    int changed = 0;
+    int32_t result = SB_MACHO_PATCH_OK;
+    if (size >= sizeof(uint32_t)) {
+        uint32_t magic = *(uint32_t *)buffer;
+        if (magic == FAT_MAGIC || magic == FAT_CIGAM) {
+            if (size < sizeof(struct fat_header)) {
+                result = SB_MACHO_PATCH_ERR_NOT_MACHO;
+            } else {
+                struct fat_header *fat_header = (struct fat_header *)buffer;
+                uint32_t nfat_arch = (uint32_t)OSSwapBigToHostInt32(fat_header->nfat_arch);
+                if (!sb_range_ok(sizeof(struct fat_header),
+                                 (size_t)nfat_arch * sizeof(struct fat_arch), size)) {
+                    result = SB_MACHO_PATCH_ERR_NOT_MACHO;
+                } else {
+                    for (uint32_t i = 0; i < nfat_arch; i++) {
+                        struct fat_arch *arch = (struct fat_arch *)(buffer +
+                            sizeof(struct fat_header) + i * sizeof(struct fat_arch));
+                        cpu_type_t cputype = OSSwapBigToHostInt32(arch->cputype);
+                        cpu_subtype_t cpusubtype = OSSwapBigToHostInt32(arch->cpusubtype);
+                        uint32_t offset = (uint32_t)OSSwapBigToHostInt32(arch->offset);
+                        uint32_t arch_size = (uint32_t)OSSwapBigToHostInt32(arch->size);
+                        if (cputype != CPU_TYPE_ARM64 || !sb_range_ok(offset, arch_size, size)) {
+                            continue;
+                        }
+                        if (((uint32_t)cpusubtype & ~0x80000000u) != (uint32_t)CPU_SUBTYPE_ARM64E ||
+                            (cpusubtype & CPU_SUBTYPE_LIB64) != 0) {
+                            continue;
+                        }
+                        // 切片头与 fat 目录两处都要置位（fat 目录里是大端序）。
+                        struct mach_header_64 *slice_header =
+                            (struct mach_header_64 *)(buffer + offset);
+                        slice_header->cpusubtype |= CPU_SUBTYPE_LIB64;
+                        arch->cpusubtype = OSSwapHostToBigInt32(cpusubtype | CPU_SUBTYPE_LIB64);
+                        changed = 1;
+                    }
+                }
+            }
+        } else if (magic == MH_MAGIC_64) {
+            if (size < sizeof(struct mach_header_64)) {
+                result = SB_MACHO_PATCH_ERR_NOT_MACHO;
+            } else {
+                struct mach_header_64 *header = (struct mach_header_64 *)buffer;
+                if (header->cputype == CPU_TYPE_ARM64 &&
+                    ((uint32_t)header->cpusubtype & ~0x80000000u) == (uint32_t)CPU_SUBTYPE_ARM64E &&
+                    (header->cpusubtype & CPU_SUBTYPE_LIB64) == 0) {
+                    header->cpusubtype |= CPU_SUBTYPE_LIB64;
+                    changed = 1;
+                }
+            }
+        }
+        // 其他 magic（32 位、MH_MAGIC 等）不是目标：不改，不报错。
+    }
+    if (result == SB_MACHO_PATCH_OK && changed) {
         if (!sb_write_file(path, buffer, size)) {
             result = SB_MACHO_PATCH_ERR_IO;
         }

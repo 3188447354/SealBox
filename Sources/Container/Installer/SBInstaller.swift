@@ -101,10 +101,17 @@ public enum SBInstaller {
                 throw SBError.patchFailed(reason: "找不到可执行文件 \(parsed.executableName)")
             }
             let hooksDylibPath = "@loader_path/../../Tweaks/\(SBConstants.guestHooksDylibName)"
-            let patchResult = SBMachOPatchExecutable(executablePath, hooksDylibPath)
+            // 0.2.5：段数不一致不再抛错，置标记记进安装记录（启动时 dyld 会按原文报错）。
+            var segMismatch: Int32 = 0
+            let patchResult = SBMachOPatchExecutable(executablePath, hooksDylibPath, &segMismatch)
             guard patchResult == SB_MACHO_PATCH_OK else {
                 throw patchError(for: patchResult)
             }
+            let segCountMismatch = segMismatch != 0
+            // 0.2.5：全包 arm64e 修正——包内 .dylib 与 framework 可执行文件补
+            // LIB64 标记（LiveContainer 的 LCPatchAppBundleFixupARM64eSlice 同款做法）。
+            // 尽力而为：某文件失败不阻塞安装。
+            fixupBundleARM64e(appPath: destinationDir.path)
             patchProgress.completedUnitCount = 10
             try Task.checkCancellation()
 
@@ -117,6 +124,24 @@ public enum SBInstaller {
                let password = certificatePassword(),
                !password.isEmpty {
                 do {
+                    // 0.2.5：先取各可执行文件的 entitlements（从原包签名提取、Team
+                    // 前缀换成导入证书的 Team；读不到时合成最小项），再全包重签，
+                    // 最后主程序与 appex 各用自己的 entitlements 再签一次。
+                    // 提取必须在全包重签之前——重签会覆盖原签名，之后就读不到了。
+                    // 打补丁不碰签名区，提取放在打补丁之后仍能读到原签名。
+                    // Team 取不到时跳过这一步（只全包重签，与 0.2.4 行为一致）。
+                    var executablesToResign: [(path: String, bundleID: String, entitlements: String)] = []
+                    if let teamID = SBSigner.teamID(withCertData: certData, password: password) {
+                        if let mainEntitlements = SBGuestEntitlementsForExecutableAtPath(
+                            executablePath, teamID, parsed.bundleID) {
+                            executablesToResign.append(
+                                (path: executablePath, bundleID: parsed.bundleID,
+                                 entitlements: mainEntitlements))
+                        }
+                        executablesToResign.append(
+                            contentsOf: appexExecutablesToResign(
+                                appPath: destinationDir.path, teamID: teamID))
+                    }
                     try await signApp(
                         appPath: destinationDir.path,
                         bundleID: parsed.bundleID,
@@ -126,6 +151,18 @@ public enum SBInstaller {
                     )
                     signed = true
                     signingCertFingerprint = certificateFingerprint(certData: certData, password: password)
+                    // 主程序与 appex 用各自的 entitlements 再签一次（0.2.5）。
+                    // 某一次失败不阻塞安装：该文件保留全包重签的签名（空 entitlements），
+                    // 与 0.2.4 行为一致。
+                    for entry in executablesToResign {
+                        try? await signMachOWithEntitlements(
+                            path: entry.path,
+                            bundleID: entry.bundleID,
+                            certData: certData,
+                            password: password,
+                            entitlementXML: entry.entitlements
+                        )
+                    }
                 } catch {
                     // 验收 C5：签名失败也照样装，详情页标「未签名 / JIT 启动」。
                     signed = false
@@ -177,6 +214,7 @@ public enum SBInstaller {
                 patchRevision: SBConstants.patchRevision,
                 signed: signed,
                 needsJIT: false,
+                segCountMismatch: segCountMismatch,
                 lastLaunchResult: nil,
                 signingCertFingerprint: signingCertFingerprint,
                 diskDirectoryName: destinationDir.lastPathComponent,
@@ -233,8 +271,6 @@ public enum SBInstaller {
             return .patchFailed(reason: "该应用为 32 位应用，无法在不开启 JIT 的情况下运行")
         case SB_MACHO_PATCH_ERR_NO_SPACE:
             return .patchFailed(reason: "可执行文件内没有足够空间注入启动组件")
-        case SB_MACHO_PATCH_ERR_SEG_COUNT_MISMATCH:
-            return .patchFailed(reason: "链式修正段数与实际段数不一致")
         case SB_MACHO_PATCH_ERR_UNSUPPORTED_ARCH:
             return .patchFailed(reason: "该应用不是 arm64 架构")
         default:
@@ -325,6 +361,115 @@ public enum SBInstaller {
                 }
             }
         }
+    }
+
+    /// 对单个 Mach-O 用给定 entitlements 再签一次（0.2.5）；失败抛 `SBError.signFailed`。
+    private static func signMachOWithEntitlements(
+        path: String,
+        bundleID: String,
+        certData: Data,
+        password: String,
+        entitlementXML: String
+    ) async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            SBSigner.signMachO(
+                atPath: path,
+                bundleID: bundleID,
+                certData: certData,
+                password: password,
+                entitlementXML: entitlementXML
+            ) { success, error in
+                if success {
+                    continuation.resume()
+                } else {
+                    continuation.resume(
+                        throwing: SBError.signFailed(
+                            reason: error?.localizedDescription ?? "签名失败"
+                        )
+                    )
+                }
+            }
+        }
+    }
+
+    /// 全包 arm64e 修正（0.2.5，LiveContainer 的 LCPatchAppBundleFixupARM64eSlice
+    /// 同款做法）：包内 .dylib 与 framework 可执行文件补 CPU_SUBTYPE_LIB64 标记。
+    /// 主可执行文件已由 SBMachOPatchExecutable 处理过，不在这里重复。
+    /// 尽力而为：某文件读失败 / 不是 Mach-O 时跳过，不阻塞安装。
+    private static func fixupBundleARM64e(appPath: String) {
+        let fileManager = FileManager.default
+        guard let enumerator = fileManager.enumerator(
+            at: URL(fileURLWithPath: appPath),
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return
+        }
+        for case let fileURL as URL in enumerator {
+            guard let values = try? fileURL.resourceValues(forKeys: [.isDirectoryKey]) else {
+                continue
+            }
+            if values.isDirectory == true {
+                // framework：读 Info.plist 的 CFBundleExecutable，找不到时用
+                // framework 名（去 .framework 后缀）作可执行文件名。
+                guard fileURL.pathExtension == "framework" else {
+                    continue
+                }
+                let executableName: String
+                if let plist = NSDictionary(
+                    contentsOf: fileURL.appendingPathComponent("Info.plist")),
+                   let name = plist["CFBundleExecutable"] as? String, !name.isEmpty {
+                    executableName = name
+                } else {
+                    executableName = fileURL.deletingPathExtension().lastPathComponent
+                }
+                let executablePath = fileURL.appendingPathComponent(executableName).path
+                if fileManager.fileExists(atPath: executablePath) {
+                    _ = SBMachOPatchARM64eFile(executablePath)
+                }
+            } else if fileURL.pathExtension == "dylib" {
+                _ = SBMachOPatchARM64eFile(fileURL.path)
+            }
+        }
+    }
+
+    /// 收集 PlugIns 下各 appex 的重签信息（0.2.5）：读 appex 自身 Info.plist 的
+    /// CFBundleExecutable 与 CFBundleIdentifier，取原包 entitlements（Team 前缀
+    /// 已换成导入证书的 Team；读不到时合成最小项）。framework / dylib 不需要
+    /// entitlements，不在这里出现。SB 从不加载客扩展，appex 只签、不打补丁。
+    private static func appexExecutablesToResign(
+        appPath: String,
+        teamID: String
+    ) -> [(path: String, bundleID: String, entitlements: String)] {
+        let fileManager = FileManager.default
+        let pluginsDir = URL(fileURLWithPath: appPath).appendingPathComponent("PlugIns")
+        guard let appexURLs = try? fileManager.contentsOfDirectory(
+            at: pluginsDir,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else {
+            return []
+        }
+        var entries: [(path: String, bundleID: String, entitlements: String)] = []
+        for appexURL in appexURLs where appexURL.pathExtension == "appex" {
+            guard let plist = NSDictionary(
+                contentsOf: appexURL.appendingPathComponent("Info.plist")),
+                  let executableName = plist["CFBundleExecutable"] as? String,
+                  !executableName.isEmpty,
+                  let appexBundleID = plist["CFBundleIdentifier"] as? String,
+                  !appexBundleID.isEmpty else {
+                continue
+            }
+            let executablePath = appexURL.appendingPathComponent(executableName).path
+            guard fileManager.fileExists(atPath: executablePath),
+                  let entitlements = SBGuestEntitlementsForExecutableAtPath(
+                    executablePath, teamID, appexBundleID) else {
+                continue
+            }
+            entries.append((path: executablePath, bundleID: appexBundleID,
+                            entitlements: entitlements))
+        }
+        return entries
     }
 
     // MARK: - 目录拷贝（带真实字节进度）

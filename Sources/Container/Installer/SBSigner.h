@@ -23,6 +23,18 @@ NS_ASSUME_NONNULL_BEGIN
                password:(NSString *)password
              completion:(void (^)(BOOL success, NSError * _Nullable error))completion;
 
+/// 对单个 Mach-O 签名并写入给定的 entitlements（0.2.5，转发 `ZSigner
+/// signMachOPathArr:…:entitlementXML:`）。用于打过补丁的客主程序（MH_DYLIB，
+/// 原来的 IsExecute() 门会把 entitlements 写空）与 appex。
+/// - Parameters:
+///   - entitlementXML: entitlements XML 字符串；nil 时与旧方法完全一致。
++ (void)signMachOAtPath:(NSString *)path
+               bundleID:(NSString *)bundleID
+               certData:(NSData *)certData
+               password:(NSString *)password
+         entitlementXML:(nullable NSString *)entitlementXML
+             completion:(void (^)(BOOL success, NSError * _Nullable error))completion;
+
 /// 取 p12 证书的 Team ID（证书 subject 的 OU；取不到返回 nil）。
 + (nullable NSString *)teamIDWithCertData:(NSData *)certData
                                  password:(NSString *)password;

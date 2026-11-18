@@ -40,7 +40,8 @@ enum SBConstants {
     static let restartDeadlineSeconds: TimeInterval = 5.0
 
     /// Mach-O 补丁版本号；低于它的客 App 启动前重打补丁。
-    static let patchRevision = 1
+    /// 0.2.5：LC_ID_DYLIB、dylib 去重、entitlements、段数 mismatch 改为标记。
+    static let patchRevision = 2
 
     /// 钥匙串半隔离组数（与 entitlements.xml 的 128 组一致）。
     static let keychainGroupCount = 128

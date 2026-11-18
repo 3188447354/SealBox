@@ -2,6 +2,7 @@
 #import "SBGuestBootstrap.h"
 
 #import <dlfcn.h>
+#import <objc/runtime.h>
 #import <stdlib.h>
 #import <sys/stat.h>
 #import <unistd.h>
@@ -13,11 +14,58 @@
 #import "SBExecPathHook.h"
 
 extern char **environ;
+// CoreFoundation 的进程名全局量（与 _CFGetProcessPath 同款做法，见 SBExecPathHook.m）。
+extern char **_CFGetProgname(void);
 
 // 钥匙串组名前缀（与契约 SBConstants 一致：com.mjorb.sealbox.shared[.N]）。
 static NSString * const SBKeychainGroupPrefix = @"com.mjorb.sealbox.shared";
 // 钥匙串组总数（与契约 keychainGroupCount 一致）。
 static const NSInteger SBKeychainGroupCount = 128;
+
+// —— 进程身份改写（0.2.5，LiveContainer 同款做法，尽力而为） ————————————
+// NSProcessInfo.arguments 是只读属性：把它的 getter 换成返回客 argv（[客可执行路径]）。
+// processName 有公开 setter；_CFGetProgname() 直写 CF 的进程名全局量。
+// _CFGetProcessPath() 的直写已在第 5 步的 overwriteExecutablePath 里做过，不重复。
+// 任何一步失败都不阻断启动——客 App 读到的进程身份不完整也比启动失败强。
+static NSArray *g_sbGuestArguments = nil;
+
+static NSArray *SBGuestProcessInfoArguments(id self, SEL _cmd) {
+    (void)self;
+    (void)_cmd;
+    return g_sbGuestArguments ?: @[];
+}
+
+static void SBRewriteProcessIdentity(NSString *guestExecPath) {
+    if (guestExecPath.length == 0) {
+        return;
+    }
+    // arguments：swizzle getter。
+    @try {
+        Method argumentsMethod = class_getInstanceMethod([NSProcessInfo class], @selector(arguments));
+        if (argumentsMethod) {
+            g_sbGuestArguments = @[ guestExecPath ];
+            method_setImplementation(argumentsMethod, (IMP)SBGuestProcessInfoArguments);
+        }
+    } @catch (NSException *exception) {
+        NSLog(@"[Sealbox] 改写 NSProcessInfo.arguments 失败：%@", exception.reason);
+    }
+    // processName：公开 setter。
+    @try {
+        [[NSProcessInfo processInfo] setProcessName:[guestExecPath lastPathComponent]];
+    } @catch (NSException *exception) {
+        NSLog(@"[Sealbox] 改写 processName 失败：%@", exception.reason);
+    }
+    // _CFGetProgname()：直写 CF 进程名全局量（通常是可执行文件名）。
+    char **progname = _CFGetProgname();
+    if (progname && *progname) {
+        static char *guestProgname = NULL;
+        free(guestProgname);
+        guestProgname = strdup([[guestExecPath lastPathComponent] UTF8String]);
+        if (guestProgname) {
+            *progname = guestProgname;
+        }
+    }
+}
 
 @implementation SBGuestBootstrap
 
@@ -223,6 +271,12 @@ static const NSInteger SBKeychainGroupCount = 128;
     } else {
         SBDiagLogLine("客加载：可执行路径已改写为客路径");
     }
+
+    // —— 5b. 改写进程身份（0.2.5，尽力而为）：NSProcessInfo.arguments /
+    // processName 与 _CFGetProgname() 指向客可执行文件，让客 App 读到的
+    // 进程身份与它自己一致。_CFGetProcessPath() 已在第 5 步里直写过。
+    SBRewriteProcessIdentity(guestExecPath);
+    SBDiagLogLine("客加载：进程身份已改写为客应用");
 
     // —— 6. 预加载客端 Hook dylib ————————————————————————————————
     // 安装时 Installer 已把 SBGuestHooks.dylib 注入客可执行的 LC_LOAD_DYLIB，

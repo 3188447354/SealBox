@@ -327,8 +327,12 @@ bool ZArchO::BuildCodeSignature(ZSignAsset* pSignAsset,
 
 	string strEmptyEntitlements = "";
 	ZSign::SlotBuildRequirements(strBundleId, pSignAsset->m_strSubjectCN, strRequirementsSlot);
-	ZSign::SlotBuildEntitlements(IsExecute() ? pSignAsset->m_strEntitleData : strEmptyEntitlements, strEntitlementsSlot);
-	ZSign::SlotBuildDerEntitlements(IsExecute() ? pSignAsset->m_strEntitleData : "", strDerEntitlementsSlot);
+	// 0.2.5：打过补丁的客主程序是 MH_DYLIB（IsExecute() 为假），但它仍需要
+	// entitlements 才能跑；m_bForceEntitlements 由调用方在签主可执行文件 / appex
+	// 时置位，framework / dylib 不置位，仍写空。
+	bool bWriteEntitlements = IsExecute() || pSignAsset->m_bForceEntitlements;
+	ZSign::SlotBuildEntitlements(bWriteEntitlements ? pSignAsset->m_strEntitleData : strEmptyEntitlements, strEntitlementsSlot);
+	ZSign::SlotBuildDerEntitlements(bWriteEntitlements ? pSignAsset->m_strEntitleData : "", strDerEntitlementsSlot);
 
 	string strRequirementsSlotSHA1;
 	string strRequirementsSlotSHA256;

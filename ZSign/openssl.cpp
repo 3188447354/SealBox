@@ -591,6 +591,7 @@ ZSignAsset::ZSignAsset()
 	m_bAdhoc = false;
 	m_bSingleBinary = false;
 	m_bSHA256Only = false;
+	m_bForceEntitlements = false;
 }
 
 bool ZSignAsset::Init(
