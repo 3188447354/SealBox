@@ -4,6 +4,7 @@
 
 #import <UIKit/UIKit.h>
 #import <Security/Security.h>
+#import <dlfcn.h>
 #import <stdlib.h>
 #import <unistd.h>
 
