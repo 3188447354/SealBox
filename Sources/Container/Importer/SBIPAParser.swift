@@ -17,6 +17,8 @@ public struct SBParsedIPA {
     public let appURL: URL
     /// 图标数据（读出即为 PNG 内容；没有则为 nil，安装时用默认图标）。
     public let iconData: Data?
+    /// 原始 IPA 文件名（Documents/IPAs 下的存档名，重装时找回源文件用）。
+    public let sourceIPAFileName: String?
 
     public init(
         bundleID: String,
@@ -24,7 +26,8 @@ public struct SBParsedIPA {
         version: String,
         executableName: String,
         appURL: URL,
-        iconData: Data?
+        iconData: Data?,
+        sourceIPAFileName: String? = nil
     ) {
         self.bundleID = bundleID
         self.displayName = displayName
@@ -32,6 +35,7 @@ public struct SBParsedIPA {
         self.executableName = executableName
         self.appURL = appURL
         self.iconData = iconData
+        self.sourceIPAFileName = sourceIPAFileName
     }
 }
 
@@ -117,7 +121,8 @@ public enum SBIPAParser {
                 version: version,
                 executableName: executableName,
                 appURL: appURL,
-                iconData: iconData
+                iconData: iconData,
+                sourceIPAFileName: ipaURL.lastPathComponent
             )
         } catch {
             // 解析失败：清掉本次创建的临时目录，不留半截文件。

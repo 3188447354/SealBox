@@ -46,6 +46,25 @@ enum VMFiles {
         return formatBytes(size)
     }
 
+    /// Human-readable total size of a directory tree (installed .app bundle),
+    /// or nil when the directory does not exist.
+    static func directorySizeString(url: URL) -> String? {
+        guard let enumerator = FileManager.default.enumerator(
+            at: url,
+            includingPropertiesForKeys: [.fileSizeKey, .isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else { return nil }
+        var total: Int64 = 0
+        var found = false
+        for case let fileURL as URL in enumerator {
+            guard let values = try? fileURL.resourceValues(forKeys: [.fileSizeKey, .isDirectoryKey]),
+                  values.isDirectory != true else { continue }
+            total += Int64(values.fileSize ?? 0)
+            found = true
+        }
+        return found ? formatBytes(total) : nil
+    }
+
     /// Total size of everything in Documents/IPAs (real disk measurement).
     static func ipasDirectorySizeString() -> String {
         guard let dir = try? ipasDirectory(),

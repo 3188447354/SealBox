@@ -6,11 +6,28 @@ import SwiftUI
 // gesture can be gated on the custom-gestures plugin switch.
 struct HomeScreenView: View {
     @EnvironmentObject private var vm: VMState
+    @EnvironmentObject private var coordinator: SBAppCoordinator
+    @ObservedObject private var store = SBStore.shared
     @AppStorage("vm.plugin.iconThemeDark") private var iconThemeDark = false
     @AppStorage("vm.plugin.customGestures") private var customGestures = false
     @AppStorage("vm.settings.wallpaper") private var selectedWallpaper = 0
-    @State private var pendingDelete: InstalledApp? = nil
+    @State private var pendingDelete: SBInstalledApp? = nil
     @State private var showDeleteConfirm = false
+
+    /// 桌面第 2 页：单源头 SBStore，按 desktopIconOrder 的 recordID 顺序排；
+    /// 顺序里没有的（迁移刚建的）按安装时间排在后面。
+    private var orderedInstalledApps: [SBInstalledApp] {
+        let order = store.desktopIconOrder
+        let apps = store.installedApps
+        return apps.sorted { a, b in
+            let ia = order.firstIndex(of: a.recordID.uuidString) ?? Int.max
+            let ib = order.firstIndex(of: b.recordID.uuidString) ?? Int.max
+            if ia != ib {
+                return ia < ib
+            }
+            return a.installedDate < b.installedDate
+        }
+    }
 
     /// The home-screen wallpaper is the option picked on the wallpaper
     /// page (vm.settings.wallpaper); it survives restarts via @AppStorage.
@@ -143,14 +160,30 @@ struct HomeScreenView: View {
 
     private func installedPage(width: CGFloat) -> some View {
         VStack {
-            if vm.installed.isEmpty {
+            if orderedInstalledApps.isEmpty {
                 Spacer()
                 Text("还没有安装的应用\n去软件源获取")
                     .multilineTextAlignment(.center)
                     .font(.system(size: 15))
                     .foregroundColor(.white.opacity(0.85))
+                Button("导入 IPA") {
+                    coordinator.importIPA()
+                }
+                .buttonStyle(.bordered)
+                .tint(.white)
+                .padding(.top, 16)
                 Spacer()
             } else {
+                HStack {
+                    Spacer()
+                    Button("导入 IPA") {
+                        coordinator.importIPA()
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(.white)
+                    .controlSize(.small)
+                }
+                .padding(.horizontal, 26)
                 ScrollView {
                     LazyVGrid(
                         columns: [
@@ -161,26 +194,24 @@ struct HomeScreenView: View {
                         ],
                         spacing: 24
                     ) {
-                        ForEach(vm.installed) { app in
-                            Button { vm.openApp = .installed(app.name) } label: {
+                        ForEach(orderedInstalledApps) { app in
+                            Button { handleIconTap(app) } label: {
                                 VStack(spacing: 6) {
-                                    ZStack {
-                                        RoundedRectangle(cornerRadius: 16)
-                                            .fill(colorForApp(named: app.name))
-                                            .frame(width: 64, height: 64)
-                                        Text(String(app.name.prefix(1)))
-                                            .font(.system(size: 28, weight: .semibold))
-                                            .foregroundColor(.white)
-                                    }
-                                    Text(app.name)
+                                    InstalledAppIconView(app: app, size: 64)
+                                    Text(SBStore.shared.displayName(for: app))
                                         .font(.system(size: 12))
                                         .foregroundColor(.white)
                                         .shadow(color: .black.opacity(0.35), radius: 2, x: 0, y: 1)
                                         .lineLimit(1)
                                 }
+                                // 需重新导入的记录灰色显示。
+                                .opacity(app.needsReimport ? 0.45 : 1.0)
                             }
-                            .buttonStyle(.plain)
+                            .buttonStyle(TapZoomButtonStyle())
                             .contextMenu {
+                                Button("详情") {
+                                    vm.openApp = .installed(app.recordID.uuidString)
+                                }
                                 Button("删除", role: .destructive) {
                                     pendingDelete = app
                                     showDeleteConfirm = true
@@ -195,13 +226,13 @@ struct HomeScreenView: View {
         }
         .frame(width: width)
         .confirmationDialog(
-            "删除“\(pendingDelete?.name ?? "")”？",
+            "删除“\(pendingDelete.map { SBStore.shared.displayName(for: $0) } ?? "")”？",
             isPresented: $showDeleteConfirm,
             titleVisibility: .visible
         ) {
             Button("删除", role: .destructive) {
                 if let app = pendingDelete {
-                    vm.removeInstalled(app.name)
+                    coordinator.deleteApp(app)
                 }
                 pendingDelete = nil
             }
@@ -209,7 +240,17 @@ struct HomeScreenView: View {
                 pendingDelete = nil
             }
         } message: {
-            Text("将删除已下载的 IPA 文件与记录。")
+            Text("将删除应用本体、数据容器、钥匙串记录与桌面记录，原始 IPA 文件保留在 Documents/IPAs。")
+        }
+    }
+
+    /// 点图标：需重新导入的记录只进详情页（重新导入 / 删除，不启动）；
+    /// 其余走启动链（JIT 预检与证书门在 coordinator.launchApp 里）。
+    private func handleIconTap(_ app: SBInstalledApp) {
+        if app.needsReimport {
+            vm.openApp = .installed(app.recordID.uuidString)
+        } else {
+            coordinator.launchApp(app)
         }
     }
 
@@ -227,18 +268,6 @@ struct HomeScreenView: View {
                     vm.homePage = max(0, vm.homePage - 1)
                 }
             }
-    }
-
-    // MARK: - Installed-app colors
-
-    /// Fixed palette; the color is picked by a stable hash of the name
-    /// (sum of Unicode scalars — Swift's hashValue is randomised per run).
-    private func colorForApp(named name: String) -> Color {
-        let palette: [Color] = [
-            .blue, .green, .orange, .purple, .pink, .teal, .red, .indigo,
-        ]
-        let sum = name.unicodeScalars.reduce(0) { $0 &+ Int($1.value) }
-        return palette[sum % palette.count]
     }
 
     // MARK: - Icon theme (light vs. dark)
@@ -289,6 +318,18 @@ struct HomeScreenView: View {
         iconThemeDark
             ? [Color(red: 0.55, green: 0.10, blue: 0.22), Color(red: 0.50, green: 0.08, blue: 0.16)]
             : [Color(red: 0.99, green: 0.23, blue: 0.42), Color(red: 0.98, green: 0.18, blue: 0.28)]
+    }
+}
+
+/// 点按缩放：按下时图标从自身中心缩小，松开复原，点按必有可见反馈。
+/// 用 ButtonStyle 的 isPressed 驱动，不抢 Dock/翻页手势；图标位置恒有，
+/// 缩放锚点就是图标中心（无图标位置的兜底分支见 0.0.9：从屏幕中心起——
+/// 桌面网格里每次点按都有图标，走不到兜底）。
+struct TapZoomButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed ? 0.82 : 1.0)
+            .animation(.easeInOut(duration: 0.12), value: configuration.isPressed)
     }
 }
 

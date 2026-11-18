@@ -43,6 +43,10 @@ struct SBInstalledApp: Codable, Identifiable, Equatable {
     /// 磁盘上的 bundle 目录名。平行安装时加时间戳后缀，与 bundleID 区分。
     var diskDirectoryName: String
 
+    /// 原始 IPA 在 Documents/IPAs 下的文件名（重装/重新导入的源文件）；
+    /// 旧记录（无此键）解码时为 nil，不编造。
+    var sourceIPAFileName: String?
+
     init(recordID: UUID = UUID(),
          bundleID: String,
          displayName: String,
@@ -58,7 +62,8 @@ struct SBInstalledApp: Codable, Identifiable, Equatable {
          lastLaunchResult: SBLaunchResult? = nil,
          signingCertFingerprint: String? = nil,
          needsReimport: Bool = false,
-         diskDirectoryName: String? = nil) {
+         diskDirectoryName: String? = nil,
+         sourceIPAFileName: String? = nil) {
         self.recordID = recordID
         self.bundleID = bundleID
         self.displayName = displayName
@@ -75,6 +80,7 @@ struct SBInstalledApp: Codable, Identifiable, Equatable {
         self.signingCertFingerprint = signingCertFingerprint
         self.needsReimport = needsReimport
         self.diskDirectoryName = diskDirectoryName ?? (bundleID + ".app")
+        self.sourceIPAFileName = sourceIPAFileName
     }
 
     enum CodingKeys: String, CodingKey {
@@ -82,6 +88,7 @@ struct SBInstalledApp: Codable, Identifiable, Equatable {
         case executableName, containerUUID, keychainGroup, installedDate
         case patchRevision, signed, needsJIT, lastLaunchResult
         case signingCertFingerprint, needsReimport, diskDirectoryName
+        case sourceIPAFileName
     }
 
     init(from decoder: Decoder) throws {
@@ -103,6 +110,7 @@ struct SBInstalledApp: Codable, Identifiable, Equatable {
         signingCertFingerprint = try container.decodeIfPresent(String.self, forKey: .signingCertFingerprint)
         needsReimport = try container.decodeIfPresent(Bool.self, forKey: .needsReimport) ?? false
         diskDirectoryName = try container.decode(String.self, forKey: .diskDirectoryName)
+        sourceIPAFileName = try container.decodeIfPresent(String.self, forKey: .sourceIPAFileName)
     }
 
     var bundleURL: URL {

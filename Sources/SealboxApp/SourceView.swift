@@ -1,5 +1,6 @@
 import SwiftUI
 import Foundation
+import UIKit
 
 // Software source app (0.1.4): browse the 27 catalog apps, download their
 // IPA into Documents/IPAs, and open installed apps' detail pages.
@@ -12,11 +13,11 @@ import Foundation
 /// Downloads IPA files from the software source into Documents/IPAs.
 ///
 /// Threading (Swift 6): URLSession calls its delegate on a private serial
-/// queue, so every @Published update and every VMState call hops to the
-/// main actor via Task { @MainActor }. The delegate-queue code itself only
-/// touches the file system and the immutable catalog. The class is
-/// @unchecked Sendable for that reason: its mutable state is only ever
-/// read/written on the main actor (download() is called from UI actions).
+/// queue, so every @Published update hops to the main actor via
+/// Task { @MainActor }. The delegate-queue code itself only touches the file
+/// system and the immutable catalog. The class is @unchecked Sendable for
+/// that reason: its mutable state is only ever read/written on the main
+/// actor (download() is called from UI actions).
 final class DownloadManager: NSObject, URLSessionDownloadDelegate, ObservableObject, @unchecked Sendable {
     /// Download progress per app name, 0.0...1.0.
     @Published private(set) var progress: [String: Double] = [:]
@@ -29,18 +30,36 @@ final class DownloadManager: NSObject, URLSessionDownloadDelegate, ObservableObj
 
     /// Shared state, set on each download call (main thread only) and only
     /// read back on the main actor once a download finishes.
-    private weak var vm: VMState?
+    private weak var coordinator: SBAppCoordinator?
 
     /// Start downloading an app's IPA. No-op if it is already downloading
-    /// or already installed.
-    func download(_ app: SourceApp, vm: VMState) {
-        guard !downloading.contains(app.name), !vm.isInstalled(app.name) else { return }
-        self.vm = vm
+    /// or already installed; installing in progress is refused with an alert.
+    func download(_ app: SourceApp, coordinator: SBAppCoordinator) {
+        guard !downloading.contains(app.name) else { return }
+        self.coordinator = coordinator
+        if coordinator.isInstalling {
+            coordinator.activeAlert = SBAppCoordinator.CoordinatorAlert(
+                title: "正在安装", message: "正在安装，请稍候")
+            return
+        }
+        if Self.isInstalled(app) { return }
         let task = session.downloadTask(with: app.url)
         task.taskDescription = app.name
         downloading.insert(app.name)
         progress[app.name] = 0
         task.resume()
+    }
+
+    /// 单源头 SBStore 的“已安装”判断：原始 IPA 文件名对上，或显示名对上。
+    static func isInstalled(_ app: SourceApp) -> Bool {
+        return installedRecord(for: app) != nil
+    }
+
+    static func installedRecord(for app: SourceApp) -> SBInstalledApp? {
+        let fileName = app.url.lastPathComponent
+        return SBStore.shared.installedApps.first { record in
+            record.sourceIPAFileName == fileName || record.displayName == app.name
+        }
     }
 
     // MARK: - URLSessionDownloadDelegate (called on the session's queue)
@@ -79,12 +98,9 @@ final class DownloadManager: NSObject, URLSessionDownloadDelegate, ObservableObj
                 guard let self else { return }
                 self.downloading.remove(name)
                 self.progress.removeValue(forKey: name)
-                self.vm?.addInstalled(InstalledApp(
-                    name: app.name,
-                    version: app.version,
-                    fileName: app.url.lastPathComponent,
-                    category: app.category.rawValue
-                ))
+                // 下载完成即走安装闭环：解析 → 同名三选一 → 安装管线。
+                // 原始 IPA 留在 Documents/IPAs（重装的源文件，不删）。
+                await self.coordinator?.installIPA(at: destination, displayNameHint: name)
             }
         } catch {
             Task { @MainActor [weak self] in
@@ -116,7 +132,6 @@ final class DownloadManager: NSObject, URLSessionDownloadDelegate, ObservableObj
 // MARK: - Source list
 
 struct SourceView: View {
-    @EnvironmentObject private var vm: VMState
     @StateObject private var downloads = DownloadManager()
     @State private var searchText = ""
     @State private var selectedCategory: SourceCategory = .all
@@ -215,7 +230,7 @@ private struct SourceRow: View {
 struct SourceAppDetailView: View {
     let app: SourceApp
     @ObservedObject var downloads: DownloadManager
-    @EnvironmentObject private var vm: VMState
+    @ObservedObject private var store = SBStore.shared
 
     var body: some View {
         ScrollView {
@@ -247,11 +262,17 @@ struct SourceAppDetailView: View {
                         .padding(.vertical, 8)
                     infoRow(label: "介绍", value: app.intro)
                     // Real disk size, only when the IPA is actually on disk.
-                    if vm.isInstalled(app.name),
+                    if DownloadManager.isInstalled(app),
                        let size = VMFiles.ipaFileSizeString(fileName: app.url.lastPathComponent) {
                         Divider()
                             .padding(.vertical, 8)
                         infoRow(label: "文件大小", value: size)
+                    }
+                    // 已装记录的签名状态（装完才有；未装不显示该行）。
+                    if let record = DownloadManager.installedRecord(for: app) {
+                        Divider()
+                            .padding(.vertical, 8)
+                        infoRow(label: "签名状态", value: record.signed ? "已签名" : "未签名 / JIT 启动")
                     }
                 }
                 .padding()
@@ -277,76 +298,128 @@ struct SourceAppDetailView: View {
 
 // MARK: - Installed app detail
 
-/// Detail page for an app already downloaded from the source
-/// (opened from the home screen via VMApp.installed).
+/// Detail page for an installed guest app (opened from the home screen
+/// via VMApp.installed, payload = SBStore recordID UUID string).
+/// Single source of truth: SBStore.shared.installedApps.
 struct InstalledAppDetailView: View {
-    let name: String
+    let recordID: String
     @EnvironmentObject private var vm: VMState
+    @EnvironmentObject private var coordinator: SBAppCoordinator
+    @ObservedObject private var store = SBStore.shared
     @State private var showDeleteConfirm = false
+
+    private var app: SBInstalledApp? {
+        store.installedApps.first { $0.recordID.uuidString == recordID }
+    }
+
+    /// 包还在磁盘上吗（迁移建了记录、包被删了时为 false，给“重新安装”）。
+    private var packageExists: Bool {
+        guard let app = app, !app.diskDirectoryName.isEmpty else { return false }
+        return FileManager.default.fileExists(atPath: app.bundleURL.path)
+    }
 
     var body: some View {
         NavigationStack {
             Group {
-                if let app = vm.installed.first(where: { $0.name == name }) {
+                if let app = app {
                     ScrollView {
                         VStack(spacing: 20) {
-                            AppIconView(name: app.name, size: 96)
+                            InstalledAppIconView(app: app, size: 96)
                                 .padding(.top, 12)
+                                .opacity(app.needsReimport ? 0.45 : 1.0)
                             VStack(spacing: 6) {
-                                Text(app.name)
+                                Text(store.displayName(for: app))
                                     .font(.title2.bold())
-                                if let catalogApp = SourceCatalog.all.first(where: { $0.name == app.name }) {
+                                if let catalogApp = SourceCatalog.all.first(where: { $0.name == app.displayName }) {
                                     Text(catalogApp.intro)
                                         .font(.body)
                                         .foregroundStyle(.secondary)
                                         .multilineTextAlignment(.center)
                                 }
+                                if app.needsReimport {
+                                    Text("需重新导入")
+                                        .font(.subheadline)
+                                        .foregroundStyle(.orange)
+                                }
                             }
                             VStack(alignment: .leading, spacing: 0) {
                                 infoRow(label: "版本号", value: app.version)
+                                if !app.bundleID.isEmpty {
+                                    Divider()
+                                        .padding(.vertical, 8)
+                                    infoRow(label: "Bundle ID", value: app.bundleID)
+                                }
                                 Divider()
                                     .padding(.vertical, 8)
-                                infoRow(label: "文件名", value: app.fileName)
-                                // Real disk size of the downloaded IPA file.
-                                if let size = VMFiles.ipaFileSizeString(fileName: app.fileName) {
+                                infoRow(label: "签名状态", value: app.signed ? "已签名" : "未签名 / JIT 启动")
+                                // 上次启动结果：有记录才显示该行。
+                                if let last = app.lastLaunchResult {
+                                    Divider()
+                                        .padding(.vertical, 8)
+                                    infoRow(
+                                        label: "上次启动结果",
+                                        value: "\(VMTime.dateTimeString(for: last.date)) \(last.message)")
+                                }
+                                // 文件大小：已装包在磁盘上的实测大小；包不在不显示该行。
+                                if let size = VMFiles.directorySizeString(url: app.bundleURL) {
                                     Divider()
                                         .padding(.vertical, 8)
                                     infoRow(label: "文件大小", value: size)
                                 }
+                                // 证书指纹：有则显示前 16 位 hex，无则不显示该行。
+                                if let fingerprint = app.signingCertFingerprint, !fingerprint.isEmpty {
+                                    Divider()
+                                        .padding(.vertical, 8)
+                                    infoRow(label: "证书指纹", value: String(fingerprint.prefix(16)))
+                                }
                             }
                             .padding()
                             .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 12))
-                            Button("删除此应用", role: .destructive) {
-                                showDeleteConfirm = true
+                            if app.needsReimport {
+                                // 占位记录只给两个按钮，不调启动。
+                                Button("重新导入") {
+                                    coordinator.reinstallApp(app)
+                                }
+                                .buttonStyle(.borderedProminent)
+                                Button("删除此应用", role: .destructive) {
+                                    showDeleteConfirm = true
+                                }
+                                .buttonStyle(.bordered)
+                            } else {
+                                if !packageExists {
+                                    Button("重新安装") {
+                                        coordinator.reinstallApp(app)
+                                    }
+                                    .buttonStyle(.borderedProminent)
+                                }
+                                Button("删除此应用", role: .destructive) {
+                                    showDeleteConfirm = true
+                                }
+                                .buttonStyle(.bordered)
                             }
-                            .buttonStyle(.bordered)
-                            Text("已下载到 Documents/IPAs，未安装到系统")
-                                .font(.footnote)
-                                .foregroundStyle(.secondary)
-                                .multilineTextAlignment(.center)
                         }
                         .padding()
                     }
                     .safeAreaInset(edge: .bottom) { Color.clear.frame(height: 28) }
                     .confirmationDialog(
-                        "删除“\(app.name)”？",
+                        "删除“\(store.displayName(for: app))”？",
                         isPresented: $showDeleteConfirm,
                         titleVisibility: .visible
                     ) {
                         Button("删除", role: .destructive) {
-                            vm.removeInstalled(app.name)
+                            coordinator.deleteApp(app)
                             vm.openApp = nil
                         }
                         Button("取消", role: .cancel) {}
                     } message: {
-                        Text("将删除已下载的 IPA 文件与记录。")
+                        Text("将删除应用本体、数据容器、钥匙串记录与桌面记录，原始 IPA 文件保留在 Documents/IPAs。")
                     }
                 } else {
                     Text("未找到")
                         .foregroundStyle(.secondary)
                 }
             }
-            .navigationTitle(name)
+            .navigationTitle(app.map { store.displayName(for: $0) } ?? "详情")
             .navigationBarTitleDisplayMode(.inline)
         }
     }
@@ -357,6 +430,7 @@ struct InstalledAppDetailView: View {
             Spacer()
             Text(value)
                 .foregroundStyle(.secondary)
+                .multilineTextAlignment(.trailing)
         }
     }
 }
@@ -389,17 +463,46 @@ struct AppIconView: View {
     }
 }
 
-/// The 获取 button, three states driven by VMState (source of truth):
-/// 未下载 → "获取"; 下载中 → progress %; 已下载/已安装 → "已安装" (grey).
+/// 已装应用的图标：包内 SBIcon.png 存在就显示它（读磁盘文件），
+/// 没有用默认色块 + 首字（沿用 AppIconView 的配色逻辑）。
+struct InstalledAppIconView: View {
+    let app: SBInstalledApp
+    let size: CGFloat
+
+    var body: some View {
+        if let uiImage = UIImage(contentsOfFile: app.iconURL.path) {
+            Image(uiImage: uiImage)
+                .resizable()
+                .aspectRatio(contentMode: .fill)
+                .frame(width: size, height: size)
+                .clipShape(RoundedRectangle(cornerRadius: size * 0.22, style: .continuous))
+        } else {
+            AppIconView(name: SBStore.shared.displayName(for: app), size: size)
+        }
+    }
+}
+
+/// The 获取 button, four states driven by SBStore + coordinator:
+/// 未下载 → "获取"; 下载中 → download %; 安装中 → install %（真实进度）;
+/// 已下载/已安装 → "已安装" (grey). 安装中再点获取会弹“正在安装，请稍候”。
 private struct GetButtonView: View {
     let app: SourceApp
     var wide = false
     @ObservedObject var downloads: DownloadManager
-    @EnvironmentObject private var vm: VMState
+    @EnvironmentObject private var coordinator: SBAppCoordinator
+    // 只为订阅 SBStore：installedApps 变化（装完/删完）时本行要刷新；
+    // “已安装”判断本身走 DownloadManager.isInstalled（读 SBStore）。
+    @ObservedObject private var store = SBStore.shared
 
     var body: some View {
-        if vm.isInstalled(app.name) {
+        if DownloadManager.isInstalled(app) {
             stateLabel("已安装", foreground: .secondary, background: Color(.secondarySystemFill))
+        } else if coordinator.installingDisplayName == app.name {
+            stateLabel(
+                "\(Int(coordinator.installProgress.progress * 100))%",
+                foreground: .white,
+                background: .blue.opacity(0.75)
+            )
         } else if downloads.downloading.contains(app.name) {
             stateLabel(
                 "\(Int((downloads.progress[app.name] ?? 0) * 100))%",
@@ -407,7 +510,7 @@ private struct GetButtonView: View {
                 background: .blue.opacity(0.75)
             )
         } else {
-            Button { downloads.download(app, vm: vm) } label: {
+            Button { downloads.download(app, coordinator: coordinator) } label: {
                 stateLabel("获取", foreground: .white, background: .accentColor)
             }
             .buttonStyle(.plain)

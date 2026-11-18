@@ -9,6 +9,8 @@ final class SBAppCoordinator: ObservableObject {
         let id = UUID()
         let title: String
         let message: String
+        /// 证书门拦截时为 true：弹窗给“去导入证书”按钮，点后跳设置页证书区。
+        var goToSettings = false
     }
 
     struct DuplicatePending: Identifiable {
@@ -19,6 +21,9 @@ final class SBAppCoordinator: ObservableObject {
 
     @Published var installProgress = SBInstallProgress()
     @Published var isInstalling = false
+    /// 正在安装的应用显示名（下载闭环时为软件源目录名，文件导入时为解析出的显示名）；
+    /// 获取按钮靠它判断“这行是不是正在装的那个”，只在那行显示真实进度。
+    @Published var installingDisplayName: String?
     @Published var showingSettings = false
     @Published var deleteError: Error?
     @Published var activeAlert: CoordinatorAlert?
@@ -50,19 +55,90 @@ final class SBAppCoordinator: ObservableObject {
         Task {
             do {
                 let url = try await SBImporter.pickIPA(presenter: presenter)
-                let parsed = try SBIPAParser.parse(ipaURL: url)
-                if let existing = SBStore.shared.app(with: parsed.bundleID) {
-                    await MainActor.run {
-                        duplicatePending = DuplicatePending(parsed: parsed, existing: existing)
-                    }
-                    return
-                }
-                await runInstall(parsed: parsed, existing: nil)
+                await installIPA(at: url)
             } catch {
                 // 用户取消静默处理（C1 的一部分），其余弹错。
                 if case SBError.cancelled = error { return }
                 await MainActor.run {
                     activeAlert = CoordinatorAlert(title: "导入失败", message: error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    /// 安装入口（文件选择器与软件源下载共用）：解析 → 同名查 → 三选一或直接装。
+    /// - Parameters:
+    ///   - url: Documents/IPAs 下的原始 IPA（下载完成后的落位文件，或选择器拷入的副本）。
+    ///   - displayNameHint: 软件源目录名；解析出的显示名与它不一致时仍以它标安装行。
+    func installIPA(at url: URL, displayNameHint: String? = nil) async {
+        if isInstalling {
+            await MainActor.run {
+                activeAlert = CoordinatorAlert(title: "正在安装", message: "正在安装，请稍候")
+            }
+            return
+        }
+        do {
+            let parsed = try SBIPAParser.parse(ipaURL: url)
+            if let existing = SBStore.shared.app(with: parsed.bundleID) {
+                await MainActor.run {
+                    duplicatePending = DuplicatePending(parsed: parsed, existing: existing)
+                }
+                return
+            }
+            await runInstall(parsed: parsed, existing: nil, displayNameHint: displayNameHint)
+        } catch {
+            if case SBError.cancelled = error { return }
+            await MainActor.run {
+                installingDisplayName = nil
+                activeAlert = CoordinatorAlert(title: "导入失败", message: error.localizedDescription)
+            }
+        }
+    }
+
+    /// 从 Documents/IPAs 的原始 IPA 重新跑一遍安装管线（详情页“重新安装”/
+    /// 占位记录“重新导入”用）。同记录重装走替换路径（复用容器与钥匙串组）；
+    /// 占位记录（needsReimport，旧 bundleID 未知）走全新安装，装完删占位记录。
+    /// 原始 IPA 文件不在了，改走文件选择器导入。
+    func reinstallApp(_ app: SBInstalledApp) {
+        if isInstalling {
+            activeAlert = CoordinatorAlert(title: "正在安装", message: "正在安装，请稍候")
+            return
+        }
+        guard let fileName = app.sourceIPAFileName, !fileName.isEmpty else {
+            importIPA()
+            return
+        }
+        let ipaURL = SBConstants.documentsURL
+            .appendingPathComponent("IPAs", isDirectory: true)
+            .appendingPathComponent(fileName)
+        guard FileManager.default.fileExists(atPath: ipaURL.path) else {
+            activeAlert = CoordinatorAlert(
+                title: "找不到原始 IPA",
+                message: "Documents/IPAs 里没有该应用的原始 IPA 文件，请重新导入")
+            return
+        }
+        Task {
+            do {
+                let parsed = try SBIPAParser.parse(ipaURL: ipaURL)
+                if let existing = SBStore.shared.app(with: parsed.bundleID),
+                   existing.recordID != app.recordID {
+                    await MainActor.run {
+                        duplicatePending = DuplicatePending(parsed: parsed, existing: existing)
+                    }
+                    return
+                }
+                if app.needsReimport {
+                    await runInstall(parsed: parsed, existing: nil) {
+                        SBStore.shared.removeAppRecord(recordID: app.recordID)
+                        SBStore.shared.loadInstalledApps()
+                    }
+                } else {
+                    await runInstall(parsed: parsed, existing: app)
+                }
+            } catch {
+                if case SBError.cancelled = error { return }
+                await MainActor.run {
+                    activeAlert = CoordinatorAlert(title: "安装失败", message: error.localizedDescription)
                 }
             }
         }
@@ -77,10 +153,26 @@ final class SBAppCoordinator: ObservableObject {
         }
     }
 
+    /// 同名三选一 sheet 上点“取消”：什么都不装，解析临时目录已清。
+    func cancelDuplicate() {
+        installingDisplayName = nil
+        duplicatePending = nil
+    }
+
     /// 真安装：进度每 100ms 刷一次到桌面 pill；装完把新应用追加到桌面顺序末尾。
-    private func runInstall(parsed: SBParsedIPA, existing: SBInstalledApp?) async {
+    /// - Parameters:
+    ///   - displayNameHint: 软件源目录名；有它时安装行按它显示进度。
+    ///   - onInstalled: 装完（记录已入库、桌面已刷新）后在主线程跑的收尾，
+    ///     如占位记录重装成功后删占位记录；失败时不跑。
+    private func runInstall(
+        parsed: SBParsedIPA,
+        existing: SBInstalledApp?,
+        displayNameHint: String? = nil,
+        onInstalled: (() -> Void)? = nil
+    ) async {
         await MainActor.run {
             isInstalling = true
+            installingDisplayName = displayNameHint ?? parsed.displayName
             installProgress.isInstalling = true
             installProgress.progress = 0
             installProgress.label = "正在安装 \(parsed.displayName)"
@@ -106,12 +198,15 @@ final class SBAppCoordinator: ObservableObject {
                 SBStore.shared.loadInstalledApps()
                 installProgress.progress = 1
                 installProgress.isInstalling = false
+                installingDisplayName = nil
                 isInstalling = false
+                onInstalled?()
             }
         } catch {
             poll.cancel()
             await MainActor.run {
                 installProgress.isInstalling = false
+                installingDisplayName = nil
                 isInstalling = false
                 if case SBError.cancelled = error { return }
                 activeAlert = CoordinatorAlert(title: "安装失败", message: error.localizedDescription)
@@ -132,7 +227,26 @@ final class SBAppCoordinator: ObservableObject {
     /// 点图标后的真实启动：证书门与 5 秒看门狗在 GuestLoader 侧，失败回调里弹错。
     /// 另加 30 秒后备计时（F5）：从点图标起算，30 秒内无完成回调（进程未死、
     /// 无错误回调）则按当前阶段弹“启动超时（卡在：<阶段>），请重试”，超时后阶段清零。
+    ///
+    /// L2 JIT 预检（设计 §3.4，步骤 6 留下的债）：未签名（signed=false）或
+    /// 需 JIT（needsJIT）的应用，先查 SBGuestLoader.isJITEnabled；未启用时
+    /// 弹“该应用需要 JIT 才能运行”，不发启动请求、不假装启动。
     func launchApp(_ app: SBInstalledApp) {
+        if app.needsReimport {
+            activeAlert = CoordinatorAlert(
+                title: "需重新导入",
+                message: "该应用的安装信息缺失，请重新导入或删除")
+            return
+        }
+        if app.signed == false || app.needsJIT {
+            if !SBGuestLoader.isJITEnabled() {
+                let message = (SBError.needsJIT.errorDescription ?? "该应用需要 JIT 才能运行")
+                    + "。"
+                    + (SBError.needsJIT.recoverySuggestion ?? "")
+                activeAlert = CoordinatorAlert(title: SBError.needsJIT.stage, message: message)
+                return
+            }
+        }
         launchWatchdog?.cancel()
         launchWatchdog = nil
         launchStage = "证书检查"
@@ -158,7 +272,12 @@ final class SBAppCoordinator: ObservableObject {
             guard let error = error else { return }
             let stage = (error as NSError).userInfo[SBGuestLoaderErrorStageKey] as? String ?? "启动失败"
             Task { @MainActor in
-                self.activeAlert = CoordinatorAlert(title: stage, message: error.localizedDescription)
+                // 证书门拦截（无证书 / 证书被删 / 证书过期）给“去导入证书”按钮，
+                // 点后关弹窗并打开设置页（证书区在设置页内）。
+                self.activeAlert = CoordinatorAlert(
+                    title: stage,
+                    message: error.localizedDescription,
+                    goToSettings: stage == "证书检查")
             }
         }
         // 证书门与包检查已同步跑完：回调还没来 = 已通过证书门，进入重启请求阶段。

@@ -529,7 +529,8 @@ private struct SoftwareUpdateView: View {
 /// Real disk numbers from FileManager + the real size of Documents/IPAs
 /// and the real count of installed apps.
 private struct StorageView: View {
-    @EnvironmentObject private var vm: VMState
+    // 只为订阅 SBStore：装完/删完后“已装应用”计数要刷新。
+    @ObservedObject private var store = SBStore.shared
 
     var body: some View {
         let space = VMFiles.diskSpace()
@@ -544,7 +545,7 @@ private struct StorageView: View {
             }
             Section("软件源下载") {
                 LabeledRow(label: "已下载 IPA 大小", value: VMFiles.ipasDirectorySizeString())
-                LabeledRow(label: "已装应用", value: "\(vm.installed.count) 个")
+                LabeledRow(label: "已装应用", value: "\(store.installedApps.count) 个")
             }
         }
         .navigationTitle("储存空间")
@@ -693,6 +694,18 @@ private struct AboutSettingsView: View {
                 LabeledRow(label: "虚拟机版本", value: VMDevice.appVersionString)
             } footer: {
                 Text("型号、系统版本与设备标识均取自本机真实系统；虚拟机版本为本 App 自身版本。")
+            }
+            // 诚实边界（设计 §5.1/D4）：九条逐行在列，不合并、不藏、不加修饰。
+            Section("诚实边界") {
+                Text("容器不隔离：客 App 能直接读宿主文件，隔离只是约定的目录分组。")
+                Text("权限全局共享：相机、定位等权限属于宿主进程，一次授权全客共享。")
+                Text("entitlement 只用宿主的：客 App 原有的推送、App Groups 等权限在重签后丢失。")
+                Text("远程推送不工作：客 App 没有推送 entitlement，收不到推送。")
+                Text("扩展不支持：Widget、Share 扩展等无处注册。")
+                Text("宿主须开发证书签名：客 App 靠宿主证书重签后运行，不是免签。")
+                Text("免费证书 7 天过期：到期后已装应用打不开，需重新导入证书并重新签名。")
+                Text("iOS 26+ 无证书启动不了：没有证书连启动入口都进不去。")
+                Text("不承诺所有 IPA 都能跑：加密包、32 位、非 arm64 等应用打不开或功能缺失。")
             }
         }
         .navigationTitle("关于本机")

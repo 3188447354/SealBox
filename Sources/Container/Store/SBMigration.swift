@@ -101,7 +101,8 @@ enum SBMigration {
                     installedDate: installedDate,
                     signed: false,
                     needsJIT: false,
-                    diskDirectoryName: nil
+                    diskDirectoryName: nil,
+                    sourceIPAFileName: legacy.fileName
                 )
                 newRecords.append(record)
             } else {
@@ -125,7 +126,8 @@ enum SBMigration {
                     signed: false,
                     needsJIT: false,
                     needsReimport: true,
-                    diskDirectoryName: ""
+                    diskDirectoryName: "",
+                    sourceIPAFileName: legacy.fileName
                 )
                 newRecords.append(record)
             }

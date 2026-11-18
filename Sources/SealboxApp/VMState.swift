@@ -6,61 +6,23 @@ enum VMApp: Hashable {
     case settings
     case source
     case plugins
-    case installed(String) // app name from the software source
+    /// 已装应用详情页：payload 是 SBStore 里那条记录的 recordID（UUID 字符串），
+    /// 不再是名字——平行安装的两条同名记录必须能区分开。
+    case installed(String)
     case phone
     case safari
     case messages
     case music
 }
 
-/// An app downloaded from the software source, saved under Documents/IPAs.
-struct InstalledApp: Codable, Hashable, Identifiable {
-    var id: String { name }
-    let name: String
-    let version: String
-    let fileName: String
-    let category: String
-}
-
-/// Shared navigation + installed-apps state. All on/off toggles live as
-/// @AppStorage in the views that use them (same key = same value everywhere);
-/// this object only holds things that must notify observers.
+/// Shared navigation state only. The installed-apps list used to live here
+/// (standard UserDefaults, key `vm.installedApps`, name/version/fileName/
+/// category only); since 0.2.0 step 8 the single source of truth is
+/// SBStore.shared.installedApps (App Group UserDefaults, SBInstalledApp
+/// records keyed by recordID UUID, ordered by desktopIconOrder).
+/// The old `vm.installedApps` data is still read once by SBMigration from
+/// standard UserDefaults directly — nothing here depends on it anymore.
 final class VMState: ObservableObject {
     @Published var openApp: VMApp?
     @Published var homePage: Int = 0
-    @Published var installed: [InstalledApp] = []
-
-    private let installedKey = "vm.installedApps"
-
-    init() {
-        if let data = UserDefaults.standard.data(forKey: installedKey),
-           let apps = try? JSONDecoder().decode([InstalledApp].self, from: data) {
-            installed = apps
-        }
-    }
-
-    func isInstalled(_ name: String) -> Bool {
-        installed.contains { $0.name == name }
-    }
-
-    func addInstalled(_ app: InstalledApp) {
-        guard !isInstalled(app.name) else { return }
-        installed.append(app)
-        if let data = try? JSONEncoder().encode(installed) {
-            UserDefaults.standard.set(data, forKey: installedKey)
-        }
-    }
-
-    /// Delete an installed app: remove the IPA file from Documents/IPAs
-    /// and drop the record. No-op if it is not installed.
-    func removeInstalled(_ name: String) {
-        if let app = installed.first(where: { $0.name == name }),
-           let dir = try? VMFiles.ipasDirectory() {
-            try? FileManager.default.removeItem(at: dir.appendingPathComponent(app.fileName))
-        }
-        installed.removeAll { $0.name == name }
-        if let data = try? JSONEncoder().encode(installed) {
-            UserDefaults.standard.set(data, forKey: installedKey)
-        }
-    }
 }

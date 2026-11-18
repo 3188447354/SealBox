@@ -179,7 +179,8 @@ public enum SBInstaller {
                 needsJIT: false,
                 lastLaunchResult: nil,
                 signingCertFingerprint: signingCertFingerprint,
-                diskDirectoryName: destinationDir.lastPathComponent
+                diskDirectoryName: destinationDir.lastPathComponent,
+                sourceIPAFileName: parsed.sourceIPAFileName
             )
             SBStore.shared.upsertApp(record)
 

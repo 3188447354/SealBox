@@ -17,6 +17,7 @@ enum SBError: LocalizedError {
     case certificateExpired
     case certificateInvalid(reason: String)
     case restartRequestFailed
+    case needsJIT
     case guestLoadFailed(reason: String)
     case selfTestFailed(stage: String, reason: String)
     case installInProgress
@@ -38,6 +39,7 @@ enum SBError: LocalizedError {
         case .certificateExpired: return "证书检查"
         case .certificateInvalid: return "证书检查"
         case .restartRequestFailed: return "重启请求"
+        case .needsJIT: return "加载客 App"
         case .guestLoadFailed: return "加载客 App"
         case .selfTestFailed(let stage, _): return stage
         case .installInProgress: return "安装"
@@ -75,6 +77,8 @@ enum SBError: LocalizedError {
             return "证书无效：\(reason)"
         case .restartRequestFailed:
             return "系统没有重启应用，请重试"
+        case .needsJIT:
+            return "该应用需要 JIT 才能运行"
         case .guestLoadFailed(let reason):
             return "客 App 加载失败：\(reason)"
         case .selfTestFailed(_, let reason):
@@ -91,6 +95,8 @@ enum SBError: LocalizedError {
         switch self {
         case .missingCertificate, .certificateDeleted, .certificateExpired:
             return "去导入证书"
+        case .needsJIT:
+            return "请用 Seal 开启 JIT 后重试，或换用 64 位版本"
         case .restartRequestFailed, .guestLoadFailed:
             return "重试"
         case .encryptedIPA:
