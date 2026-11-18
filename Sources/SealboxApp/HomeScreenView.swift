@@ -2,14 +2,15 @@ import SwiftUI
 
 // Home screen (0.1.4): two manually paged pages.
 // Page 1: the three built-in apps. Page 2: installed apps from the source.
-// Paging is a plain HStack with an offset — no TabView — so the swipe
-// gesture can be gated on the custom-gestures plugin switch.
+// Paging is a plain HStack with an offset — no TabView — and the swipe
+// is always on (0.2.1: it used to be gated on the custom-gestures plugin
+// switch, whose stored value was false on real phones, so swiping was
+// dead out of the box; the switch is gone, swiping is unconditional).
 struct HomeScreenView: View {
     @EnvironmentObject private var vm: VMState
     @EnvironmentObject private var coordinator: SBAppCoordinator
     @ObservedObject private var store = SBStore.shared
     @AppStorage("vm.plugin.iconThemeDark") private var iconThemeDark = false
-    @AppStorage("vm.plugin.customGestures") private var customGestures = false
     @AppStorage("vm.settings.wallpaper") private var selectedWallpaper = 0
     @State private var pendingDelete: SBInstalledApp? = nil
     @State private var showDeleteConfirm = false
@@ -66,11 +67,17 @@ struct HomeScreenView: View {
                     }
                     .offset(x: -CGFloat(vm.homePage) * geo.size.width)
                     .animation(.easeInOut(duration: 0.28), value: vm.homePage)
-                    .gesture(pageDragGesture)
+                    // simultaneousGesture, not .gesture: page 2 holds a
+                    // vertical ScrollView whose own drag would otherwise
+                    // outrank this parent gesture, so swiping back from
+                    // page 2 could not reach the pager. Delivered to both:
+                    // vertical drags scroll the list (onEnded ignores them,
+                    // |width| < 50), horizontal drags flip the page.
+                    .simultaneousGesture(pageDragGesture)
                 }
 
                 // Page dots: iOS standard position, just above the Dock.
-                // Always tappable, even when the swipe gesture is switched off.
+                // Always tappable, same as swiping.
                 HStack(spacing: 8) {
                     ForEach(0..<2, id: \.self) { page in
                         Button {
@@ -256,12 +263,11 @@ struct HomeScreenView: View {
 
     // MARK: - Paging gesture
 
-    /// Always attached; the onEnded handler checks the switch first,
-    /// so turning the plugin off leaves the gesture inert.
+    /// Always attached and always live (0.2.1): no plugin switch gates it,
+    /// so it works on phones that already stored the old switch as false.
     private var pageDragGesture: some Gesture {
         DragGesture(minimumDistance: 20)
             .onEnded { value in
-                guard customGestures else { return }
                 if value.translation.width < -50 {
                     vm.homePage = min(1, vm.homePage + 1)
                 } else if value.translation.width > 50 {

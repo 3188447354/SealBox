@@ -1,12 +1,13 @@
 import SwiftUI
 
-// Plugins (0.1.4): three toggles, each backed by a fixed @AppStorage key
+// Plugins (0.1.4): two toggles, each backed by a fixed @AppStorage key
 // so the same value is read by the home screen and the root view.
 // The list and the detail pages share the same bindings.
+// (0.2.1: the custom-gestures toggle is gone — page swiping is now
+// unconditional, so a switch for it would be a dead control.)
 struct PluginsView: View {
     @AppStorage("vm.plugin.iconThemeDark") private var iconThemeDark = false
     @AppStorage("vm.plugin.statusBarFancy") private var statusBarFancy = false
-    @AppStorage("vm.plugin.customGestures") private var customGestures = false
     @State private var searchText = ""
 
     private var filteredPlugins: [PluginKind] {
@@ -20,7 +21,6 @@ struct PluginsView: View {
         switch plugin {
         case .iconTheme: return $iconThemeDark
         case .statusBar: return $statusBarFancy
-        case .customGestures: return $customGestures
         }
     }
 
@@ -49,7 +49,6 @@ struct PluginsView: View {
 private enum PluginKind: String, CaseIterable, Identifiable {
     case iconTheme
     case statusBar
-    case customGestures
 
     var id: String { rawValue }
 
@@ -57,7 +56,6 @@ private enum PluginKind: String, CaseIterable, Identifiable {
         switch self {
         case .iconTheme: return "图标主题"
         case .statusBar: return "状态栏美化"
-        case .customGestures: return "自定义手势"
         }
     }
 
@@ -65,7 +63,6 @@ private enum PluginKind: String, CaseIterable, Identifiable {
         switch self {
         case .iconTheme: return "主屏幕图标换成更深的配色"
         case .statusBar: return "应用内改画状态栏，显示秒数"
-        case .customGestures: return "主屏幕支持左右滑动切页"
         }
     }
 
@@ -73,7 +70,6 @@ private enum PluginKind: String, CaseIterable, Identifiable {
         switch self {
         case .iconTheme: return "paintpalette.fill"
         case .statusBar: return "clock.fill"
-        case .customGestures: return "hand.draw.fill"
         }
     }
 
@@ -81,7 +77,6 @@ private enum PluginKind: String, CaseIterable, Identifiable {
         switch self {
         case .iconTheme: return .purple
         case .statusBar: return .blue
-        case .customGestures: return .green
         }
     }
 }

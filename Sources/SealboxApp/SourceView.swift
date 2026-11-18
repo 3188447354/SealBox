@@ -85,7 +85,14 @@ final class DownloadManager: NSObject, URLSessionDownloadDelegate, ObservableObj
         didFinishDownloadingTo location: URL
     ) {
         guard let name = downloadTask.taskDescription,
-              let app = SourceCatalog.all.first(where: { $0.name == name }) else { return }
+              let app = SourceCatalog.all.first(where: { $0.name == name }) else {
+            // 0.2.1：之前这里静默 return，下载完了却什么都没发生。
+            Task { @MainActor [weak self] in
+                self?.coordinator?.activeAlert = SBAppCoordinator.CoordinatorAlert(
+                    title: "下载失败", message: "下载完成但找不到对应的应用，请重试")
+            }
+            return
+        }
         do {
             let destination = try Self.ipasDirectory()
                 .appendingPathComponent(app.url.lastPathComponent)
@@ -103,18 +110,25 @@ final class DownloadManager: NSObject, URLSessionDownloadDelegate, ObservableObj
                 await self.coordinator?.installIPA(at: destination, displayNameHint: name)
             }
         } catch {
+            // 0.2.1：之前这里只清进度不弹错，下载完了文件没落位，
+            // 按钮悄悄变回“获取”，用户根本不知道下载失败了。
             Task { @MainActor [weak self] in
                 self?.downloading.remove(name)
                 self?.progress.removeValue(forKey: name)
+                self?.coordinator?.activeAlert = SBAppCoordinator.CoordinatorAlert(
+                    title: "下载失败", message: "下载完成，保存文件失败，请重试")
             }
         }
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        guard error != nil, let name = task.taskDescription else { return }
+        guard let error = error, let name = task.taskDescription else { return }
+        // 0.2.1：之前网络失败也只清进度不弹错，按钮悄悄变回“获取”。
         Task { @MainActor [weak self] in
             self?.downloading.remove(name)
             self?.progress.removeValue(forKey: name)
+            self?.coordinator?.activeAlert = SBAppCoordinator.CoordinatorAlert(
+                title: "下载失败", message: error.localizedDescription)
         }
     }
 

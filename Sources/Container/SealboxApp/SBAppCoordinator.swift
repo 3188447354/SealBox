@@ -11,6 +11,9 @@ final class SBAppCoordinator: ObservableObject {
         let message: String
         /// 证书门拦截时为 true：弹窗给“去导入证书”按钮，点后跳设置页证书区。
         var goToSettings = false
+        /// 安装成功时为 true：弹窗给“去看看”按钮，点后回桌面第 2 页
+        /// （已装应用那页）；“留在软件源”只关弹窗。
+        var goToDesktop = false
     }
 
     struct DuplicatePending: Identifiable {
@@ -201,6 +204,13 @@ final class SBAppCoordinator: ObservableObject {
                 installingDisplayName = nil
                 isInstalling = false
                 onInstalled?()
+                // 安装成功必须有明确信号（0.2.1）：之前只在软件源那行把
+                // 按钮翻成“已安装”，用户离开页面就看不到，装好的应用又
+                // 在桌面第 2 页——不弹这一下，用户根本不知道装完了。
+                activeAlert = CoordinatorAlert(
+                    title: "已安装到桌面",
+                    message: "“\(record.displayName)”已安装到桌面。",
+                    goToDesktop: true)
             }
         } catch {
             poll.cancel()

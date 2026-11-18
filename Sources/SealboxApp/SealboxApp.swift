@@ -81,6 +81,17 @@ struct VMRootView: View {
                     secondaryButton: .cancel(Text("取消"))
                 )
             }
+            if alert.goToDesktop {
+                return Alert(
+                    title: Text(alert.title),
+                    message: Text(alert.message),
+                    primaryButton: .default(Text("去看看")) {
+                        vm.homePage = 1
+                        vm.openApp = nil
+                    },
+                    secondaryButton: .cancel(Text("留在软件源"))
+                )
+            }
             return Alert(
                 title: Text(alert.title),
                 message: Text(alert.message),
