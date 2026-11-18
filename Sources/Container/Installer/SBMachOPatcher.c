@@ -372,7 +372,10 @@ static int32_t sb_patch_thin_slice(uint8_t *base, size_t size, const char *hooks
             if (has_dylinker) {
                 dylinker_off += id_needed;
             }
-        } else if (has_dylinker && dylinker_size >= id_needed) {
+        } else if (has_dylinker && dylinker_size > (uint32_t)sizeof(struct dylib_command)) {
+            // 复用 LC_LOAD_DYLINKER 的槽位：名字截断放下（与 LiveContainer 一致，
+            // 它不要求槽位放得下完整名字——nameSize = 槽位 - 结构体，截断后末字节补 NUL；
+            // 只要求槽位比结构体大，至少留 1 字节给名字）。
             uint8_t *slot = base + dylinker_off;
             memset(slot, 0, dylinker_size);
             struct dylib_command *dc = (struct dylib_command *)slot;
