@@ -519,6 +519,9 @@ public enum SBInstaller {
                 SBDiagLog.log("Team 不一致：\(bundleID) \(executablePath) 客 Team=\(guestTeam) 宿主 Team=\(hostTeam)（dyld 要求一致，须用同一证书重签宿主）")
                 throw SBError.teamMismatch(guestTeam: guestTeam, hostTeam: hostTeam)
             }
+            // 0.2.11：通过时也记一行（客 Team 与宿主 Team 的值）——只记
+            // “验签通过”分不清门是放行还是根本没比 Team。
+            SBDiagLog.log("Team 一致：\(bundleID) 客 Team=\(guestTeam) 宿主 Team=\(hostTeam)")
         } else {
             SBDiagLog.log("Team 预检：\(bundleID) \(executablePath) 客 Team=\(guestTeam) 宿主无 Team（CI 自签，dyld 不会放行，须用同一证书重签宿主）")
             throw SBError.teamMismatch(guestTeam: guestTeam, hostTeam: nil)
@@ -531,17 +534,32 @@ public enum SBInstaller {
     /// invalid）。
     /// - 先验签：结构/CMS 坏 → 走 repatchInstalledApp 修一次（重打补丁+
     ///   重签+验签）；修不好抛错，不启动。
-    /// - Team 不一致 → 也走 repatchInstalledApp 修一次：repatch 前会先
-    ///   比当前证书 Team 与宿主 Team——重签能把客 Team 换成当前证书的
-    ///   Team，换完能与宿主匹配才动手；换完也匹配不上直接抛 teamMismatch，
-    ///   不白做工。
-    /// - LC_ID_DYLIB 缺失 → 走 repatchInstalledApp（补 ID）。
+    /// - Team 不一致 → 直接抛 teamMismatch，不走 repatch（0.2.11：重签
+    ///   换不了宿主的 Team，走 repatch 只是白做工；且无证书时 repatch 的
+    ///   signFailed 会盖掉真正的 teamMismatch）。
+    /// - LC_ID_DYLIB 缺失 → 走 repatchInstalledApp（补 ID）；无证书时
+    ///   修不了，直接抛缺 ID 的原因。
     /// - 全过 → 原样返回，不动记录。
-    /// 调用方须保证已导入证书（点图标时 coordinator 已做 hasCertificate
-    /// 门控）。
+    /// 0.2.11：调用方不再保证已导入证书——门无证书也能验（结构 + Team），
+    /// 只拦不修；无证书时验签失败直接抛原错，不调 repatch。
+    /// 点图标时修复门能否动手重打补丁：p12 文件在且钥匙串密码非空
+    ///（与 SBCertificate.hasCertificate 同条件；门本身不依赖证书也能验）。
+    private static var canRepair: Bool {
+        guard let data = certificateData(), !data.isEmpty,
+              let password = certificatePassword(), !password.isEmpty else {
+            return false
+        }
+        return true
+    }
+
     static func ensureLaunchableSignature(_ record: SBInstalledApp) async throws -> SBInstalledApp {
         let executablePath = record.executableURL.path
         if SBMachOHasIDDylib(executablePath) == 0 {
+            // 0.2.11：无证书修不了，直接报缺 ID 的原因——不调 repatch，
+            // 不然 repatch 的“没有导入证书”会盖掉真正的原因。
+            guard canRepair else {
+                throw SBError.patchFailed(reason: "缺少 LC_ID_DYLIB，且未导入证书，无法重打补丁修复")
+            }
             NSLog("[SBInstaller] ensureLaunchableSignature: %@ 缺 LC_ID_DYLIB，走重打补丁", record.bundleID)
             SBDiagLog.log("签名修复门：\(record.bundleID) \(executablePath) 缺 LC_ID_DYLIB，走重打补丁")
             return try await repatchInstalledApp(record)
@@ -550,6 +568,11 @@ public enum SBInstaller {
             try verifyExecutableSignature(executablePath, bundleID: record.bundleID, checkTeam: true)
             return record
         } catch {
+            // 0.2.11：Team 不一致重签修不好，直接抛，不白走 repatch；无证书
+            // 时也直接抛原错，不让 repatch 的 signFailed（“没有导入证书”）
+            // 盖掉真正的验签失败。
+            if case SBError.teamMismatch = error { throw error }
+            guard canRepair else { throw error }
             NSLog("[SBInstaller] ensureLaunchableSignature: %@ 验签失败（%@），走重打补丁修复",
                   record.bundleID, error.localizedDescription)
             SBDiagLog.log("签名修复门：\(record.bundleID) \(executablePath) 验签失败（[code=\(Self.errorCode(of: error))] \(error.localizedDescription)），走重打补丁修复")

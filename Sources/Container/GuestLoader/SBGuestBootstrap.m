@@ -40,6 +40,10 @@ static IMP g_originalArgumentsIMP = NULL;
 static NSString *g_originalProcessName = nil;
 static char *g_originalProgname = NULL;
 static char *g_guestProgname = NULL;
+// 0.2.11：客加载前存的宿主 HOME/CFFIXED_USER_HOME（setenv 改写前存，
+// 失败 / 客 main 返回时还原——见 SBRestoreGuestEnvironment）。
+static char *g_originalHome = NULL;
+static char *g_originalFixedHome = NULL;
 
 static NSArray *SBGuestProcessInfoArguments(id self, SEL _cmd) {
     (void)self;
@@ -133,6 +137,30 @@ static void SBClearGuestEnvironment(void) {
     unsetenv("SB_GUEST_EXEC_PATH");
     unsetenv("SB_GUEST_KEYCHAIN_GROUP");
     unsetenv("SB_HOST_BUNDLE_ID");
+}
+
+// 0.2.11：客加载失败 / 客 main 返回时把进程环境还回去——不止 SB_* 变量，
+// 关键是 HOME/CFFIXED_USER_HOME（loadGuest 第 2 步 setenv 改写过）。0.2.10
+// 真机实证：只清 SB_*、不还 HOME，失败返回后 Swift 的 documentsURL 解析
+// 落进客容器，日志路径多叠了一段旧容器路径（取值层错，不只是打印层错）。
+// 有存值则 setenv 回去并 free；进程本来就没 HOME（理论上到不了）则 unsetenv。
+static void SBRestoreGuestEnvironment(void) {
+    if (g_originalHome != NULL) {
+        setenv("HOME", g_originalHome, 1);
+        free(g_originalHome);
+        g_originalHome = NULL;
+    } else {
+        unsetenv("HOME");
+    }
+    if (g_originalFixedHome != NULL) {
+        setenv("CFFIXED_USER_HOME", g_originalFixedHome, 1);
+        free(g_originalFixedHome);
+        g_originalFixedHome = NULL;
+    } else {
+        unsetenv("CFFIXED_USER_HOME");
+    }
+    SBClearGuestEnvironment();
+    SBDiagLogLine("客加载：进程环境已还原（HOME 指回宿主）");
 }
 
 @implementation SBGuestBootstrap
@@ -280,6 +308,19 @@ static void SBDiagLogGuestFail(SBGuestLoaderErrorCode code, NSString *bundleID, 
 
     // HOME 与 CFFIXED_USER_HOME 指向客数据容器；之后 Foundation 的
     // Documents/Caches 等路径解析都会落进客容器。
+    // 0.2.11：先存宿主的原值（有 guard 防覆盖——若 HOME 已是客容器值，
+    // 再存就把污染值当原值了），失败 / 客 main 返回时由
+    // SBRestoreGuestEnvironment 还原。0.2.10 真机实证：HOME 改了没还，
+    // 失败返回后 Swift 的 documentsURL 解析落进客容器，日志路径多叠了
+    // 一段旧容器路径。
+    if (g_originalHome == NULL) {
+        const char *home = getenv("HOME");
+        g_originalHome = home ? strdup(home) : NULL;
+    }
+    if (g_originalFixedHome == NULL) {
+        const char *fixed = getenv("CFFIXED_USER_HOME");
+        g_originalFixedHome = fixed ? strdup(fixed) : NULL;
+    }
     setenv("HOME", [containerPath UTF8String], 1);
     setenv("CFFIXED_USER_HOME", [containerPath UTF8String], 1);
 
@@ -389,7 +430,7 @@ static void SBDiagLogGuestFail(SBGuestLoaderErrorCode code, NSString *bundleID, 
         restoreMainNSBundle();
         restoreExecutablePath();
         SBRestoreProcessIdentity();
-        SBClearGuestEnvironment();
+        SBRestoreGuestEnvironment();
         if (error) {
             *error = dlopenError;
         }
@@ -403,7 +444,7 @@ static void SBDiagLogGuestFail(SBGuestLoaderErrorCode code, NSString *bundleID, 
         restoreMainNSBundle();
         restoreExecutablePath();
         SBRestoreProcessIdentity();
-        SBClearGuestEnvironment();
+        SBRestoreGuestEnvironment();
         return [self failWithError:error
                               code:SBGuestLoaderErrorGuestLoadFailed
                            message:[NSString stringWithFormat:@"客 App 加载失败：%@", bundleLoadError.localizedDescription]
@@ -421,7 +462,7 @@ static void SBDiagLogGuestFail(SBGuestLoaderErrorCode code, NSString *bundleID, 
         restoreMainNSBundle();
         restoreExecutablePath();
         SBRestoreProcessIdentity();
-        SBClearGuestEnvironment();
+        SBRestoreGuestEnvironment();
         if (error) {
             *error = entryError;
         }
@@ -436,7 +477,7 @@ static void SBDiagLogGuestFail(SBGuestLoaderErrorCode code, NSString *bundleID, 
         restoreMainNSBundle();
         restoreExecutablePath();
         SBRestoreProcessIdentity();
-        SBClearGuestEnvironment();
+        SBRestoreGuestEnvironment();
         if (error) {
             *error = entryError;
         }
@@ -459,7 +500,7 @@ static void SBDiagLogGuestFail(SBGuestLoaderErrorCode code, NSString *bundleID, 
     restoreMainNSBundle();
     restoreExecutablePath();
     SBRestoreProcessIdentity();
-    SBClearGuestEnvironment();
+    SBRestoreGuestEnvironment();
     [SBGuestLoader clearLaunchRequest];
     SBDiagLogLine([[NSString stringWithFormat:@"客 App 已退出（返回码 %d），回到桌面", guestResult] UTF8String]);
     NSLog(@"[Sealbox] 客 App 已退出（返回码 %d），回到桌面", guestResult);

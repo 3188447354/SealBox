@@ -93,12 +93,53 @@ enum SBLaunchRouter {
         }
     }
 
+    /// 0.2.11：新进程加载前第二道 Team 门——收据可能由旧版本点图标写下
+    ///（那时门还没修好、或根本没跑），只拦“点图标时”不够。新进程在 dlopen
+    /// 之前再比一次：Team 不一致就不加载，直接把收据写成 guest-failed、
+    /// 弹 teamMismatch 明文，不再报原始 dlopen 长文。
+    /// 只比 Team，不验结构：未签名（无 Team）的二进制直接放行（走 JIT）；
+    /// 结构坏的仍由加载器按 dlopen 报错。收据不在待处理阶段、找不到记录、
+    /// 可执行文件不在时不拦（交给已有的清收据/加载流程处理）。
+    /// - Returns: true 表示已拦截（调用方直接 return，不再加载）。
+    private static func blockReceiptOnTeamMismatch() -> Bool {
+        guard let receipt = SBStore.shared.launchReceipt,
+              receipt.stage == "restart-requested"
+                || receipt.stage == "restart-confirmed" else { return false }
+        let record = SBStore.shared.installedApps.first {
+            $0.bundleID == receipt.guestBundleID
+            && $0.diskDirectoryName == receipt.diskDirectoryName
+        } ?? SBStore.shared.app(with: receipt.guestBundleID)
+        guard let record = record else { return false }
+        let executablePath = record.executableURL.path
+        guard FileManager.default.fileExists(atPath: executablePath) else { return false }
+        do {
+            try SBInstaller.checkTeamMatch(executablePath, bundleID: record.bundleID)
+            return false
+        } catch {
+            // checkTeamMatch 只抛 teamMismatch（客无 Team 时不抛）；其他错误
+            // 理论上到不了这里，保险起见只拦 teamMismatch，其余交给加载器。
+            guard case SBError.teamMismatch = error else { return false }
+            let message = error.localizedDescription
+            SBDiagLog.log("启动路由：\(receipt.guestBundleID) \(executablePath) Team 门拦截（[code=\(SBInstaller.errorCode(of: error))] \(message)），不加载")
+            var failed = receipt
+            failed.stage = "guest-failed"
+            failed.stageDetail = message
+            SBStore.shared.launchReceipt = failed
+            SBStore.shared.recordLaunchResult(
+                bundleID: receipt.guestBundleID, success: false, message: message)
+            SBStore.shared.clearGuestSelection()
+            return true
+        }
+    }
+
     /// App 启动时调用一次。若本次是“重起进客 App”，尝试加载客 App；
     /// 加载失败时清掉选中标记、留收据，回桌面弹错（由桌面在 appear 时按收据弹）。
     static func routeOnLaunchIfNeeded() {
         ensureGuestHooksDylib()
         reconcileInstalledAppsWithDisk()
         clearStaleReceiptIfPackageMissing()
+        // 0.2.11：新进程加载前第二道 Team 门（见 blockReceiptOnTeamMismatch）。
+        if blockReceiptOnTeamMismatch() { return }
         guard SBGuestLoader.isGuestLaunchRequested() else {
             // 客已退出或闪退过：收据残留 guest-loaded 时静默清除，不弹错、不记失败，
             // 避免下次启动误判（设计 §5.5 的 guest-loaded 过期清理）。

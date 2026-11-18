@@ -277,71 +277,88 @@ final class SBAppCoordinator: ObservableObject {
         }
         guard !isLaunching else { return }
         isLaunching = true
-        if SBCertificate.hasCertificate {
-            Task {
+        // 0.2.11：签名门无条件跑。0.2.10 真机实证（KMusic）：门只在有证书
+        // 且记录 signed==true 时才跑，点图标后照常写收据、重启，新进程
+        // 直接走到 dlopen 报 code signature invalid——门没跑等于没门。
+        // Team 比对只看二进制本身（记录的 signed 旗标可能是旧的）；无证书
+        // 时门只拦不修（ensureLaunchableSignature 内无证书不调 repatch）。
+        // 注入件重签仍需证书：无证书时跳过它，直接发重启请求，由 ObjC 侧
+        // 证书门弹“未导入证书”。
+        Task {
+            var appToLaunch = app
+            do {
                 // 0.2.6：旧版本装的包先重打补丁 + 重签（patchRevision < 2 的
                 // 包主可执行文件缺 LC_ID_DYLIB，dlopen 必败——0.2.5 真机实证）。
-                // 重打失败直接弹错，不发重启请求。
-                var appToLaunch = app
-                do {
-                    if app.patchRevision < SBConstants.patchRevision {
-                        appToLaunch = try await SBInstaller.repatchInstalledApp(app)
-                    }
-                    // 0.2.8：启动前签名修复门。patchRevision 已是当前值也不等于
-                    // 签名是好的——Via 就是 0.2.5 安装时签了名、记录写 signed=true，
-                    // 点图标才由 dlopen 报 code signature invalid。先验签：结构
-                    // /CMS 坏或缺 LC_ID_DYLIB 就重打补丁+重签修一次；Team 不一致
-                    // 时 repatch 会先比当前证书 Team 与宿主 Team，修不好直接抛
-                    // teamMismatch，不白做工。
-                    // 只对 signed==true 的应用走这道门：未签名应用走 JIT 启动，
-                    // 别因为重签失败堵了 JIT 的路。
-                    if appToLaunch.signed {
-                        appToLaunch = try await SBInstaller.ensureLaunchableSignature(appToLaunch)
-                    }
-                } catch {
-                    // 0.2.10 报错日志：修复门（重打补丁/验签）失败之前只弹
-                    // 弹窗，诊断日志里没有这一行——看日志不知道修了什么、
-                    // 为什么修不好。
-                    SBDiagLog.log("启动失败：\(app.bundleID) \(app.executableURL.path) 签名修复门失败（[code=\(SBInstaller.errorCode(of: error))] \(error.localizedDescription)）")
-                    await MainActor.run {
-                        self.isLaunching = false
-                        self.activeAlert = CoordinatorAlert(
-                            title: "启动失败",
-                            message: self.launchRepairErrorMessage(error))
-                    }
-                    return
+                // 重打失败直接弹错，不发重启请求；无证书时不重打（修不了），
+                // 直接进签名门（门能拦 Team/结构，不依赖证书）。
+                if SBCertificate.hasCertificate,
+                   app.patchRevision < SBConstants.patchRevision {
+                    appToLaunch = try await SBInstaller.repatchInstalledApp(app)
                 }
-                // 0.2.8：Swift 6 下 @Sendable 闭包不能捕获 var——先把最终值
-                // 定格成 let 再进 MainActor.run（0.2.8 第一轮 CI 红于此，
-                // SBAppCoordinator.swift:309）。
-                let launchTarget = appToLaunch
-                let ok = await SBCertificate.ensureHooksDylibSigned()
+                // 0.2.8：启动前签名修复门。patchRevision 已是当前值也不等于
+                // 签名是好的——Via 就是 0.2.5 安装时签了名、记录写 signed=true，
+                // 点图标才由 dlopen 报 code signature invalid。先验签：结构
+                // /CMS 坏或缺 LC_ID_DYLIB 就重打补丁+重签修一次；Team 不一致
+                // 直接抛 teamMismatch，不白做工。
+                // signed==false 的记录也比 Team：二进制可能带着签名（安装时
+                // 签名失败却照装、或记录过期），只验结构会堵 JIT 的路，所以
+                // 未签名记录只比 Team（无 Team 的二进制直接放行，走 JIT）。
+                if appToLaunch.signed {
+                    appToLaunch = try await SBInstaller.ensureLaunchableSignature(appToLaunch)
+                } else {
+                    try SBInstaller.checkTeamMatch(
+                        appToLaunch.executableURL.path, bundleID: appToLaunch.bundleID)
+                }
+            } catch {
+                // 0.2.10 报错日志：修复门（重打补丁/验签）失败之前只弹
+                // 弹窗，诊断日志里没有这一行——看日志不知道修了什么、
+                // 为什么修不好。
+                SBDiagLog.log("启动失败：\(app.bundleID) \(app.executableURL.path) 签名修复门失败（[code=\(SBInstaller.errorCode(of: error))] \(error.localizedDescription)）")
                 await MainActor.run {
-                    if ok {
-                        self.requestRestart(app: launchTarget)
-                    } else {
-                        // 0.2.10 报错日志：注入件签名失败之前只弹弹窗；失败
-                        // 的具体原因（无证书/件不在/重签失败）由
-                        // performEnsureHooksDylibSigned 记行，这里记弹窗决定。
-                        SBDiagLog.log("启动失败：\(launchTarget.bundleID) 注入组件签名失败，弹启动失败（无法用当前证书签名 SBGuestHooks.dylib）")
-                        self.isLaunching = false
-                        self.activeAlert = CoordinatorAlert(
-                            title: "启动失败",
-                            message: "注入组件签名失败：无法用当前证书签名 SBGuestHooks.dylib，请重新导入证书后重试")
-                    }
+                    self.isLaunching = false
+                    self.activeAlert = CoordinatorAlert(
+                        title: "启动失败",
+                        message: self.launchRepairErrorMessage(error))
+                }
+                return
+            }
+            // 无证书：跳过注入件重签，直接发重启请求（ObjC 侧证书门会弹
+            // “未导入证书”并给去导入证书按钮）。
+            guard SBCertificate.hasCertificate else {
+                await MainActor.run { self.requestRestart(app: appToLaunch) }
+                return
+            }
+            // 0.2.8：Swift 6 下 @Sendable 闭包不能捕获 var——先把最终值
+            // 定格成 let 再进 MainActor.run（0.2.8 第一轮 CI 红于此，
+            // SBAppCoordinator.swift:309）。
+            let launchTarget = appToLaunch
+            let ok = await SBCertificate.ensureHooksDylibSigned()
+            await MainActor.run {
+                if ok {
+                    self.requestRestart(app: launchTarget)
+                } else {
+                    // 0.2.10 报错日志：注入件签名失败之前只弹弹窗；失败
+                    // 的具体原因（无证书/件不在/重签失败）由
+                    // performEnsureHooksDylibSigned 记行，这里记弹窗决定。
+                    SBDiagLog.log("启动失败：\(launchTarget.bundleID) 注入组件签名失败，弹启动失败（无法用当前证书签名 SBGuestHooks.dylib）")
+                    self.isLaunching = false
+                    self.activeAlert = CoordinatorAlert(
+                        title: "启动失败",
+                        message: "注入组件签名失败：无法用当前证书签名 SBGuestHooks.dylib，请重新导入证书后重试")
                 }
             }
-            return
         }
-        requestRestart(app: app)
     }
 
     /// 0.2.8：启动前签名修复失败的文案。Team 不一致是部署问题（宿主须与
     /// 客应用用同一证书签名），重签客应用修不好——不要给“删除后重新导入”
     /// 这种误导建议；其余失败（结构/CMS 坏、重打补丁失败）给重装建议。
     private func launchRepairErrorMessage(_ error: Error) -> String {
-        if case SBError.teamMismatch = error {
-            return error.localizedDescription
+        if let sbError = error as? SBError, case .teamMismatch = sbError {
+            // 0.2.11：teamMismatch 弹窗给部署指导——只说“不一致”用户
+            // 不知道怎么办，补上恢复建议（宿主须用同一证书签名）。
+            return (sbError.errorDescription ?? "Team 不一致")
+                + "。" + (sbError.recoverySuggestion ?? "")
         }
         return "旧版本应用升级失败：\(error.localizedDescription)，请删除后重新导入"
     }
