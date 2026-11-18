@@ -302,7 +302,11 @@ public enum SBInstaller {
         // 重打一整套也修不好，先报出来，不白做工、不碰文件。
         // 当前证书读不到 Team 时不拦（无法判断时让后面的验签决定）。
         if let certTeamID = SBSigner.teamID(withCertData: certData, password: password) {
-            let hostTeam = Bundle.main.executableURL?.path.flatMap {
+            // 注意：不能写 Bundle.main.executableURL?.path.flatMap{...}——
+            // 可选链只解第一层，后面的 .flatMap 会落在非可选 String 上
+            // （按字符迭代），$0 就成了 Character。先绑到 String? 再 flatMap。
+            let hostExecutablePath = Bundle.main.executableURL?.path
+            let hostTeam = hostExecutablePath.flatMap {
                 SBCodesignCheck.teamIdentifier(atPath: $0)
             }
             if let hostTeam = hostTeam {
