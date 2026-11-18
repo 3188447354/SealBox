@@ -279,18 +279,29 @@ final class SBAppCoordinator: ObservableObject {
                 // 包主可执行文件缺 LC_ID_DYLIB，dlopen 必败——0.2.5 真机实证）。
                 // 重打失败直接弹错，不发重启请求。
                 var appToLaunch = app
-                if app.patchRevision < SBConstants.patchRevision {
-                    do {
+                do {
+                    if app.patchRevision < SBConstants.patchRevision {
                         appToLaunch = try await SBInstaller.repatchInstalledApp(app)
-                    } catch {
-                        await MainActor.run {
-                            self.isLaunching = false
-                            self.activeAlert = CoordinatorAlert(
-                                title: "启动失败",
-                                message: "旧版本应用升级失败：\(error.localizedDescription)，请删除后重新导入")
-                        }
-                        return
                     }
+                    // 0.2.8：启动前签名修复门。patchRevision 已是当前值也不等于
+                    // 签名是好的——Via 就是 0.2.5 安装时签了名、记录写 signed=true，
+                    // 点图标才由 dlopen 报 code signature invalid。先验签：结构
+                    // /CMS 坏或缺 LC_ID_DYLIB 就重打补丁+重签修一次；Team 不一致
+                    // 时 repatch 会先比当前证书 Team 与宿主 Team，修不好直接抛
+                    // teamMismatch，不白做工。
+                    // 只对 signed==true 的应用走这道门：未签名应用走 JIT 启动，
+                    // 别因为重签失败堵了 JIT 的路。
+                    if appToLaunch.signed {
+                        appToLaunch = try await SBInstaller.ensureLaunchableSignature(appToLaunch)
+                    }
+                } catch {
+                    await MainActor.run {
+                        self.isLaunching = false
+                        self.activeAlert = CoordinatorAlert(
+                            title: "启动失败",
+                            message: self.launchRepairErrorMessage(error))
+                    }
+                    return
                 }
                 let ok = await SBCertificate.ensureHooksDylibSigned()
                 await MainActor.run {
@@ -307,6 +318,16 @@ final class SBAppCoordinator: ObservableObject {
             return
         }
         requestRestart(app: app)
+    }
+
+    /// 0.2.8：启动前签名修复失败的文案。Team 不一致是部署问题（宿主须与
+    /// 客应用用同一证书签名），重签客应用修不好——不要给“删除后重新导入”
+    /// 这种误导建议；其余失败（结构/CMS 坏、重打补丁失败）给重装建议。
+    private func launchRepairErrorMessage(_ error: Error) -> String {
+        if case SBError.teamMismatch = error {
+            return error.localizedDescription
+        }
+        return "旧版本应用升级失败：\(error.localizedDescription)，请删除后重新导入"
     }
 
     /// 发重启请求（launchApp 的后半段，签名门通过后才进）。

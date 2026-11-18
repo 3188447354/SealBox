@@ -176,6 +176,18 @@ public enum SBInstaller {
                     signed = false
                 }
             }
+            // 0.2.8：安装时验签——签完立刻在本地验一遍主可执行文件，确认
+            // 签名真能被系统接受再入库。0.2.7 的验签只接了重打补丁路径，
+            // 安装路径没有；Via 就是 0.2.5 安装时签了名、记录写 signed=true，
+            // 点图标才由 dlopen 报 code signature invalid。
+            // 只验结构（页哈希 + CMS 块存在），不验 Team：Team 是宿主与
+            // 客应用的配对属性，是部署问题不是签名缺陷；在安装时按 Team
+            // 拦会把所有应用都挡在门外（当前宿主是 CI 自签、无 Team），
+            // Team 的诊断放在启动时（ensureLaunchableSignature）。
+            // 验签失败直接抛错，安装失败清理，不留签坏的包。
+            if signed {
+                try verifyExecutableSignature(executablePath, checkTeam: false)
+            }
             patchProgress.completedUnitCount = patchProgress.totalUnitCount
 
             // ---- 图标：解析出的图标原样写为 SBIcon.png，没有则不写（用默认图标） ----
@@ -285,6 +297,22 @@ public enum SBInstaller {
               !password.isEmpty else {
             throw SBError.signFailed(reason: "没有导入证书，无法重签")
         }
+        // 0.2.8：重打补丁前先比 Team——重签只能把客 Team 换成当前证书的
+        // Team，换不了宿主的 Team。当前证书 Team 与宿主 Team 不一致时，
+        // 重打一整套也修不好，先报出来，不白做工、不碰文件。
+        // 当前证书读不到 Team 时不拦（无法判断时让后面的验签决定）。
+        if let certTeamID = SBSigner.teamID(withCertData: certData, password: password) {
+            let hostTeam = Bundle.main.executableURL?.path.flatMap {
+                SBCodesignCheck.teamIdentifier(atPath: $0)
+            }
+            if let hostTeam = hostTeam {
+                if certTeamID != hostTeam {
+                    throw SBError.teamMismatch(guestTeam: certTeamID, hostTeam: hostTeam)
+                }
+            } else {
+                throw SBError.teamMismatch(guestTeam: certTeamID, hostTeam: nil)
+            }
+        }
         // 先备份主可执行文件：打补丁会使原签名失效，之后任一步失败都把
         // 备份还原，应用回到重打补丁前的状态（而不是留一个签坏的包）。
         let backupURL = fileManager.temporaryDirectory
@@ -349,7 +377,9 @@ public enum SBInstaller {
             // 被系统接受再记 patchRevision——不要等到 dlopen 那步才由 dyld 报
             // 一个无法定位的 code signature invalid。任一失败都抛错，外层
             // catch 会把主可执行文件还原回备份（重打补丁前的状态）。
-            try verifyResignedExecutable(executablePath)
+            // 0.2.8：含 Team 一致性，宿主无 Team 时也判失败（见
+            // verifyExecutableSignature 注释）。
+            try verifyExecutableSignature(executablePath, checkTeam: true)
         } catch {
             // 任一步失败：主可执行文件还原，记录不动。
             if fileManager.fileExists(atPath: executablePath) {
@@ -385,35 +415,80 @@ public enum SBInstaller {
         return updated
     }
 
-    /// 0.2.7 签后验签：重签完立刻校验主可执行文件，两项都过才算签好了。
+    /// 0.2.8 签名验签核心（安装、重打补丁、启动前三条线共用）。
     /// ① 结构校验（SBCodesignCheck）：superblob/CodeDirectory 可解析、每页
     /// 内容哈希与 CodeDirectory 一致、CMS 签名块存在。任一不过，dyld 在
-    /// dlopen 时一定报 code signature invalid——在这里拦住比在启动时报
-    /// 一个无法定位的错强得多。
-    /// ② Team 一致：客主程序的 Team 必须与宿主进程的 Team 一致（dyld 的
-    /// Team 校验）；两边都有 Team 且不同时，系统一定拒绝加载。宿主没有
-    /// Team（CI 自签原样安装）时跳过这一项——没有 Team 的宿主不触发 dyld
-    /// 的 Team 校验，判不一致是误报。
+    /// dlopen 时一定报 code signature invalid——签名在结构上就是坏的。
+    /// ② Team 一致（checkTeam 为 true 时）：客主程序的 Team 必须与宿主进程
+    /// 的 Team 一致，否则 dyld 的 Library Validation（F_CHECK_LV）拒绝
+    /// 加载。0.2.7 的“宿主无 Team 就跳过”是错的，已纠正：0.2.1 自测已
+    /// 证实，宿主 CI 自签无 Team、测试件用导入证书签（Team Wan、CMS 在位）
+    /// 仍被 dlopen 以 code signature invalid 拒绝（errno=1）——无 Team 的
+    /// 宿主不是“不校验”，而是没有任何 Team 能与客应用匹配。
+    /// 客本身无 Team 时跳过 Team 项（无 Team 可比；adhoc/未签名件走 JIT 门）。
+    /// 安装时不验 Team（checkTeam: false）：Team 是宿主与客应用的配对属性，
+    /// 是部署问题不是签名缺陷；在安装时按 Team 拦会把所有应用都挡在门外。
     /// 只抛错、不静默：调用方在 do 块内，抛错会走 catch 还原备份。
-    private static func verifyResignedExecutable(_ executablePath: String) throws {
+    static func verifyExecutableSignature(_ executablePath: String, checkTeam: Bool) throws {
         do {
             // ObjC 的 validateSignatureAtPath:error: 在 Swift 侧以 throws
             // 形式导入；失败时 error 即校验原因。
             try SBCodesignCheck.validateSignature(atPath: executablePath)
         } catch {
             throw SBError.signFailed(
-                reason: "重签后验签失败：\(error.localizedDescription)"
+                reason: "验签失败：\(error.localizedDescription)"
             )
         }
+        if checkTeam {
+            try checkTeamMatch(executablePath)
+        }
+    }
+
+    /// 0.2.8：只比 Team（不验结构）。客 Team 与宿主 Team 不一致时抛
+    /// teamMismatch；客无 Team 时不抛（无 Team 可比）。
+    static func checkTeamMatch(_ executablePath: String) throws {
         let guestTeam = SBCodesignCheck.teamIdentifier(atPath: executablePath)
+        guard let guestTeam = guestTeam else { return }
         let hostExecutablePath = Bundle.main.executableURL?.path
         let hostTeam = hostExecutablePath.flatMap { SBCodesignCheck.teamIdentifier(atPath: $0) }
-        NSLog("[SBInstaller] repatch verify: guestTeam=%@ hostTeam=%@",
-              guestTeam ?? "(nil)", hostTeam ?? "(nil)")
-        if let guestTeam = guestTeam, let hostTeam = hostTeam, guestTeam != hostTeam {
-            throw SBError.signFailed(
-                reason: "重签后验签失败：客应用签名 Team（\(guestTeam)）与宿主 Team（\(hostTeam)）不一致，系统会拒绝加载"
-            )
+        NSLog("[SBInstaller] checkTeamMatch: guestTeam=%@ hostTeam=%@",
+              guestTeam, hostTeam ?? "(nil)")
+        if let hostTeam = hostTeam {
+            if guestTeam != hostTeam {
+                throw SBError.teamMismatch(guestTeam: guestTeam, hostTeam: hostTeam)
+            }
+        } else {
+            throw SBError.teamMismatch(guestTeam: guestTeam, hostTeam: nil)
+        }
+    }
+
+    /// 0.2.8：点图标前的签名修复门（Via 案：patchRevision 已是当前值，
+    /// 但安装时签的名是坏的——0.2.5 安装走 ZSign 时签名结构有问题，
+    /// 记录却写 signed=true；点图标直接启动，dlopen 才报 code signature
+    /// invalid）。
+    /// - 先验签：结构/CMS 坏 → 走 repatchInstalledApp 修一次（重打补丁+
+    ///   重签+验签）；修不好抛错，不启动。
+    /// - Team 不一致 → 也走 repatchInstalledApp 修一次：repatch 前会先
+    ///   比当前证书 Team 与宿主 Team——重签能把客 Team 换成当前证书的
+    ///   Team，换完能与宿主匹配才动手；换完也匹配不上直接抛 teamMismatch，
+    ///   不白做工。
+    /// - LC_ID_DYLIB 缺失 → 走 repatchInstalledApp（补 ID）。
+    /// - 全过 → 原样返回，不动记录。
+    /// 调用方须保证已导入证书（点图标时 coordinator 已做 hasCertificate
+    /// 门控）。
+    static func ensureLaunchableSignature(_ record: SBInstalledApp) async throws -> SBInstalledApp {
+        let executablePath = record.executableURL.path
+        if SBMachOHasIDDylib(executablePath) == 0 {
+            NSLog("[SBInstaller] ensureLaunchableSignature: %@ 缺 LC_ID_DYLIB，走重打补丁", record.bundleID)
+            return try await repatchInstalledApp(record)
+        }
+        do {
+            try verifyExecutableSignature(executablePath, checkTeam: true)
+            return record
+        } catch {
+            NSLog("[SBInstaller] ensureLaunchableSignature: %@ 验签失败（%@），走重打补丁修复",
+                  record.bundleID, error.localizedDescription)
+            return try await repatchInstalledApp(record)
         }
     }
 

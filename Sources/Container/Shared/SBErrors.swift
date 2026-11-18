@@ -12,6 +12,12 @@ enum SBError: LocalizedError {
     case encryptedIPA
     case patchFailed(reason: String)
     case signFailed(reason: String)
+    /// 0.2.8：客应用签名 Team 与宿主 Team 不一致，dyld 的 Library Validation
+    ///（F_CHECK_LV）会拒绝加载。这不是签名损坏（签名本身可能完全有效），
+    ///是部署配对问题：宿主须与客应用用同一证书签名。重签客应用修不好
+    ///（重签换不了宿主的 Team），不要给“删除后重新导入”这种误导建议。
+    /// hostTeam 为 nil 表示宿主没有 Team（CI 自签原样安装）。
+    case teamMismatch(guestTeam: String, hostTeam: String?)
     case missingCertificate
     case certificateDeleted
     case certificateExpired
@@ -34,6 +40,7 @@ enum SBError: LocalizedError {
         case .encryptedIPA: return "安装"
         case .patchFailed: return "打补丁"
         case .signFailed: return "签名"
+        case .teamMismatch: return "签名"
         case .missingCertificate: return "证书检查"
         case .certificateDeleted: return "证书检查"
         case .certificateExpired: return "证书检查"
@@ -67,6 +74,8 @@ enum SBError: LocalizedError {
             return "打补丁失败：\(reason)"
         case .signFailed(let reason):
             return "签名失败：\(reason)"
+        case .teamMismatch(let guestTeam, let hostTeam):
+            return "客应用签名 Team（\(guestTeam)）与宿主 Team（\(hostTeam ?? "无")）不一致，系统会拒绝加载客应用"
         case .missingCertificate:
             return "未导入证书，请先导入证书"
         case .certificateDeleted:
@@ -103,6 +112,8 @@ enum SBError: LocalizedError {
             return "请提供已解密的 IPA"
         case .signFailed:
             return "应用已按未签名状态安装，可尝试用 JIT 启动"
+        case .teamMismatch:
+            return "宿主应用需要用同一证书签名才能打开客应用"
         default:
             return nil
         }
