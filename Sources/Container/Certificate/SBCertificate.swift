@@ -1,6 +1,13 @@
 // SBCertificate.swift — 证书导入、校验、删除与启动链自测（证书文件存于 App Group）。
+//
+// 密码存系统钥匙串（SBKeychain，service `com.mjorb.sealbox.certificate-password`），
+// 不再写 App Group UserDefaults 明文。删除时顺手清掉旧明文键 SBCertificatePassword
+// 的残留（0.1.0 / 步骤 2 之前的做法留下的）。
+// 导入日期（SBCertificateImportedDate）与有效期缓存（SBCertificateExpiryDate）是非敏感
+// 信息，仍放 App Group UserDefaults，不变。
 
 import Foundation
+import Security
 import UIKit
 import UniformTypeIdentifiers
 
@@ -8,16 +15,17 @@ import UniformTypeIdentifiers
 ///
 /// 约定（按模块契约）：
 /// - 证书文件在 App Group 容器内，文件名为 Certificate.p12；
-/// - 密码与导入日期存在 App Group UserDefaults（键 SBCertificatePassword /
-///   SBCertificateImportedDate）；有效期缓存键 SBCertificateExpiryDate 是本模块自有键，
-///   只用来拼状态文案，不作他用；
+/// - 密码存系统钥匙串（SBKeychain）；导入日期与有效期缓存存在 App Group UserDefaults
+///   （键 SBCertificateImportedDate / SBCertificateExpiryDate），有效期缓存只用来拼
+///   状态文案，不作他用；
 /// - 证书相关失败一律抛 SBError；校验失败用 `.certificateInvalid(reason:)`，
 ///   自测失败用 `.selfTestFailed(stage:reason:)`。
 public enum SBCertificate {
 
     // MARK: - 常量
 
-    private static let passwordKey = "SBCertificatePassword"
+    /// 旧明文密码键（0.1.0 做法）：不再写入，删除证书时清一次残留。
+    private static let legacyPasswordKey = "SBCertificatePassword"
     private static let importedDateKey = "SBCertificateImportedDate"
     private static let expiryDateKey = "SBCertificateExpiryDate"
 
@@ -27,6 +35,14 @@ public enum SBCertificate {
 
     /// 状态文案缓存；为空时由 statusText 按存量信息现场算。
     private static var cachedStatusText: String?
+
+    /// checkCert 最近一次结果的备忘（设置页进页时 refreshStatusText 与
+    /// certificateInfo 各调一次 checkCert，60 秒内共用一次 OCSP 请求）。
+    /// 只在主线程读写（见 checkCertRaw）。
+    private static var lastCheckData: Data?
+    private static var lastCheckPassword: String?
+    private static var lastCheckResult: (status: Int, expirationDate: Date?, teamID: String?, error: String?)?
+    private static var lastCheckAt: Date?
 
     // MARK: - 基础访问
 
@@ -39,13 +55,14 @@ public enum SBCertificate {
             .appendingPathComponent(SBConstants.certificateFileName)
     }
 
+    /// 证书密码：只从系统钥匙串读，绝不读 UserDefaults 明文。
     private static var storedPassword: String? {
-        sharedDefaults?.string(forKey: passwordKey)
+        SBKeychain.read()
     }
 
     // MARK: - 状态
 
-    /// 是否有可用证书：p12 文件存在且密码非空。
+    /// 是否有可用证书：p12 文件存在且钥匙串里密码非空。
     public static var hasCertificate: Bool {
         guard let url = certificateFileURL,
               FileManager.default.fileExists(atPath: url.path),
@@ -61,6 +78,8 @@ public enum SBCertificate {
     /// - 有效：「证书有效，至 2026-12-01」
     /// - 7 天内过期：「证书将于 2026-12-01 过期，请及时重新导入」
     /// - 已过期：「证书已过期，请重新导入」
+    /// - 校验失败：「证书校验失败，请重新导入证书」
+    /// - 有效期未知：「证书已导入，有效期未知」
     public static var statusText: String {
         if let cached = cachedStatusText {
             return cached
@@ -118,13 +137,82 @@ public enum SBCertificate {
         return true
     }
 
+    // MARK: - 证书信息（全部取自证书本身，不编）
+
+    /// 从证书本身解析出的真实信息。任一字段取不到即为 nil，调用方不显示该行，
+    /// 不编默认值。无证书返回 nil。
+    public struct SBCertificateInfo {
+        /// 主体（SecCertificateCopySubjectSummary），如 "iPhone Developer: xxx (TEAMID)"。
+        public let subject: String?
+        /// 颁发者（SecCertificateCopyValues 的颁发者 CN），如
+        /// "Apple Worldwide Developer Relations Certification Authority"。
+        public let issuer: String?
+        /// 过期日：ZSigner.checkCert 回的 expirationDate，与 Security 的 NotAfter
+        /// 交叉核对过；不一致时以 Security 的值为准。
+        public let expirationDate: Date?
+        /// Team ID：checkCert 回的 organizationalUnitName（OU 即 Team ID）；
+        /// 取不到时退到主体括号里的部分（仍取自证书本身）。
+        public let teamID: String?
+        /// 导入日期（App Group UserDefaults 的 SBCertificateImportedDate）。
+        public let importedDate: Date?
+    }
+
+    /// 读当前证书的真实信息。无证书、读不到文件、钥匙串无密码、p12 解不开
+    /// （如密码错）时返回 nil。
+    /// checkCert 失败（如离线导致 OCSP 请求失败）不抹掉整份信息：过期日与
+    /// Team ID 退到 Security 框架的解析结果，状态文案另由 refreshStatusText
+    /// 按“证书校验失败”处理。
+    public static func certificateInfo() async -> SBCertificateInfo? {
+        guard let url = certificateFileURL,
+              FileManager.default.fileExists(atPath: url.path),
+              let data = try? Data(contentsOf: url),
+              let password = storedPassword, !password.isEmpty else {
+            return nil
+        }
+        guard let cert = certificateFromP12(data: data, password: password) else {
+            return nil
+        }
+        let subject: String? = SecCertificateCopySubjectSummary(cert) as String?
+        let values = SecCertificateCopyValues(
+            cert,
+            [kSecOIDX509V1IssuerName, kSecOIDX509V1ValidityNotAfter] as CFArray,
+            nil) as? [String: Any]
+        let issuer = issuerName(from: values)
+        let securityNotAfter = notAfterDate(from: values)
+
+        let check = await checkCertRaw(data: data, password: password)
+        var expiration = check.expirationDate
+        if let securityDate = securityNotAfter {
+            if let checkDate = expiration {
+                if Swift.abs(checkDate.timeIntervalSince(securityDate)) > 60 {
+                    NSLog("[SBCertificate] checkCert 过期日与 Security NotAfter 不一致，以 Security 为准：checkCert=%@ Security=%@",
+                          checkDate as NSDate, securityDate as NSDate)
+                    expiration = securityDate
+                }
+            } else {
+                expiration = securityDate
+            }
+        }
+        var teamID = check.teamID
+        if teamID == nil, let summary = subject {
+            teamID = teamIDFromSubjectSummary(summary)
+        }
+        let imported = sharedDefaults?.object(forKey: importedDateKey) as? Date
+        return SBCertificateInfo(
+            subject: subject,
+            issuer: issuer,
+            expirationDate: expiration,
+            teamID: teamID,
+            importedDate: imported)
+    }
+
     // MARK: - 导入 / 删除
 
     /// 导入证书：文件选择器选 .p12 → 拷到 App Group Certificate.p12 →
-    /// 弹密码框 → 调 ZSigner 校验 → 存密码与导入日期。
+    /// 弹密码框 → 调 ZSigner 校验 → 密码存钥匙串，存导入日期与有效期缓存。
     /// - Parameter presenter: 用来 present 选择器与密码框的视图控制器。
     /// - Throws: 用户取消抛 `SBError.cancelled`；密码为空或校验未通过抛
-    ///   `SBError.certificateInvalid(reason:)`；文件落盘失败抛
+    ///   `SBError.certificateInvalid(reason:)`；文件落盘失败或钥匙串存密码失败抛
     ///   `SBError.generic(stage: "导入证书", message:)`。失败时刚拷入的文件会被清掉，
     ///   不留半截证书。
     public static func importP12(presenter: UIViewController) async throws {
@@ -149,8 +237,10 @@ public enum SBCertificate {
         do {
             let password = try await askPassword(presenter: presenter)
             let expiration = try await checkCertificate(data: data, password: password)
+            guard SBKeychain.save(password: password) else {
+                throw SBError.generic(stage: "导入证书", message: "证书密码保存失败，请重试")
+            }
             await MainActor.run {
-                sharedDefaults?.set(password, forKey: passwordKey)
                 sharedDefaults?.set(Date(), forKey: importedDateKey)
                 if let expiration = expiration {
                     sharedDefaults?.set(expiration, forKey: expiryDateKey)
@@ -166,7 +256,8 @@ public enum SBCertificate {
         }
     }
 
-    /// 删除证书：删 p12 文件，清密码、导入日期与有效期缓存。删后 hasCertificate 为 false。
+    /// 删除证书：删 p12 文件，清钥匙串密码、导入日期与有效期缓存，并清掉
+    /// 旧明文键 SBCertificatePassword 的残留。删后 hasCertificate 为 false。
     /// 文件本就不存在时也照常清键，不报错。
     public static func deleteCertificate() throws {
         let fileManager = FileManager.default
@@ -177,7 +268,8 @@ public enum SBCertificate {
                 throw SBError.generic(stage: "删除证书", message: "删除证书文件失败，请重试")
             }
         }
-        sharedDefaults?.removeObject(forKey: passwordKey)
+        _ = SBKeychain.delete()
+        sharedDefaults?.removeObject(forKey: legacyPasswordKey)
         sharedDefaults?.removeObject(forKey: importedDateKey)
         sharedDefaults?.removeObject(forKey: expiryDateKey)
         sawCertificate = false
@@ -189,11 +281,11 @@ public enum SBCertificate {
     /// 启动链自测：先查应用共享目录（App Group 权限缺失时当场报，不走到证书门），
     /// 再过证书门，再调 SBGuestLoader 自测入口。
     /// 自测内部用信号量等 ZSign 回调，必须在后台线程跑，本方法已把调用派到全局队列，
-    /// 调用方在主线程调本方法即可。
+    /// 调用方在主线程调本方法即可。设置页证书区直接调本入口。
     /// - Returns: 成功 `.success(())`；失败 `.failure(SBError)`，其中证书门失败为
     ///   `.missingCertificate` / `.certificateDeleted`，其余为
     ///   `.selfTestFailed(stage:reason:)`，stage 取自测返回的中文阶段名。
-    static func runChainSelfTest() async -> Result<Void, SBError> {
+    public static func runChainSelfTest() async -> Result<Void, SBError> {
         guard SBConstants.appGroupContainerURL != nil else {
             return .failure(.selfTestFailed(
                 stage: "应用共享目录",
@@ -301,19 +393,137 @@ public enum SBCertificate {
 
     // MARK: - 私有：ZSigner 校验
 
-    /// 调 ZSigner.checkCert 校验 p12：status 为 0 才算有效，返回过期日；
-    /// 否则按 ZSigner 回的错误文案抛 `.certificateInvalid(reason:)`。
-    private static func checkCertificate(data: Data, password: String) async throws -> Date? {
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Date?, Error>) in
-            ZSigner.checkCert(data, pass: password) { status, expirationDate, _, errorString in
-                if status == 0 {
-                    continuation.resume(returning: expirationDate)
-                } else {
-                    let reason = errorString ?? "证书校验未通过（状态码 \(status)）"
-                    continuation.resume(throwing: SBError.certificateInvalid(reason: reason))
-                }
+    /// 调 ZSigner.checkCert 校验 p12，返回 (status, 过期日, Team ID, 错误文案)，
+    /// 不抛错：调用方按 status 决定是有效还是失败。
+    /// 60 秒内同一份 p12 + 密码重复调直接复用上次结果（备忘只在主线程读写）。
+    private static func checkCertRaw(data: Data, password: String) async -> (status: Int, expirationDate: Date?, teamID: String?, error: String?) {
+        let cached: (status: Int, expirationDate: Date?, teamID: String?, error: String?)? = await MainActor.run {
+            if let at = lastCheckAt,
+               let cachedData = lastCheckData,
+               let cachedPassword = lastCheckPassword,
+               let result = lastCheckResult,
+               cachedData == data, cachedPassword == password,
+               Date().timeIntervalSince(at) < 60 {
+                return result
+            }
+            return nil
+        }
+        if let cached = cached {
+            return cached
+        }
+        let result: (status: Int, expirationDate: Date?, teamID: String?, error: String?) = await withCheckedContinuation { (continuation: CheckedContinuation<(status: Int, expirationDate: Date?, teamID: String?, error: String?), Never>) in
+            ZSigner.checkCert(data, pass: password) { status, expirationDate, organizationalUnitName, errorString in
+                continuation.resume(returning: (status: Int(status), expirationDate: expirationDate, teamID: organizationalUnitName, error: errorString))
             }
         }
+        await MainActor.run {
+            lastCheckData = data
+            lastCheckPassword = password
+            lastCheckResult = result
+            lastCheckAt = Date()
+        }
+        return result
+    }
+
+    /// 调 ZSigner.checkCert 校验 p12：status 为 0 才算有效，返回过期日；
+    /// 否则按 ZSigner 回的错误文案抛 `.certificateInvalid(reason:)`。
+    ///
+    /// status 语义（已按 ZSign/zsign.mm 源码确认，不是假设）：
+    /// - status 是 OCSP 响应里的证书状态（OCSP_resp_find_status）：
+    ///   0 = GOOD（未吊销）、1 = REVOKED（已吊销）、2 = UNKNOWN；
+    /// - 口令错（InitSimple 失败）、颁发者不是 Apple 开发 CA（issuer hash 不匹配）、
+    ///   无 AIA / 无 OCSP 地址、OCSP 联网失败、OCSP 响应解码失败，全部以 status 2
+    ///   + 错误文案回，见 zsign.mm 的 checkCert；
+    /// - checkCert 本身不判过期：expirationDate 只是 X509 notAfter 解析出的日期，
+    ///   过期与否由本模块按该日期与当前时间比对（statusText(for:)）；
+    /// - OCSP 要联网：离线时校验失败，文案为网络错误原文；
+    /// - ZSigner.checkCert 的 int 返回值（-1…-6 / 1）只表示异步任务是否发出，
+    ///   Swift 侧只看 completionHandler 的 status，不读它。
+    /// 仍需真机验证（源码确认不了）：拿已知好证书与已知坏口令的证书各跑一次，
+    /// 核对 status / expirationDate / organizationalUnitName / errorString
+    /// 四个返回值与源码结论一致；另需确认非签名用途的 Apple 证书是否也会
+    /// 回 status 0（checkCert 只认 Apple 颁发者 + OCSP GOOD，不验代码签名用途）。
+    private static func checkCertificate(data: Data, password: String) async throws -> Date? {
+        let result = await checkCertRaw(data: data, password: password)
+        if result.status == 0 {
+            return result.expirationDate
+        }
+        let reason = result.error ?? "证书校验未通过（状态码 \(result.status)）"
+        throw SBError.certificateInvalid(reason: reason)
+    }
+
+    // MARK: - 私有：Security 框架解析
+
+    /// SecPKCS12Import 解 p12 取首个身份的证书。解不开（密码错、文件损坏）
+    /// 返回 nil。CF 类型不用 `as?` 条件转换（编译器直接报错，见 70945ca3
+    /// 教训），先取 Any 再 `as!` 强制转换。
+    private static func certificateFromP12(data: Data, password: String) -> SecCertificate? {
+        let options: [String: Any] = [kSecImportExportPassphrase as String: password]
+        var items: CFArray?
+        let status = SecPKCS12Import(data as CFData, options as CFDictionary, &items)
+        guard status == errSecSuccess,
+              let array = items as? [[String: Any]],
+              let first = array.first,
+              let identityValue = first[kSecImportItemIdentity as String] else {
+            return nil
+        }
+        let identity = identityValue as! SecIdentity
+        var cert: SecCertificate?
+        let copyStatus = SecIdentityCopyCertificate(identity, &cert)
+        guard copyStatus == errSecSuccess else {
+            return nil
+        }
+        return cert
+    }
+
+    /// 从一次 SecCertificateCopyValues 的结果里取颁发者 CN：优先 CN 项，
+    /// 没有 CN 时取第一个字符串值；都没有返回 nil（不编）。
+    private static func issuerName(from values: [String: Any]?) -> String? {
+        guard let values = values,
+              let issuer = values[kSecOIDX509V1IssuerName as String] as? [String: Any],
+              let rdnArray = issuer[kSecPropertyKeyValue as String] as? [[String: Any]] else {
+            return nil
+        }
+        for entry in rdnArray {
+            if let label = entry[kSecPropertyKeyLabel as String] as? String,
+               label == "CN",
+               let value = entry[kSecPropertyKeyValue as String] as? String {
+                return value
+            }
+        }
+        for entry in rdnArray {
+            if let value = entry[kSecPropertyKeyValue as String] as? String {
+                return value
+            }
+        }
+        return nil
+    }
+
+    /// 从一次 SecCertificateCopyValues 的结果里取 NotAfter（Security 侧的过期日）。
+    private static func notAfterDate(from values: [String: Any]?) -> Date? {
+        guard let values = values,
+              let entry = values[kSecOIDX509V1ValidityNotAfter as String] as? [String: Any] else {
+            return nil
+        }
+        if let date = entry[kSecPropertyKeyValue as String] as? Date {
+            return date
+        }
+        if let seconds = entry[kSecPropertyKeyValue as String] as? TimeInterval {
+            return Date(timeIntervalSince1970: seconds)
+        }
+        return nil
+    }
+
+    /// 主体括号里的部分即 Team ID（如 "iPhone Developer: xxx (TEAMID)"），
+    /// 仅作 checkCert 的 OU 取不到时的退路，仍取自证书本身。
+    private static func teamIDFromSubjectSummary(_ summary: String) -> String? {
+        guard let open = summary.lastIndex(of: "("),
+              let close = summary.lastIndex(of: ")"),
+              open < close else {
+            return nil
+        }
+        let teamID = String(summary[summary.index(after: open)..<close])
+        return teamID.isEmpty ? nil : teamID
     }
 
     // MARK: - 私有：文件选择器与密码框（主线程）

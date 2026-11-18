@@ -3,6 +3,7 @@
 #import "SBGuestLoader.h"
 
 #import <UIKit/UIKit.h>
+#import <Security/Security.h>
 #import <dlfcn.h>
 #import <stdlib.h>
 #import <unistd.h>
@@ -22,7 +23,10 @@ static NSString * const SBReceiptStageGuestFailed      = @"guest-failed";
 static NSString * const SBKeySelectedGuestBundleID = @"SBSelectedGuestBundleID";
 static NSString * const SBKeySelectedGuestContainer = @"SBSelectedGuestContainer";
 static NSString * const SBKeyLaunchReceipt = @"SBLaunchReceipt";
-static NSString * const SBKeyCertificatePassword = @"SBCertificatePassword";
+
+// 证书密码的钥匙串定位（与 Swift 侧 SBKeychain 的 service / account 一致）：
+// 密码自步骤 5 起只存系统钥匙串，不再写 App Group UserDefaults 明文，
+// 证书门必须从钥匙串读，否则有证书也会误判成“未导入”。
 
 // 重启截止时间（秒），与契约 restartDeadlineSeconds 一致
 static const NSTimeInterval SBRestartDeadlineSeconds = 5.0;
@@ -192,11 +196,31 @@ NSError *SBGuestLoaderErrorMake(SBGuestLoaderErrorCode code,
 
 #pragma mark - 证书门
 
-/// 证书门：App Group 下 Certificate.p12 存在且 suite 里存了密码才算有证书。
+/// 从系统钥匙串读证书密码（service / account 与 Swift 侧 SBKeychain 一致）。
+/// 读不到返回 nil，不报错。
++ (nullable NSString *)keychainCertificatePassword {
+    NSDictionary *query = @{
+        (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
+        (__bridge id)kSecAttrService: @"com.mjorb.sealbox.certificate-password",
+        (__bridge id)kSecAttrAccount: @"certificate-password",
+        (__bridge id)kSecReturnData: @YES,
+        (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitOne,
+    };
+    CFTypeRef result = NULL;
+    if (SecItemCopyMatching((__bridge CFDictionaryRef)query, &result) != errSecSuccess) {
+        return nil;
+    }
+    NSData *data = (__bridge_transfer NSData *)result;
+    if (![data isKindOfClass:[NSData class]] || data.length == 0) {
+        return nil;
+    }
+    return [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+}
+
+/// 证书门：App Group 下 Certificate.p12 存在且钥匙串里存了密码才算有证书。
 /// 返回 NO 时 error 置为缺证书（两者都没有）或证书已被删除（有密码无文件）。
 - (BOOL)checkCertificateGate:(NSError **)error {
-    NSUserDefaults *defaults = [SBGuestLoader sharedDefaults];
-    NSString *password = [defaults stringForKey:SBKeyCertificatePassword];
+    NSString *password = [[self class] keychainCertificatePassword];
     BOOL hasPassword = password.length > 0;
 
     NSURL *groupURL = [[NSFileManager defaultManager] containerURLForSecurityApplicationGroupIdentifier:[SBGuestLoader appGroupSuiteName]];
@@ -501,7 +525,10 @@ NSError *SBGuestLoaderErrorMake(SBGuestLoaderErrorCode code,
         return NO;
     }
 
-    // ③ 证书校验：status 为 0 才算有效（见 MODULE_NOTES 的假设说明）。
+    // ③ 证书校验：status 为 0 才算有效。status 语义已按 ZSign/zsign.mm 源码确认：
+    // status 是 OCSP 响应里的证书状态（0 = GOOD 未吊销，1 = REVOKED，2 = UNKNOWN；
+    // 口令错、非 Apple 颁发者、无 OCSP、联网失败全部以 status 2 回），不是假设；
+    // 过期与否 checkCert 本身不判，只回 X509 notAfter 解析出的过期日。
     __block int certStatus = -1;
     __block NSString *certErrorString = nil;
     dispatch_semaphore_t certSema = dispatch_semaphore_create(0);

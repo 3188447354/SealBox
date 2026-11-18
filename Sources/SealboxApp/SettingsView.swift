@@ -158,6 +158,9 @@ struct SettingsView: View {
                 }
             }
 
+            // Certificate (container): status + real cert info + import/delete/self-test.
+            CertificateSettingsSection()
+
             // Group 3: other built-in apps (switch apps, not sub-pages)
             Section {
                 Button { vm.openApp = .source } label: {
@@ -1194,6 +1197,159 @@ private struct PrivacySettingsView: View {
         .navigationTitle("隐私与安全性")
         .navigationBarTitleDisplayMode(.inline)
         .safeAreaInset(edge: .bottom) { Color.clear.frame(height: 28) }
+    }
+}
+
+// MARK: - 证书（容器步骤 5）
+
+/// 设置页证书区：状态文案 + 真实证书信息（全部取自证书本身）+ 导入 / 删除 / 自测。
+/// 进页时调 refreshStatusText() 异步刷新；无证书只显示状态行，有证书才显示信息行。
+private struct CertificateSettingsSection: View {
+    @State private var statusText: String = SBCertificate.statusText
+    @State private var info: SBCertificate.SBCertificateInfo?
+    @State private var hasCertificate: Bool = SBCertificate.hasCertificate
+    @State private var selfTestResult: String?
+    @State private var selfTestPassed: Bool = false
+    @State private var selfTesting: Bool = false
+    @State private var alertTitle: String = ""
+    @State private var alertMessage: String = ""
+    @State private var showingAlert: Bool = false
+
+    /// 已过期时状态文案标红（设计 §4.4）。
+    private var isExpired: Bool {
+        if let expiration = info?.expirationDate {
+            return expiration < Date()
+        }
+        return false
+    }
+
+    var body: some View {
+        Section("证书") {
+            HStack {
+                Text("状态")
+                Spacer()
+                Text(statusText)
+                    .foregroundStyle(isExpired ? .red : .secondary)
+            }
+            if let info = info {
+                if let subject = info.subject {
+                    LabeledRow(label: "主体", value: subject)
+                }
+                if let issuer = info.issuer {
+                    LabeledRow(label: "颁发者", value: issuer)
+                }
+                if let expiration = info.expirationDate {
+                    LabeledRow(label: "过期日", value: Self.formattedDate(expiration))
+                }
+                if let teamID = info.teamID {
+                    LabeledRow(label: "Team ID", value: teamID)
+                }
+                if let imported = info.importedDate {
+                    LabeledRow(label: "导入日期", value: Self.formattedDate(imported))
+                }
+            }
+            Button("导入证书") {
+                Task {
+                    guard let presenter = Self.topViewController() else { return }
+                    do {
+                        try await SBCertificate.importP12(presenter: presenter)
+                        await refresh()
+                    } catch {
+                        if case SBError.cancelled = error { return }
+                        await MainActor.run {
+                            alertTitle = "导入证书失败"
+                            alertMessage = error.localizedDescription
+                            showingAlert = true
+                        }
+                    }
+                }
+            }
+            Button("删除证书", role: .destructive) {
+                Task {
+                    do {
+                        try SBCertificate.deleteCertificate()
+                        await refresh()
+                    } catch {
+                        await MainActor.run {
+                            alertTitle = "删除证书失败"
+                            alertMessage = error.localizedDescription
+                            showingAlert = true
+                        }
+                    }
+                }
+            }
+            .disabled(!hasCertificate)
+            Button("启动链自测") {
+                Task {
+                    await MainActor.run {
+                        selfTesting = true
+                        selfTestResult = nil
+                    }
+                    let result = await SBCertificate.runChainSelfTest()
+                    await MainActor.run {
+                        selfTesting = false
+                        switch result {
+                        case .success:
+                            selfTestPassed = true
+                            selfTestResult = "自测通过"
+                        case .failure(let error):
+                            selfTestPassed = false
+                            if case SBError.selfTestFailed(let stage, let reason) = error {
+                                selfTestResult = "\(stage)：\(reason)"
+                            } else {
+                                selfTestResult = error.localizedDescription
+                            }
+                        }
+                    }
+                }
+            }
+            .disabled(selfTesting)
+            if let result = selfTestResult {
+                Text(result)
+                    .foregroundStyle(selfTestPassed ? .green : .red)
+            }
+        } footer: {
+            Text("免费开发证书有效期 7 天，到期后需重新生成并重新导入，已装应用需重新签名。")
+        }
+        .task { await refresh() }
+        .alert(Text(alertTitle), isPresented: $showingAlert) {
+            Button("好", role: .cancel) {}
+        } message: {
+            Text(alertMessage)
+        }
+    }
+
+    private func refresh() async {
+        let text = await SBCertificate.refreshStatusText()
+        let fetched = await SBCertificate.certificateInfo()
+        let hasCert = SBCertificate.hasCertificate
+        await MainActor.run {
+            statusText = text
+            info = fetched
+            hasCertificate = hasCert
+        }
+    }
+
+    private static func formattedDate(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter.string(from: date)
+    }
+
+    /// 顶层 presenter（文件选择器 / 密码框用），做法与
+    /// SBAppCoordinator.topViewController 一致。
+    private static func topViewController() -> UIViewController? {
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        let window = scenes.first(where: { $0.activationState == .foregroundActive })?
+            .windows.first(where: { $0.isKeyWindow })
+            ?? scenes.flatMap { $0.windows }.first(where: { $0.isKeyWindow })
+        guard var top = window?.rootViewController else { return nil }
+        while let presented = top.presentedViewController {
+            top = presented
+        }
+        return top
     }
 }
 
