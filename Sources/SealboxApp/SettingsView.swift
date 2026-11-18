@@ -1224,7 +1224,7 @@ private struct CertificateSettingsSection: View {
     }
 
     var body: some View {
-        Section("证书") {
+        Section {
             HStack {
                 Text("状态")
                 Spacer()
@@ -1308,6 +1308,8 @@ private struct CertificateSettingsSection: View {
                 Text(result)
                     .foregroundStyle(selfTestPassed ? .green : .red)
             }
+        } header: {
+            Text("证书")
         } footer: {
             Text("免费开发证书有效期 7 天，到期后需重新生成并重新导入，已装应用需重新签名。")
         }
