@@ -289,6 +289,7 @@ NSError *SBGuestLoaderErrorMake(SBGuestLoaderErrorCode code,
                         keychainGroup:(NSInteger)keychainGroup
                            completion:(void (^)(NSError * _Nullable error))completion {
     if (bundleID.length == 0 || containerUUID.length == 0) {
+        SBDiagLogLine([[NSString stringWithFormat:@"点图标：启动信息不完整（缺少应用或容器）：bundleID=%@ containerUUID=%@", bundleID ?: @"", containerUUID ?: @""] UTF8String]);
         if (completion) {
             completion(SBGuestLoaderErrorMake(SBGuestLoaderErrorGuestLoadFailed,
                                               @"重启请求",
@@ -299,6 +300,9 @@ NSError *SBGuestLoaderErrorMake(SBGuestLoaderErrorCode code,
     }
     NSError *certError = nil;
     if (![self checkCertificateGate:&certError]) {
+        // 0.2.10 报错日志：之前只把错交回调用方弹弹窗，诊断日志里
+        // 没有这一行——证书门拦了谁、为什么拦，全看不到。
+        SBDiagLogLine([[NSString stringWithFormat:@"点图标：证书门拦截：[code=%ld] %@ %@", (long)(certError ? certError.code : SBGuestLoaderErrorMissingCertificate), bundleID, certError.localizedDescription ?: @"未知原因"] UTF8String]);
         if (completion) {
             completion(certError);
         }
@@ -308,6 +312,7 @@ NSError *SBGuestLoaderErrorMake(SBGuestLoaderErrorCode code,
                                              diskDirectoryName:diskDirectoryName];
     BOOL isDirectory = NO;
     if (![[NSFileManager defaultManager] fileExistsAtPath:appPath isDirectory:&isDirectory] || !isDirectory) {
+        SBDiagLogLine([[NSString stringWithFormat:@"点图标：包检查失败：[code=%ld] %@ %@（包不在磁盘）", (long)SBGuestLoaderErrorBundleNotFound, bundleID, appPath] UTF8String]);
         if (completion) {
             completion(SBGuestLoaderErrorMake(SBGuestLoaderErrorBundleNotFound,
                                               @"加载客 App",
@@ -364,6 +369,9 @@ NSError *SBGuestLoaderErrorMake(SBGuestLoaderErrorCode code,
             return;
         }
         NSString *message = @"系统没有重启应用，请重试";
+        // 0.2.10 报错日志：之前只改收据不记日志——看门狗超时在诊断
+        // 日志里完全看不到，收据却写着“系统没有重启应用”。
+        SBDiagLogLine([[NSString stringWithFormat:@"点图标：重启请求超时：[code=%ld] %@（5 秒看门狗，系统未重启应用）", (long)SBGuestLoaderErrorRestartRequestFailed, bundleID] UTF8String]);
         [SBGuestLoader markReceiptStage:SBReceiptStageRestartRequested detail:message];
         finish(SBGuestLoaderErrorMake(SBGuestLoaderErrorRestartRequestFailed,
                                       @"重启请求",
@@ -380,6 +388,7 @@ NSError *SBGuestLoaderErrorMake(SBGuestLoaderErrorCode code,
     components.queryItems = @[ bundleItem, containerItem, requestItem ];
     NSURL *launchURL = components.URL;
     if (!launchURL) {
+        SBDiagLogLine([[NSString stringWithFormat:@"点图标：启动链接生成失败：[code=%ld] %@", (long)SBGuestLoaderErrorRestartRequestFailed, bundleID] UTF8String]);
         finish(SBGuestLoaderErrorMake(SBGuestLoaderErrorRestartRequestFailed,
                                       @"重启请求",
                                       @"启动链接生成失败，请重试",
@@ -391,7 +400,7 @@ NSError *SBGuestLoaderErrorMake(SBGuestLoaderErrorCode code,
                                        options:@{}
                              completionHandler:^(BOOL success) {
         if (!success) {
-            SBDiagLogLine("重启请求失败：系统拒绝 openURL");
+            SBDiagLogLine([[NSString stringWithFormat:@"重启请求失败：[code=%ld] %@ 系统拒绝 openURL", (long)SBGuestLoaderErrorRestartRequestFailed, bundleID] UTF8String]);
             [SBGuestLoader markReceiptStage:SBReceiptStageRestartRequested
                                      detail:@"系统没有重启应用，请重试"];
             finish(SBGuestLoaderErrorMake(SBGuestLoaderErrorRestartRequestFailed,
@@ -454,7 +463,9 @@ NSError *SBGuestLoaderErrorMake(SBGuestLoaderErrorCode code,
     if (message.length == 0) {
         message = @"客 App 加载失败";
     }
-    SBDiagLogLine([[NSString stringWithFormat:@"客加载失败：%@", message] UTF8String]);
+    NSString *guestAppPath = [SBGuestLoader guestAppPathForBundleID:bundleID
+                                                  diskDirectoryName:diskDirectoryName];
+    SBDiagLogLine([[NSString stringWithFormat:@"客加载失败：[code=%ld] %@ %@ %@", (long)(error ? error.code : SBGuestLoaderErrorGuestLoadFailed), bundleID, guestAppPath, message] UTF8String]);
     [SBGuestLoader markReceiptStage:SBReceiptStageGuestFailed detail:message];
     NSUserDefaults *defaults = [SBGuestLoader sharedDefaults];
     [defaults removeObjectForKey:SBKeySelectedGuestBundleID];

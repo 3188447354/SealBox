@@ -299,6 +299,10 @@ final class SBAppCoordinator: ObservableObject {
                         appToLaunch = try await SBInstaller.ensureLaunchableSignature(appToLaunch)
                     }
                 } catch {
+                    // 0.2.10 报错日志：修复门（重打补丁/验签）失败之前只弹
+                    // 弹窗，诊断日志里没有这一行——看日志不知道修了什么、
+                    // 为什么修不好。
+                    SBDiagLog.log("启动失败：\(app.bundleID) \(app.executableURL.path) 签名修复门失败（[code=\(SBInstaller.errorCode(of: error))] \(error.localizedDescription)）")
                     await MainActor.run {
                         self.isLaunching = false
                         self.activeAlert = CoordinatorAlert(
@@ -316,6 +320,10 @@ final class SBAppCoordinator: ObservableObject {
                     if ok {
                         self.requestRestart(app: launchTarget)
                     } else {
+                        // 0.2.10 报错日志：注入件签名失败之前只弹弹窗；失败
+                        // 的具体原因（无证书/件不在/重签失败）由
+                        // performEnsureHooksDylibSigned 记行，这里记弹窗决定。
+                        SBDiagLog.log("启动失败：\(launchTarget.bundleID) 注入组件签名失败，弹启动失败（无法用当前证书签名 SBGuestHooks.dylib）")
                         self.isLaunching = false
                         self.activeAlert = CoordinatorAlert(
                             title: "启动失败",
@@ -343,9 +351,12 @@ final class SBAppCoordinator: ObservableObject {
         launchWatchdog?.cancel()
         launchWatchdog = nil
         launchStage = "证书检查"
+        let bundleID = app.bundleID
         let watchdog = DispatchWorkItem { [weak self] in
             guard let self = self else { return }
             let stage = self.launchStage ?? "重启请求"
+            // 0.2.10 报错日志：之前只弹“启动超时”，诊断日志里没有这一行。
+            SBDiagLog.log("启动超时：\(bundleID) 卡在：\(stage)（30 秒看门狗，重启请求未回）")
             self.launchStage = nil
             self.launchWatchdog = nil
             self.isLaunching = false
@@ -366,6 +377,9 @@ final class SBAppCoordinator: ObservableObject {
             guard let error = error else { return }
             self.isLaunching = false
             let stage = (error as NSError).userInfo[SBGuestLoaderErrorStageKey] as? String ?? "启动失败"
+            // 0.2.10 报错日志：重启请求失败之前只弹弹窗；原因（证书门/
+            // 包缺失/看门狗/openURL）已由 ObjC 侧记行，这里记弹窗决定。
+            SBDiagLog.log("启动失败弹窗：[code=\((error as NSError).code)] \(app.bundleID) 阶段：\(stage) \(error.localizedDescription)")
             Task { @MainActor in
                 if (error as NSError).code == SBGuestLoaderErrorCode.bundleNotFound.rawValue {
                     // 0.2.9：包不在磁盘（记录还在，多为宿主重装换了容器）——
@@ -430,6 +444,9 @@ final class SBAppCoordinator: ObservableObject {
         guard let receipt = SBStore.shared.launchReceipt, receipt.stage == "guest-failed" else { return }
         let message = receipt.stageDetail ?? "客 App 加载失败"
         SBStore.shared.launchReceipt = nil
+        // 0.2.10 报错日志：收据的失败原因已在加载时记行；这里记收据
+        // 被桌面弹出来并清掉，收尾可追溯。
+        SBDiagLog.log("启动失败弹窗：\(receipt.guestBundleID) 按 guest-failed 收据弹错（\(message)），收据已清")
         activeAlert = CoordinatorAlert(title: "启动失败", message: message)
     }
 }

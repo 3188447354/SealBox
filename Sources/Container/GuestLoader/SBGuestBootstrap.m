@@ -2,6 +2,7 @@
 #import "SBGuestBootstrap.h"
 
 #import <dlfcn.h>
+#import <errno.h>
 #import <objc/runtime.h>
 #import <stdlib.h>
 #import <sys/stat.h>
@@ -165,6 +166,13 @@ static void SBClearGuestEnvironment(void) {
     return NO;
 }
 
+/// 客加载失败统一记一行（0.2.10 报错日志用）：错误码 + bundle ID +
+/// 包路径 + 原因。failWithError 只造 NSError 不记日志；每个失败点
+/// 先调这里再返回，出错位置由调用点的步骤号标出。
+static void SBDiagLogGuestFail(SBGuestLoaderErrorCode code, NSString *bundleID, NSString *path, NSString *message) {
+    SBDiagLogLine([[NSString stringWithFormat:@"客加载失败：[code=%ld] %@ %@ %@", (long)code, bundleID ?: @"", path ?: @"", message ?: @""] UTF8String]);
+}
+
 + (BOOL)loadGuestWithBundleID:(NSString *)bundleID
                 containerUUID:(NSString *)containerUUID
             diskDirectoryName:(NSString *)diskDirectoryName
@@ -185,6 +193,7 @@ static void SBClearGuestEnvironment(void) {
     // —— 1. 读客 App 包与 Info.plist ————————————————————————————
     BOOL isDirectory = NO;
     if (![fileManager fileExistsAtPath:guestAppPath isDirectory:&isDirectory] || !isDirectory) {
+        SBDiagLogGuestFail(SBGuestLoaderErrorBundleNotFound, bundleID, guestAppPath, @"客 App 安装包不在磁盘");
         return [self failWithError:error
                               code:SBGuestLoaderErrorBundleNotFound
                            message:@"找不到客 App 安装包，请重新安装"
@@ -199,12 +208,14 @@ static void SBClearGuestEnvironment(void) {
     }
     NSString *guestExecPath = [guestAppPath stringByAppendingPathComponent:executableName];
     if (![fileManager fileExistsAtPath:guestExecPath]) {
+        SBDiagLogGuestFail(SBGuestLoaderErrorBundleNotFound, bundleID, guestExecPath, @"客 App 可执行文件不在磁盘");
         return [self failWithError:error
                               code:SBGuestLoaderErrorBundleNotFound
                            message:@"找不到客 App 可执行文件，请重新安装"
                           recovery:@"重新导入该应用"];
     }
     if (is32BitMachOAtPath(guestExecPath)) {
+        SBDiagLogGuestFail(SBGuestLoaderErrorUnsupportedBinary, bundleID, guestExecPath, @"该应用是 32 位应用，需要 JIT 才能运行");
         return [self failWithError:error
                               code:SBGuestLoaderErrorUnsupportedBinary
                            message:@"该应用是 32 位应用，需要 JIT 才能运行"
@@ -231,6 +242,8 @@ static void SBClearGuestEnvironment(void) {
                 : [NSString stringWithFormat:@"%ld.%ld", (long)guestMajor, (long)guestMinor];
             NSString *hostVersionText = [NSString stringWithFormat:@"%ld.%ld",
                                          (long)hostVersion.majorVersion, (long)hostVersion.minorVersion];
+            SBDiagLogGuestFail(SBGuestLoaderErrorUnsupportedBinary, bundleID, guestExecPath,
+                               [NSString stringWithFormat:@"该应用需要 iOS %@，当前系统为 iOS %@", guestVersionText, hostVersionText]);
             return [self failWithError:error
                                   code:SBGuestLoaderErrorUnsupportedBinary
                                message:[NSString stringWithFormat:@"该应用需要 iOS %@，当前系统为 iOS %@",
@@ -253,6 +266,11 @@ static void SBClearGuestEnvironment(void) {
                      withIntermediateDirectories:YES
                                       attributes:nil
                                            error:&mkdirError]) {
+            int mkdirErrno = errno;
+            SBDiagLogGuestFail(SBGuestLoaderErrorGuestLoadFailed, bundleID, dirPath,
+                               [NSString stringWithFormat:@"创建客 App 数据目录失败：%@（NSError code=%ld%@）",
+                                mkdirError.localizedDescription ?: @"未知原因", (long)mkdirError.code,
+                                mkdirErrno != 0 ? [NSString stringWithFormat:@" errno=%d", mkdirErrno] : @""]);
             return [self failWithError:error
                                   code:SBGuestLoaderErrorGuestLoadFailed
                                message:[NSString stringWithFormat:@"创建客 App 数据目录失败：%@", mkdirError.localizedDescription]
@@ -305,6 +323,7 @@ static void SBClearGuestEnvironment(void) {
     // —— 4. 改写主 Bundle（NSBundle / CFBundle 指向客 App） ———————————
     NSBundle *guestBundle = [NSBundle bundleWithPath:guestAppPath];
     if (!guestBundle) {
+        SBDiagLogGuestFail(SBGuestLoaderErrorGuestLoadFailed, bundleID, guestAppPath, @"NSBundle 读不到客 App 安装包（bundleWithPath 返回 nil）");
         return [self failWithError:error
                               code:SBGuestLoaderErrorGuestLoadFailed
                            message:@"无法读取客 App 安装包"
@@ -313,7 +332,9 @@ static void SBClearGuestEnvironment(void) {
     NSError *spoofError = nil;
     if (!overwriteMainNSBundle(guestBundle, &spoofError)) {
         NSString *reason = spoofError.localizedDescription ?: @"改写主 Bundle 失败";
-        SBDiagLogLine([[NSString stringWithFormat:@"客加载失败：NSBundle 伪装失败：%@", reason] UTF8String]);
+        SBDiagLogGuestFail(SBGuestLoaderErrorSpoofFailed, bundleID, guestAppPath,
+                           [NSString stringWithFormat:@"NSBundle 伪装失败：%@%@", reason,
+                            spoofError ? [NSString stringWithFormat:@"（NSError code=%ld）", (long)spoofError.code] : @""]);
         return [self failWithError:error
                               code:SBGuestLoaderErrorSpoofFailed
                            message:reason
@@ -322,7 +343,9 @@ static void SBClearGuestEnvironment(void) {
     if (!overwriteMainCFBundle(guestBundle, &spoofError)) {
         restoreMainNSBundle();
         NSString *reason = spoofError.localizedDescription ?: @"改写主 Bundle 失败";
-        SBDiagLogLine([[NSString stringWithFormat:@"客加载失败：CFBundle 伪装失败：%@", reason] UTF8String]);
+        SBDiagLogGuestFail(SBGuestLoaderErrorSpoofFailed, bundleID, guestAppPath,
+                           [NSString stringWithFormat:@"CFBundle 伪装失败：%@%@", reason,
+                            spoofError ? [NSString stringWithFormat:@"（NSError code=%ld）", (long)spoofError.code] : @""]);
         return [self failWithError:error
                               code:SBGuestLoaderErrorSpoofFailed
                            message:reason
@@ -333,7 +356,8 @@ static void SBClearGuestEnvironment(void) {
     // —— 5. 改写可执行路径（尽力而为：失败只记日志，不阻断启动） ————————
     NSError *execPathError = nil;
     if (!overwriteExecutablePath(guestExecPath, &execPathError)) {
-        SBDiagLogLine([[NSString stringWithFormat:@"客加载：改写可执行路径失败（继续启动）：%@", execPathError.localizedDescription] UTF8String]);
+        int execErrno = errno;
+        SBDiagLogLine([[NSString stringWithFormat:@"客加载：改写可执行路径失败（继续启动）：%@ %@（NSError code=%ld%@）", guestExecPath, execPathError.localizedDescription ?: @"未知原因", (long)execPathError.code, execErrno != 0 ? [NSString stringWithFormat:@" errno=%d", execErrno] : @""] UTF8String]);
         NSLog(@"[Sealbox] 改写可执行路径失败：%@，继续启动", execPathError.localizedDescription);
     } else {
         SBDiagLogLine("客加载：可执行路径已改写为客路径");
@@ -359,6 +383,8 @@ static void SBClearGuestEnvironment(void) {
     NSError *dlopenError = nil;
     void *guestHandle = dlopenGuest(guestExecPath, &dlopenError);
     if (!guestHandle) {
+        SBDiagLogGuestFail(SBGuestLoaderErrorGuestLoadFailed, bundleID, guestExecPath,
+                           [NSString stringWithFormat:@"dlopen 失败：%@", dlopenError.localizedDescription ?: @"未知错误"]);
         restoreMainCFBundle();
         restoreMainNSBundle();
         restoreExecutablePath();
@@ -371,6 +397,8 @@ static void SBClearGuestEnvironment(void) {
     }
     NSError *bundleLoadError = nil;
     if (![guestBundle loadAndReturnError:&bundleLoadError]) {
+        SBDiagLogGuestFail(SBGuestLoaderErrorGuestLoadFailed, bundleID, guestExecPath,
+                           [NSString stringWithFormat:@"NSBundle 加载失败：%@（NSError code=%ld）", bundleLoadError.localizedDescription ?: @"未知原因", (long)bundleLoadError.code]);
         restoreMainCFBundle();
         restoreMainNSBundle();
         restoreExecutablePath();
@@ -386,6 +414,9 @@ static void SBClearGuestEnvironment(void) {
     uint64_t entryoff = 0;
     NSError *entryError = nil;
     if (!getAppEntryPoint(guestExecPath, &entryoff, &entryError)) {
+        NSInteger entryCode = entryError ? entryError.code : SBGuestLoaderErrorEntryPointNotFound;
+        SBDiagLogGuestFail((SBGuestLoaderErrorCode)entryCode, bundleID, guestExecPath,
+                           [NSString stringWithFormat:@"取客 App 入口失败：%@", entryError.localizedDescription ?: @"未知原因"]);
         restoreMainCFBundle();
         restoreMainNSBundle();
         restoreExecutablePath();
@@ -398,6 +429,9 @@ static void SBClearGuestEnvironment(void) {
     }
     uintptr_t entryAddress = 0;
     if (!runtimeAddressForImageAtPath(guestExecPath, entryoff, &entryAddress, &entryError)) {
+        NSInteger entryCode = entryError ? entryError.code : SBGuestLoaderErrorEntryPointNotFound;
+        SBDiagLogGuestFail((SBGuestLoaderErrorCode)entryCode, bundleID, guestExecPath,
+                           [NSString stringWithFormat:@"取客 App 入口运行地址失败：entryoff=0x%llx 原因：%@", (unsigned long long)entryoff, entryError.localizedDescription ?: @"未知原因"]);
         restoreMainCFBundle();
         restoreMainNSBundle();
         restoreExecutablePath();

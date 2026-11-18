@@ -392,12 +392,16 @@ public enum SBCertificate {
               let password = storedPassword, !password.isEmpty,
               let certTeamID = SBSigner.teamID(withCertData: data, password: password),
               !certTeamID.isEmpty else {
+            // 0.2.10 报错日志：之前直接 return false，调用方只看到
+            // “注入组件签名失败”一句，看不出是无证书还是读不到 Team。
+            SBDiagLog.log("注入件签名检查失败：无导入证书或读不到证书 Team（无法重签注入件）")
             return false
         }
         // 先保证 Tweaks 里有件（包内新了就覆盖拷一份）。
         SBLaunchRouter.ensureGuestHooksDylib()
         let tweaksURL = SBConstants.tweaksHookDylibURL(documentsURL: SBConstants.documentsURL)
         guard FileManager.default.fileExists(atPath: tweaksURL.path) else {
+            SBDiagLog.log("注入件签名检查失败：注入件不在磁盘 \(tweaksURL.path)")
             return false
         }
         if teamIDOfSignedMachO(at: tweaksURL) == certTeamID {
@@ -405,8 +409,15 @@ public enum SBCertificate {
         }
         // Team 不一致（或无签名）：用当前证书重签，再读一次 Team 确认。
         let signed = await signMachO(at: tweaksURL.path, bundleID: "com.mjorb.sealbox", certData: data, password: password)
-        guard signed else { return false }
-        return teamIDOfSignedMachO(at: tweaksURL) == certTeamID
+        guard signed else {
+            SBDiagLog.log("注入件签名检查失败：重签失败 \(tweaksURL.path) 证书 Team=\(certTeamID)")
+            return false
+        }
+        let afterTeam = teamIDOfSignedMachO(at: tweaksURL)
+        if afterTeam != certTeamID {
+            SBDiagLog.log("注入件签名检查失败：重签后 Team 仍不一致 \(tweaksURL.path) 注入件 Team=\(afterTeam ?? "无") 证书 Team=\(certTeamID)")
+        }
+        return afterTeam == certTeamID
     }
 
     /// 当前导入证书的 p12 数据；无证书返回 nil。

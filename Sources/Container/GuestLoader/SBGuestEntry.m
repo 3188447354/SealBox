@@ -3,6 +3,7 @@
 #import "SBGuestEntry.h"
 
 #import <dlfcn.h>
+#import <errno.h>
 #import <libkern/OSByteOrder.h>
 #import <mach-o/dyld.h>
 #import <mach-o/fat.h>
@@ -163,6 +164,10 @@ BOOL getAppEntryPoint(NSString *machOPath, uint64_t *entryoffOut, NSError **erro
     }
     NSData *data = [NSData dataWithContentsOfFile:machOPath];
     if (!data) {
+        // 0.2.10 报错日志：之前只返错不记日志，读失败的原因（权限/不存在）
+        // 全丢了；errno 在这里现取。
+        int readErrno = errno;
+        SBDiagLogLine([[NSString stringWithFormat:@"客入口：读可执行文件失败：%@ errno=%d", machOPath, readErrno] UTF8String]);
         if (error) {
             *error = SBEntryError(@"找不到客 App 入口：读不到可执行文件");
         }
@@ -171,12 +176,14 @@ BOOL getAppEntryPoint(NSString *machOPath, uint64_t *entryoffOut, NSError **erro
     uint64_t sliceOffset = 0, sliceSize = 0;
     uint32_t cputype = 0;
     if (!SBMachOSlice(data, &sliceOffset, &sliceSize, &cputype)) {
+        SBDiagLogLine([[NSString stringWithFormat:@"客入口：不是有效的 Mach-O 文件：%@ 文件大小=%lu", machOPath, (unsigned long)data.length] UTF8String]);
         if (error) {
             *error = SBEntryError(@"找不到客 App 入口：不是有效的 Mach-O 文件");
         }
         return NO;
     }
     if (cputype != CPU_TYPE_ARM64) {
+        SBDiagLogLine([[NSString stringWithFormat:@"客入口：不是 64 位应用：%@ cputype=0x%x", machOPath, cputype] UTF8String]);
         if (error) {
             *error = SBGuestLoaderErrorMake(SBGuestLoaderErrorUnsupportedBinary,
                                             @"加载客 App",
@@ -203,6 +210,7 @@ BOOL getAppEntryPoint(NSString *machOPath, uint64_t *entryoffOut, NSError **erro
             return NO; // 停下
         });
     if (!enumerated || !found) {
+        SBDiagLogLine([[NSString stringWithFormat:@"客入口：可执行文件里没有 LC_MAIN：%@", machOPath] UTF8String]);
         if (error) {
             *error = SBEntryError(@"找不到客 App 入口：可执行文件里没有 LC_MAIN");
         }
@@ -220,9 +228,12 @@ void *dlopenGuest(NSString *path, NSError **error) {
         SBDiagLogLine([[NSString stringWithFormat:@"客加载：dlopen 客可执行成功：%@", path] UTF8String]);
         return handle;
     }
+    // dlopen 失败：errno 要在 dlerror() 之前现取（后面的 NSString
+    // 分配可能改掉它）；dlerror 原文照原样记进日志。
+    int dlopenErrno = errno;
     const char *dlerrorString = dlerror();
     NSString *detail = dlerrorString ? [NSString stringWithUTF8String:dlerrorString] : @"未知错误";
-    SBDiagLogLine([[NSString stringWithFormat:@"客加载：dlopen 客可执行失败：%@", detail] UTF8String]);
+    SBDiagLogLine([[NSString stringWithFormat:@"客加载：dlopen 客可执行失败：[code=%ld] %@%@ dyld 原文：%@", (long)SBGuestLoaderErrorGuestLoadFailed, path, dlopenErrno != 0 ? [NSString stringWithFormat:@" errno=%d", dlopenErrno] : @"", detail] UTF8String]);
     NSInteger majorVersion = [[NSProcessInfo processInfo] operatingSystemVersion].majorVersion;
     NSString *message = nil;
     NSString *recovery = @"请重试，或重新导入该应用";
@@ -311,5 +322,8 @@ BOOL runtimeAddressForImageAtPath(NSString *imagePath,
     if (error) {
         *error = SBEntryError(@"找不到客 App 入口：客 App 镜像未加载");
     }
+    // 0.2.10 报错日志：之前只返错不记日志；记下要找的镜像、已加载
+    // 镜像数与 entryoff，定位“dlopen 成功了但镜像不在列表里”。
+    SBDiagLogLine([[NSString stringWithFormat:@"客入口：镜像未加载：%@ 已加载镜像数=%u entryoff=0x%llx", imagePath, _dyld_image_count(), (unsigned long long)fileOffset] UTF8String]);
     return NO;
 }

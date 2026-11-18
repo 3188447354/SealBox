@@ -48,7 +48,7 @@ enum SBLaunchRouter {
             if !FileManager.default.fileExists(atPath: app.bundleURL.path) {
                 updated[i].needsReimport = true
                 changed = true
-                SBDiagLog.log("启动对账：\(app.bundleID) 包不在磁盘，标为需重新导入")
+                SBDiagLog.log("启动对账：\(app.bundleID) \(app.bundleURL.path) 包不在磁盘，标为需重新导入")
             }
         }
         if changed {
@@ -75,7 +75,7 @@ enum SBLaunchRouter {
             && $0.diskDirectoryName == receipt.diskDirectoryName
         } ?? SBStore.shared.app(with: receipt.guestBundleID)
         if record?.needsReimport == true {
-            SBDiagLog.log("启动路由：\(receipt.guestBundleID) 已标需重新导入，跳过客加载并清掉过期收据")
+            SBDiagLog.log("启动路由：\(receipt.guestBundleID) \(record?.bundleURL.path ?? "") 已标需重新导入，跳过客加载并清掉过期收据")
             SBStore.shared.launchReceipt = nil
             SBStore.shared.clearGuestSelection()
             return
@@ -87,7 +87,7 @@ enum SBLaunchRouter {
             .appendingPathComponent(SBConstants.guestAppsDirectoryName)
             .appendingPathComponent(dirName)
         if !FileManager.default.fileExists(atPath: packageURL.path) {
-            SBDiagLog.log("启动路由：\(receipt.guestBundleID) 包不在磁盘，跳过客加载并清掉过期收据")
+            SBDiagLog.log("启动路由：\(receipt.guestBundleID) \(packageURL.path) 包不在磁盘，跳过客加载并清掉过期收据")
             SBStore.shared.launchReceipt = nil
             SBStore.shared.clearGuestSelection()
         }
@@ -112,6 +112,11 @@ enum SBLaunchRouter {
             if var receipt = SBStore.shared.launchReceipt,
                receipt.stage == "restart-requested",
                Date().timeIntervalSince(receipt.createdAt) > SBConstants.restartDeadlineSeconds {
+                // 0.2.10 报错日志：之前进这个分支（收据过期记 guest-failed）
+                // 没有日志行——下次启动看到 guest-failed 收据，不知道是
+                // 哪张收据、过期多久。
+                let age = Date().timeIntervalSince(receipt.createdAt)
+                SBDiagLog.log("启动路由：\(receipt.guestBundleID) 重启收据过期（\(String(format: "%.1f", age)) 秒 > \(SBConstants.restartDeadlineSeconds) 秒，[code=1003]），记启动失败")
                 receipt.stage = "guest-failed"
                 receipt.stageDetail = SBError.restartRequestFailed.errorDescription
                 SBStore.shared.launchReceipt = receipt

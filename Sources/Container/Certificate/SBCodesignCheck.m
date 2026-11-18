@@ -402,4 +402,79 @@ static BOOL SBVerifyPageHash(const uint8_t *page, size_t pageLen,
     return YES;
 }
 
++ (NSDictionary *)signatureDetailAtPath:(NSString *)path {
+    NSMutableDictionary *detail = [NSMutableDictionary dictionary];
+    detail[@"valid"] = @NO;
+    detail[@"hasCMS"] = @NO;
+    detail[@"pageHashOK"] = @NO;
+    detail[@"firstBadPage"] = [NSNull null];
+    detail[@"pageCount"] = @0;
+    detail[@"teamID"] = [NSNull null];
+    detail[@"identifier"] = [NSNull null];
+    detail[@"error"] = [NSNull null];
+
+    NSData *fileData = [NSData dataWithContentsOfFile:path];
+    if (fileData == nil) {
+        detail[@"error"] = @"读不到待校验的文件";
+        return detail;
+    }
+    const uint8_t *bytes = (const uint8_t *)fileData.bytes;
+    size_t len = fileData.length;
+    uint32_t sigOff = 0, sigSize = 0;
+    NSString *reason = nil;
+    if (!SBFindSignature(bytes, len, &sigOff, &sigSize, &reason)) {
+        detail[@"error"] = [NSString stringWithFormat:@"签名结构无效：%@", reason ?: @"找不到签名块"];
+        return detail;
+    }
+    SBCodeDirectoryInfo info;
+    if (!SBParseCodeDirectory(bytes, len, sigOff, sigSize, &info, &reason)) {
+        detail[@"error"] = [NSString stringWithFormat:@"签名结构无效：%@", reason ?: @"解析 CodeDirectory 失败"];
+        return detail;
+    }
+    NSString *identifier = SBReadCDString(&info, info.identOffset);
+    if (identifier.length > 0) {
+        detail[@"identifier"] = identifier;
+    } else {
+        detail[@"error"] = @"CodeDirectory 没有 identifier";
+    }
+    NSString *teamID = SBReadCDString(&info, info.teamOffset);
+    if (teamID.length > 0) {
+        detail[@"teamID"] = teamID;
+    }
+    detail[@"hasCMS"] = @(info.hasSignatureSlot);
+    if (!info.hasSignatureSlot) {
+        detail[@"error"] = @"superblob 里没有 CMS 签名块";
+    }
+    detail[@"pageCount"] = @(info.nCodeSlots);
+
+    // 页哈希逐项验（与 validateSignature 同款循环；CMS 缺失也照验，
+    // 各字段独立记，调用方在日志里分得清“CMS 缺失”和“页哈希不过”）。
+    uint32_t pageSize = 1u << info.pageSizeLog2;
+    BOOL pagesOK = YES;
+    for (uint32_t i = 0; i < info.nCodeSlots; i++) {
+        uint64_t pageStart = (uint64_t)i * pageSize;
+        if (pageStart >= info.codeLimit) {
+            detail[@"error"] = @"代码页超出 codeLimit";
+            pagesOK = NO;
+            break;
+        }
+        uint64_t remaining = (uint64_t)info.codeLimit - pageStart;
+        size_t pageLen = (size_t)MIN((uint64_t)pageSize, remaining);
+        const uint8_t *expected = info.cd + info.codeHashOffset
+            + (uint64_t)i * info.hashSize;
+        if (!SBVerifyPageHash(bytes + pageStart, pageLen,
+                             info.hashType, info.hashSize, expected)) {
+            detail[@"firstBadPage"] = @(i);
+            detail[@"error"] = [NSString stringWithFormat:@"第 %u 页内容哈希与签名里存的不一致，文件可能被改过", i];
+            pagesOK = NO;
+            break;
+        }
+    }
+    detail[@"pageHashOK"] = @(pagesOK);
+    if (identifier.length > 0 && info.hasSignatureSlot && pagesOK) {
+        detail[@"valid"] = @YES;
+    }
+    return detail;
+}
+
 @end

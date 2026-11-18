@@ -161,18 +161,24 @@ public enum SBInstaller {
                     signingCertFingerprint = certificateFingerprint(certData: certData, password: password)
                     // 主程序与 appex 用各自的 entitlements 再签一次（0.2.5）。
                     // 某一次失败不阻塞安装：该文件保留全包重签的签名（空 entitlements），
-                    // 与 0.2.4 行为一致。
+                    // 与 0.2.4 行为一致；但失败要进诊断日志（0.2.10），不能静默吞掉。
                     for entry in executablesToResign {
-                        try? await signMachOWithEntitlements(
-                            path: entry.path,
-                            bundleID: entry.bundleID,
-                            certData: certData,
-                            password: password,
-                            entitlementXML: entry.entitlements
-                        )
+                        do {
+                            try await signMachOWithEntitlements(
+                                path: entry.path,
+                                bundleID: entry.bundleID,
+                                certData: certData,
+                                password: password,
+                                entitlementXML: entry.entitlements
+                            )
+                        } catch {
+                            SBDiagLog.log("安装 entitlements 再签失败：[code=\(Self.errorCode(of: error))] \(entry.bundleID) \(entry.path) 错误：\(error.localizedDescription)（保留全包重签签名，继续装）")
+                        }
                     }
                 } catch {
                     // 验收 C5：签名失败也照样装，详情页标「未签名 / JIT 启动」。
+                    // 0.2.10 报错日志：静默照装不行，失败原因要进诊断日志。
+                    SBDiagLog.log("安装重签失败：[code=\(Self.errorCode(of: error))] \(parsed.bundleID) \(destinationDir.path) 错误：\(error.localizedDescription)（照装，标未签名）")
                     signed = false
                 }
             }
@@ -186,7 +192,7 @@ public enum SBInstaller {
             // Team 的诊断放在启动时（ensureLaunchableSignature）。
             // 验签失败直接抛错，安装失败清理，不留签坏的包。
             if signed {
-                try verifyExecutableSignature(executablePath, checkTeam: false)
+                try verifyExecutableSignature(executablePath, bundleID: parsed.bundleID, checkTeam: false)
             }
             patchProgress.completedUnitCount = patchProgress.totalUnitCount
 
@@ -251,6 +257,9 @@ public enum SBInstaller {
         } catch {
             // 安装失败：只清本次新建的东西，不留半截图标；
             // 替换失败时把旧包从备份处恢复原位。
+            // 0.2.10 报错日志：安装链任一步失败（打补丁/重签/验签/
+            // 图标/入库）都在这里记一行，含错误码与 bundle ID。
+            SBDiagLog.log("安装失败：[code=\(Self.errorCode(of: error))] \(parsed.bundleID) 错误：\(error.localizedDescription)")
             if didStartCopy {
                 try? fileManager.removeItem(at: destinationDir)
             }
@@ -290,11 +299,13 @@ public enum SBInstaller {
         let appPath = record.bundleURL.path
         let executablePath = record.executableURL.path
         guard fileManager.fileExists(atPath: executablePath) else {
+            SBDiagLog.log("重打补丁失败：\(record.bundleID) \(executablePath) 可执行文件不在磁盘")
             throw SBError.patchFailed(reason: "找不到可执行文件 \(record.executableName)")
         }
         guard let certData = certificateData(),
               let password = certificatePassword(),
               !password.isEmpty else {
+            SBDiagLog.log("重打补丁失败：\(record.bundleID) \(appPath) 没有导入证书，无法重签")
             throw SBError.signFailed(reason: "没有导入证书，无法重签")
         }
         // 0.2.8：重打补丁前先比 Team——重签只能把客 Team 换成当前证书的
@@ -311,9 +322,11 @@ public enum SBInstaller {
             }
             if let hostTeam = hostTeam {
                 if certTeamID != hostTeam {
+                    SBDiagLog.log("重打补丁 Team 预检失败：\(record.bundleID) 证书 Team=\(certTeamID) 宿主 Team=\(hostTeam)（重签也换不成宿主 Team，不动手）")
                     throw SBError.teamMismatch(guestTeam: certTeamID, hostTeam: hostTeam)
                 }
             } else {
+                SBDiagLog.log("重打补丁 Team 预检失败：\(record.bundleID) 证书 Team=\(certTeamID) 宿主无 Team（CI 自签，无法匹配，不动手）")
                 throw SBError.teamMismatch(guestTeam: certTeamID, hostTeam: nil)
             }
         }
@@ -324,6 +337,7 @@ public enum SBInstaller {
         do {
             try fileManager.copyItem(atPath: executablePath, toPath: backupURL.path)
         } catch {
+            SBDiagLog.log("重打补丁备份失败：[code=\(Self.errorCode(of: error))] \(record.bundleID) \(executablePath) 错误：\(error.localizedDescription)")
             throw SBError.patchFailed(reason: "备份可执行文件失败")
         }
         defer { try? fileManager.removeItem(at: backupURL) }
@@ -369,13 +383,17 @@ public enum SBInstaller {
             signed = true
             signingCertFingerprint = certificateFingerprint(certData: certData, password: password)
             for entry in executablesToResign {
-                try? await signMachOWithEntitlements(
-                    path: entry.path,
-                    bundleID: entry.bundleID,
-                    certData: certData,
-                    password: password,
-                    entitlementXML: entry.entitlements
-                )
+                do {
+                    try await signMachOWithEntitlements(
+                        path: entry.path,
+                        bundleID: entry.bundleID,
+                        certData: certData,
+                        password: password,
+                        entitlementXML: entry.entitlements
+                    )
+                } catch {
+                    SBDiagLog.log("重打补丁 entitlements 再签失败：[code=\(Self.errorCode(of: error))] \(entry.bundleID) \(entry.path) 错误：\(error.localizedDescription)（保留全包重签签名，继续）")
+                }
             }
             // 0.2.7 签后验签：重签完立刻在本地验一遍主可执行文件，确认签名真能
             // 被系统接受再记 patchRevision——不要等到 dlopen 那步才由 dyld 报
@@ -383,15 +401,26 @@ public enum SBInstaller {
             // catch 会把主可执行文件还原回备份（重打补丁前的状态）。
             // 0.2.8：含 Team 一致性，宿主无 Team 时也判失败（见
             // verifyExecutableSignature 注释）。
-            try verifyExecutableSignature(executablePath, checkTeam: true)
+            try verifyExecutableSignature(executablePath, bundleID: record.bundleID, checkTeam: true)
         } catch {
             // 任一步失败：主可执行文件还原，记录不动。
-            if fileManager.fileExists(atPath: executablePath) {
-                _ = try? fileManager.replaceItemAt(
-                    URL(fileURLWithPath: executablePath), withItemAt: backupURL)
-            } else {
-                try? fileManager.copyItem(atPath: backupURL.path, toPath: executablePath)
+            // 还原本身也是尽力而为：先做再记，日志里的“已还原/还原失败”
+            // 按实际结果写，不许先报成功。
+            var restored = false
+            do {
+                if fileManager.fileExists(atPath: executablePath) {
+                    _ = try fileManager.replaceItemAt(
+                        URL(fileURLWithPath: executablePath), withItemAt: backupURL)
+                } else {
+                    try fileManager.copyItem(atPath: backupURL.path, toPath: executablePath)
+                }
+                restored = true
+            } catch {
+                restored = false
             }
+            // 0.2.10 报错日志：打补丁/重签/验签任一步失败都在这里记
+            // 一行（错误码 + bundle ID + 路径 + 原因 + 还原结果）。
+            SBDiagLog.log("重打补丁失败：[code=\(Self.errorCode(of: error))] \(record.bundleID) \(executablePath) 错误：\(error.localizedDescription)（备份\(restored ? "已还原" : "还原失败")，记录不动）")
             throw error
         }
 
@@ -432,25 +461,52 @@ public enum SBInstaller {
     /// 客本身无 Team 时跳过 Team 项（无 Team 可比；adhoc/未签名件走 JIT 门）。
     /// 安装时不验 Team（checkTeam: false）：Team 是宿主与客应用的配对属性，
     /// 是部署问题不是签名缺陷；在安装时按 Team 拦会把所有应用都挡在门外。
+    /// 把签名逐项结果拼成日志字段（0.2.10 报错日志用）：
+    /// 有效 / CMS / 页哈希（页数、首坏页）/ Team / identifier / 原因。
+    static func signatureDetailFields(at path: String) -> String {
+        let detail = SBCodesignCheck.signatureDetail(atPath: path)
+        let valid = (detail["valid"] as? NSNumber)?.boolValue ?? false
+        let hasCMS = (detail["hasCMS"] as? NSNumber)?.boolValue ?? false
+        let pageHashOK = (detail["pageHashOK"] as? NSNumber)?.boolValue ?? false
+        let pageCount = (detail["pageCount"] as? NSNumber)?.intValue ?? 0
+        let firstBadPage = detail["firstBadPage"] as? NSNumber
+        let teamID = detail["teamID"] as? String ?? "无"
+        let identifier = detail["identifier"] as? String ?? "无"
+        let error = detail["error"] as? String ?? ""
+        var fields = "签名逐项：有效=\(valid ? "是" : "否") CMS=\(hasCMS ? "在位" : "缺失") 页哈希=\(pageHashOK ? "全过" : "不过")(\(pageCount)页"
+        if let bad = firstBadPage {
+            fields += " 首坏页=\(bad.intValue)"
+        }
+        fields += ") Team=\(teamID) identifier=\(identifier)"
+        if !error.isEmpty {
+            fields += " 原因：\(error)"
+        }
+        return fields
+    }
+
     /// 只抛错、不静默：调用方在 do 块内，抛错会走 catch 还原备份。
-    static func verifyExecutableSignature(_ executablePath: String, checkTeam: Bool) throws {
+    static func verifyExecutableSignature(_ executablePath: String, bundleID: String, checkTeam: Bool = false) throws {
+        let detail = signatureDetailFields(at: executablePath)
         do {
             // ObjC 的 validateSignatureAtPath:error: 在 Swift 侧以 throws
             // 形式导入；失败时 error 即校验原因。
             try SBCodesignCheck.validateSignature(atPath: executablePath)
         } catch {
-            throw SBError.signFailed(
+            let sbError = SBError.signFailed(
                 reason: "验签失败：\(error.localizedDescription)"
             )
+            SBDiagLog.log("验签失败：[code=\(sbError.code)] \(bundleID) \(executablePath) \(detail)")
+            throw sbError
         }
+        SBDiagLog.log("验签通过：\(bundleID) \(executablePath) \(detail)")
         if checkTeam {
-            try checkTeamMatch(executablePath)
+            try checkTeamMatch(executablePath, bundleID: bundleID)
         }
     }
 
     /// 0.2.8：只比 Team（不验结构）。客 Team 与宿主 Team 不一致时抛
     /// teamMismatch；客无 Team 时不抛（无 Team 可比）。
-    static func checkTeamMatch(_ executablePath: String) throws {
+    static func checkTeamMatch(_ executablePath: String, bundleID: String) throws {
         let guestTeam = SBCodesignCheck.teamIdentifier(atPath: executablePath)
         guard let guestTeam = guestTeam else { return }
         let hostExecutablePath = Bundle.main.executableURL?.path
@@ -459,9 +515,12 @@ public enum SBInstaller {
               guestTeam, hostTeam ?? "(nil)")
         if let hostTeam = hostTeam {
             if guestTeam != hostTeam {
+                // 0.2.10 报错日志：之前只有 NSLog，不进诊断日志文件。
+                SBDiagLog.log("Team 不一致：\(bundleID) \(executablePath) 客 Team=\(guestTeam) 宿主 Team=\(hostTeam)（dyld 要求一致，须用同一证书重签宿主）")
                 throw SBError.teamMismatch(guestTeam: guestTeam, hostTeam: hostTeam)
             }
         } else {
+            SBDiagLog.log("Team 预检：\(bundleID) \(executablePath) 客 Team=\(guestTeam) 宿主无 Team（CI 自签，dyld 不会放行，须用同一证书重签宿主）")
             throw SBError.teamMismatch(guestTeam: guestTeam, hostTeam: nil)
         }
     }
@@ -484,14 +543,16 @@ public enum SBInstaller {
         let executablePath = record.executableURL.path
         if SBMachOHasIDDylib(executablePath) == 0 {
             NSLog("[SBInstaller] ensureLaunchableSignature: %@ 缺 LC_ID_DYLIB，走重打补丁", record.bundleID)
+            SBDiagLog.log("签名修复门：\(record.bundleID) \(executablePath) 缺 LC_ID_DYLIB，走重打补丁")
             return try await repatchInstalledApp(record)
         }
         do {
-            try verifyExecutableSignature(executablePath, checkTeam: true)
+            try verifyExecutableSignature(executablePath, bundleID: record.bundleID, checkTeam: true)
             return record
         } catch {
             NSLog("[SBInstaller] ensureLaunchableSignature: %@ 验签失败（%@），走重打补丁修复",
                   record.bundleID, error.localizedDescription)
+            SBDiagLog.log("签名修复门：\(record.bundleID) \(executablePath) 验签失败（[code=\(Self.errorCode(of: error))] \(error.localizedDescription)），走重打补丁修复")
             return try await repatchInstalledApp(record)
         }
     }
@@ -512,6 +573,12 @@ public enum SBInstaller {
     }
 
     // MARK: - 补丁错误码 → SBError
+
+    /// 报错日志字段（0.2.10）：SBError 的稳定数字码；非 SBError 的
+    /// 系统错误记 -1（日志里同时有错误原文，不丢信息）。
+    static func errorCode(of error: Error) -> Int {
+        (error as? SBError)?.code ?? -1
+    }
 
     private static func patchError(for code: Int32) -> SBError {
         switch code {

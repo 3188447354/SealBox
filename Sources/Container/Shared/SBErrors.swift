@@ -99,8 +99,35 @@ enum SBError: LocalizedError {
         }
     }
 
-    /// 恢复建议：显示在报错弹窗的次要文案或按钮旁。
-    var recoverySuggestion: String? {
+    /// 稳定数字码（0.2.10 报错日志用）：每条报错记录都带这个码，日志里
+    /// 一眼定位是哪一类失败。与 ObjC 的 SBGuestLoaderErrorCode
+    ///（1001–1010）不重叠；新增 case 时往后加，不要改已有值。
+    var code: Int {
+        switch self {
+        case .cancelled: return 2001
+        case .notAnIPA: return 2002
+        case .unzipFailed: return 2003
+        case .noAppBundle: return 2004
+        case .infoPlistUnreadable: return 2005
+        case .noBundleID: return 2006
+        case .encryptedIPA: return 2007
+        case .patchFailed: return 2008
+        case .signFailed: return 2009
+        case .teamMismatch: return 2010
+        case .missingCertificate: return 2011
+        case .certificateDeleted: return 2012
+        case .certificateExpired: return 2013
+        case .certificateInvalid: return 2014
+        case .restartRequestFailed: return 2015
+        case .needsJIT: return 2016
+        case .guestLoadFailed: return 2017
+        case .selfTestFailed: return 2018
+        case .installInProgress: return 2019
+        case .generic: return 2020
+        }
+    }
+
+    /// 恢复建议：显示在报错弹窗的次要文案或按钮旁。    var recoverySuggestion: String? {
         switch self {
         case .missingCertificate, .certificateDeleted, .certificateExpired:
             return "去导入证书"

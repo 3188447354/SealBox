@@ -24,6 +24,16 @@ NS_ASSUME_NONNULL_BEGIN
 /// 失败时 error 的 localizedDescription 带中文原因。
 + (BOOL)validateSignatureAtPath:(NSString *)path error:(NSError **)error;
 
+/// 逐项签名检查（0.2.10 报错日志用）：不早退，CMS / 页哈希 /
+/// Team / identifier 各自验、各自记；返回字典：
+///   valid（BOOL）= identifier 在位 && CMS 在位 && 页哈希全过
+///   hasCMS（BOOL）、pageHashOK（BOOL）、firstBadPage（NSNumber/NSNull）
+///   pageCount（NSNumber）、teamID（NSString/NSNull）
+///   identifier（NSString/NSNull）、error（NSString/NSNull）
+/// 无 Team 时 teamID 记 NSNull（只验结构，不判 Team 对不对——
+/// Team 对不对由调用方拿 teamID 对比宿主 Team 再决定）。
++ (NSDictionary *)signatureDetailAtPath:(NSString *)path;
+
 @end
 
 NS_ASSUME_NONNULL_END
