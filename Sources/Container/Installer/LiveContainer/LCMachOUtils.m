@@ -7,9 +7,12 @@
 // 一处字符串常量；其余一字未动）：
 //   1. `#import "../litehook/src/litehook.h"` → `#import "litehook.h"`
 //      （本仓库 litehook/src 已在 HEADER_SEARCH_PATHS 里，见 project.pbxproj）。
-//   2. 删掉 `#import "LCUtils.h"`（本文件里没有任何符号用到它，grep 只有
-//      import 这一行；LCUtils.h 本身是 LC 应用层头，会拖进 LCSharedUtils/
-//      UIKitPrivate 等整条应用层，不取）。
+//   2. 删掉 `#import "LCUtils.h"`，改引 `#import "LCMachOUtils.h"`。
+//      原文件经 LCUtils.h（LCUtils.h:2 `#import "LCMachOUtils.h"`）间接
+//      引入本头——本头才声明 PATCH_EXEC_RESULT_* 与 LCParseMachOCallback；
+//      我第一版以为 LCUtils.h 无用直接删掉，第二轮 CI 红于此（本文件
+//      192/226/261 行报未声明）。LCUtils.h 本身是 LC 应用层头，会拖进
+//      LCSharedUtils/UIKitPrivate 等整条应用层，不取；直接引本头等价。
 //   3. `tweakLoaderPath` 由 "@loader_path/../../Tweaks/TweakLoader.dylib"
 //      改为 "@loader_path/../../Tweaks/SBGuestHooks.dylib"（我们的客端 Hook
 //      件名；同一变量既用于匹配已注入的命令、也用于注入新命令，改一处即全通）。
@@ -27,6 +30,7 @@
 @import Foundation;
 @import MachO;
 #import "litehook.h"
+#import "LCMachOUtils.h"
 #include "dyld_cache_format.h"
 
 static uint32_t rnd32(uint32_t v, uint32_t r) {
