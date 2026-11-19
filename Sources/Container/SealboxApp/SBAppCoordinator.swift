@@ -330,7 +330,13 @@ final class SBAppCoordinator: ObservableObject {
             // 无证书：跳过注入件重签，直接发重启请求（ObjC 侧证书门会弹
             // “未导入证书”并给去导入证书按钮）。
             guard SBCertificate.hasCertificate else {
-                await MainActor.run { self.requestRestart(app: appToLaunch) }
+                // 0.2.16：同下面 339 行——Swift 6 下 @Sendable 闭包不能捕获 var，
+                // 先定格成 let 再进 MainActor.run。0.2.8 只修了下面那处，这处
+                // 漏了；0.2.15 的 CI 上它还是警告，新 runner 镜像
+                //（macos-26-arm64 20261112.0504.1，Xcode 同为 26.2）上它升成
+                // 错误，Archive 步 exit 65。
+                let launchTarget = appToLaunch
+                await MainActor.run { self.requestRestart(app: launchTarget) }
                 return
             }
             // 0.2.8：Swift 6 下 @Sendable 闭包不能捕获 var——先把最终值
