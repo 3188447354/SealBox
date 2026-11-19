@@ -580,9 +580,10 @@ public enum SBCertificate {
             return false
         }
         do {
-            try FileManager.default.replaceItemAt(
+            // resultingItemURL 在本 SDK 的重载里不存在（原参数有默认值），省略。
+            _ = try FileManager.default.replaceItemAt(
                 tweaksURL, withItemAt: tmpURL, backupItemName: nil,
-                options: [], resultingItemURL: nil)
+                options: [])
         } catch {
             try? FileManager.default.removeItem(at: tmpURL)
             SBDiagLog.log("注入件签名检查失败：重签后原子替换失败 \(error.localizedDescription)")
