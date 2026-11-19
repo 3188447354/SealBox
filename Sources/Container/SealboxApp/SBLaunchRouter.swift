@@ -1,12 +1,26 @@
+import CryptoKit
 import Foundation
 
 /// 进程启动时的路由：读启动标记，决定进桌面还是进客 App。
 /// 客 App 的加载由 SBGuestLoader 完成；这里只做分流与收据处理。
 enum SBLaunchRouter {
+    /// 0.2.19：包内件同步标记（包内 SBGuestHooks.dylib 的 SHA-256 hex），
+    /// 记在 App Group UserDefaults（与已装记录同寿命）。
+    private static let hooksSyncedHashKey = "SBGuestHooksSyncedHash"
+
     /// 保证 Documents/Tweaks/SBGuestHooks.dylib 存在且与包内版本一致：
     /// 补丁注入的 LC_LOAD_DYLIB 指向它，自测也用它。包内位置是
     /// SealBox.app/Frameworks/SBGuestHooks.dylib（Embed Frameworks 落位）。
-    /// 每次启动都比对大小，包内新了就覆盖拷一份。
+    /// 0.2.19：按包内件 SHA-256 同步，不再按大小比对——大小比对会抹掉
+    /// 已签好的件：Seal 签名件 106,400 字节、ZSign 重签件 121,552 字节，
+    /// 都 != 包内未签名件 101,072 字节，每次 ensure 都把好签名拷回未
+    /// 签名件，performEnsure 永远从未签名件出发重签（0.2.18 真机日志
+    /// 18:54–18:57 十次重复的根因，见 build log 0.2.19 节）。
+    /// 拷贝条件只剩三条：件缺失、件被截断（小于包内件）、包内件换了
+    /// （新版本，标记对不上）。首次运行（无标记）且件已在位时不覆盖：
+    /// 它可能带好签名，门+重签路径会在原地修它；包内件代码自 0.2.6
+    /// 起没换过（0.2.17/0.2.18 两版 IPA 的包内件字节相同，
+    /// md5 742fe5a5f18ef242b0c90c1467e7b935），不覆盖不会留旧代码。
     static func ensureGuestHooksDylib() {
         let fileManager = FileManager.default
         let documentsURL = SBConstants.documentsURL
@@ -15,17 +29,25 @@ enum SBLaunchRouter {
         let embedded = Bundle.main.bundleURL
             .appendingPathComponent("Frameworks")
             .appendingPathComponent(SBConstants.guestHooksDylibName)
-        guard fileManager.fileExists(atPath: embedded.path) else { return }
+        guard fileManager.fileExists(atPath: embedded.path),
+              let embeddedData = try? Data(contentsOf: embedded) else { return }
+        let embeddedHash = SHA256.hash(data: embeddedData).map { String(format: "%02x", $0) }.joined()
+        let defaults = UserDefaults(suiteName: SBConstants.appGroupSuiteName)
         do {
             try fileManager.createDirectory(at: tweaksDir, withIntermediateDirectories: true)
-            let embeddedSize = (try? fileManager.attributesOfItem(atPath: embedded.path)[.size] as? NSNumber)?.int64Value
-            let destSize = (try? fileManager.attributesOfItem(atPath: destination.path)[.size] as? NSNumber)?.int64Value
-            if embeddedSize != destSize {
-                if fileManager.fileExists(atPath: destination.path) {
+            let destExists = fileManager.fileExists(atPath: destination.path)
+            let destSize = (try? fileManager.attributesOfItem(atPath: destination.path)[.size] as? NSNumber)?.int64Value ?? -1
+            let storedHash = defaults?.string(forKey: hooksSyncedHashKey)
+            let needsCopy = !destExists
+                || destSize < Int64(embeddedData.count)
+                || (storedHash != nil && storedHash != embeddedHash)
+            if needsCopy {
+                if destExists {
                     try? fileManager.removeItem(at: destination)
                 }
                 try fileManager.copyItem(at: embedded, to: destination)
             }
+            defaults?.set(embeddedHash, forKey: hooksSyncedHashKey)
         } catch {
             // 拷不过去不拦启动：加载客 App 时 bootstrap 会报缺件。
             NSLog("[Sealbox] SBGuestHooks.dylib 同步到 Tweaks 失败：%@", error.localizedDescription)

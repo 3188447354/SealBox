@@ -6,6 +6,7 @@
 // 导入日期（SBCertificateImportedDate）与有效期缓存（SBCertificateExpiryDate）是非敏感
 // 信息，仍放 App Group UserDefaults，不变。
 
+import CryptoKit
 import Foundation
 import Security
 import UIKit
@@ -28,6 +29,16 @@ public enum SBCertificate {
     private static let legacyPasswordKey = "SBCertificatePassword"
     private static let importedDateKey = "SBCertificateImportedDate"
     private static let expiryDateKey = "SBCertificateExpiryDate"
+
+    /// 0.2.19：导入时钉住的叶子证书指纹（SHA-256 hex），记在 App Group
+    /// UserDefaults。用时核对：指纹对不上说明证书文件被换过，拒签并明记，
+    /// 不静默用另一张证书签。0.2.19 之前导入的证书没有钉住的指纹——
+    /// 只记日志，不拒签（MJ 在用的 2026-11-19 导入那张就是这种情况）。
+    private static let certificateFingerprintKey = "SBCertificateLeafFingerprint"
+
+    /// 0.2.19：注入件签名失败的统一文案。证书本身没问题（客应用用它
+    /// 签得好好的，CyPwn/Asspp 逐项全过），不再让用户重导证书背锅。
+    static let hooksSignFailureReason = "注入组件签名失败：已用当前证书重签，内核仍不通过（证书本身没问题，详见启动日志）"
 
     /// 本进程内是否见过有效证书（供 checkStillExists 判断“证书丢了”用）。
     /// 跨进程靠“密码还在、文件没了”判断，不依赖本标记。
@@ -225,13 +236,20 @@ public enum SBCertificate {
             throw SBError.generic(stage: "导入证书", message: "读不到所选证书文件，请重试")
         }
 
+        // 0.2.19：原子化写入——先拷到临时文件再替换，避免写入中途（崩溃/
+        // 被杀）留下半截 p12；半截文件会让下次读 Team 时翻成另一张证书。
         let fileManager = FileManager.default
+        let tempURL = destination.appendingPathExtension("tmp")
         do {
+            try? fileManager.removeItem(at: tempURL)
+            try fileManager.copyItem(at: pickedURL, to: tempURL)
             if fileManager.fileExists(atPath: destination.path) {
-                try fileManager.removeItem(at: destination)
+                _ = try fileManager.replaceItemAt(destination, withItemAt: tempURL)
+            } else {
+                try fileManager.moveItem(at: tempURL, to: destination)
             }
-            try fileManager.copyItem(at: pickedURL, to: destination)
         } catch {
+            try? fileManager.removeItem(at: tempURL)
             throw SBError.generic(stage: "导入证书", message: "证书文件保存失败，请重试")
         }
 
@@ -255,6 +273,11 @@ public enum SBCertificate {
                 }
                 sawCertificate = true
                 cachedStatusText = expiration.map { statusText(for: $0) } ?? "证书已导入，有效期未知"
+            }
+            // 0.2.19：钉住这张证书的叶子指纹，用时核对。
+            if let fingerprint = leafFingerprint(data: data, password: password) {
+                sharedDefaults?.set(fingerprint, forKey: certificateFingerprintKey)
+                SBDiagLog.log("导入证书：叶子指纹=\(fingerprint.prefix(12))")
             }
             // 证书刚换过：后台把注入件重签成新证书的 Team（0.2.2），下次点图标不用等。
             Task.detached { _ = await SBCertificate.ensureHooksDylibSigned() }
@@ -280,6 +303,7 @@ public enum SBCertificate {
         sharedDefaults?.removeObject(forKey: legacyPasswordKey)
         sharedDefaults?.removeObject(forKey: importedDateKey)
         sharedDefaults?.removeObject(forKey: expiryDateKey)
+        sharedDefaults?.removeObject(forKey: certificateFingerprintKey)
         sawCertificate = false
         cachedStatusText = "未导入证书"
     }
@@ -319,7 +343,7 @@ public enum SBCertificate {
                 if await ensureHooksDylibSigned() {
                     return .success(())
                 }
-                return .failure(.selfTestFailed(stage: "自测", reason: "注入组件签名失败：无法用当前证书签名 SBGuestHooks.dylib，请重新导入证书后重试"))
+                return .failure(.selfTestFailed(stage: "自测", reason: hooksSignFailureReason))
             }
             return .failure(.selfTestFailed(stage: "自测", reason: "自测未通过，请重试"))
         } catch let nsError as NSError {
@@ -407,7 +431,21 @@ public enum SBCertificate {
             SBDiagLog.log("注入件签名检查失败：无导入证书或读不到证书 Team（无法重签注入件）")
             return false
         }
-        // 先保证 Tweaks 里有件（包内新了就覆盖拷一份）。
+        // 0.2.19：每次读证书都记文件 SHA 与叶子指纹前缀——0.2.18 真机
+        // 18:55:07–12 同一会话里 Team 翻成旧证书 L9RL3DB66Y（MJ 19:00
+        // 确认那张旧证书没在用，在用的是 2026-11-19 导入的 3432ZHJUF9
+        // 那张），须能从日志里区分“文件被换过”（SHA 变了）还是“同一份
+        // p12 里多身份选取不一致”（SHA 与指纹都不变、Team 翻了）。
+        let fileSHA = sha256Hex(data)
+        let fingerprint = leafFingerprint(data: data, password: password)
+        SBDiagLog.log("注入件签名检查：证书文件SHA=\(fileSHA.prefix(12)) 叶子指纹=\(fingerprint?.prefix(12) ?? "算不出") Team=\(certTeamID)")
+        if let pinned = sharedDefaults?.string(forKey: certificateFingerprintKey),
+           let fingerprint,
+           pinned != fingerprint {
+            SBDiagLog.log("注入件签名检查失败：证书文件与导入时不一致（叶子指纹不匹配），拒绝签名")
+            return false
+        }
+        // 先保证 Tweaks 里有件（0.2.19：按包内件哈希同步，不再按大小覆盖——已签好的件不再被抹掉）。
         SBLaunchRouter.ensureGuestHooksDylib()
         let tweaksURL = SBConstants.tweaksHookDylibURL(documentsURL: SBConstants.documentsURL)
         guard FileManager.default.fileExists(atPath: tweaksURL.path) else {
@@ -436,7 +474,14 @@ public enum SBCertificate {
             return false
         }
         guard SBLCCheckCodeSignature(tweaksURL.path) != 0 else {
-            SBDiagLog.log("注入件签名检查失败：重签后内核验签仍不通过 \(tweaksURL.path) 证书 Team=\(certTeamID)")
+            // 0.2.19：重签后仍不通过时记重签后件的完整逐项 + 内核门自检。
+            // 宿主主程序正在运行，其签名内核必认；门若说宿主不通过，门
+            // 本身就是坏的（0.2.18 任务第 2 条：门从未在已知好件上证实过）。
+            // 重签后件的逐项与客主程序（能过的那个）逐项比，找“同证书同
+            // 签名器同空 entitlements，客过、件不过”的差别。
+            let detail = SBCodesignCheck.signatureDetail(atPath: tweaksURL.path)
+            let hostSelfCheck = Bundle.main.executableURL.map { SBLCCheckCodeSignature($0.path) != 0 } ?? false
+            SBDiagLog.log("注入件签名检查失败：重签后内核验签仍不通过 \(tweaksURL.path) 证书 Team=\(certTeamID) 重签后件：\(SBInstaller.signatureDetailFields(detail: detail)) 内核门自检宿主主程序=\(hostSelfCheck ? "通过" : "不通过")")
             return false
         }
         let afterTeam = teamIDOfSignedMachO(at: tweaksURL)
@@ -452,6 +497,21 @@ public enum SBCertificate {
     private static func currentCertificateData() -> Data? {
         guard let url = certificateFileURL else { return nil }
         return try? Data(contentsOf: url)
+    }
+
+    /// p12 里首个身份的叶子证书 SHA-256 指纹（hex）；解不开返回 nil。
+    /// 与 Team 的 ZSign（OpenSSL PKCS12_parse）取首个身份是两条解析路：
+    /// 若同一份 p12 的 Team 在日志里翻转而指纹不变，说明是多身份选取
+    /// 不一致；若指纹也变了，说明证书文件内容被换过。
+    private static func leafFingerprint(data: Data, password: String) -> String? {
+        guard let cert = certificateFromP12(data: data, password: password) else { return nil }
+        let certData = SecCertificateCopyData(cert) as Data
+        return SHA256.hash(data: certData).map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// 任意数据的 SHA-256 hex（证书文件字节指纹用）。
+    private static func sha256Hex(_ data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
     /// 读一个已签名 Mach-O 的 Team ID（SBCodesignCheck 手动解析 CodeDirectory；

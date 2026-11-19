@@ -758,7 +758,7 @@ public enum SBInstaller {
             SBDiagLog.log("签名修复门：\(record.bundleID) 上次启动死在注入件签名（SBGuestHooks.dylib），先修注入件")
             if SBCertificate.hasCertificate {
                 guard await SBCertificate.ensureHooksDylibSigned() else {
-                    throw SBError.signFailed(reason: "注入组件签名失败：无法用当前证书签名 SBGuestHooks.dylib，请重新导入证书后重试")
+                    throw SBError.signFailed(reason: SBCertificate.hooksSignFailureReason)
                 }
                 SBDiagLog.log("签名修复门：\(record.bundleID) 注入件已修好（内核验签通过）")
                 if detailValid {

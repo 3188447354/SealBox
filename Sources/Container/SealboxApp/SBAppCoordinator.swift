@@ -351,11 +351,14 @@ final class SBAppCoordinator: ObservableObject {
                     // 0.2.10 报错日志：注入件签名失败之前只弹弹窗；失败
                     // 的具体原因（无证书/件不在/重签失败）由
                     // performEnsureHooksDylibSigned 记行，这里记弹窗决定。
-                    SBDiagLog.log("启动失败：\(launchTarget.bundleID) 注入组件签名失败，弹启动失败（无法用当前证书签名 SBGuestHooks.dylib）")
+                    // 0.2.19：文案统一走 SBCertificate.hooksSignFailureReason——
+                    // 证书本身没问题（客应用用它签得好好的），不再让用户
+                    // 重导证书背锅；具体原因见启动日志。
+                    SBDiagLog.log("启动失败：\(launchTarget.bundleID) 注入组件签名失败，弹启动失败（\(SBCertificate.hooksSignFailureReason)）")
                     self.isLaunching = false
                     self.activeAlert = CoordinatorAlert(
                         title: "启动失败",
-                        message: "注入组件签名失败：无法用当前证书签名 SBGuestHooks.dylib，请重新导入证书后重试")
+                        message: SBCertificate.hooksSignFailureReason)
                 }
             }
         }
