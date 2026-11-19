@@ -85,7 +85,11 @@ struct VMRootView: View {
             if !didRouteLaunch {
                 didRouteLaunch = true
                 SBDiagLog.log("启动路由开始")
-                SBLaunchRouter.routeOnLaunchIfNeeded()
+                // 0.2.13：重启路需要异步修复时，修复完成后按收据弹错
+                //（同步路照常在 route 返回后弹，见下一行）。
+                SBLaunchRouter.routeOnLaunchIfNeeded {
+                    coordinator.showGuestFailedReceiptIfNeeded()
+                }
                 SBDiagLog.log("启动路由完成")
                 coordinator.showGuestFailedReceiptIfNeeded()
             }

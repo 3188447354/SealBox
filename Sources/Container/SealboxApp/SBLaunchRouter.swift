@@ -132,9 +132,120 @@ enum SBLaunchRouter {
         }
     }
 
+    /// 0.2.13：重启路消费收据前的完整签名逐项门。
+    /// 根因（0.2.12 真机实证，2026-11-19 11:59）：hdsh 在 09:52 的旧检查
+    /// 里全过（9492 页、CMS 在位、Team 一致），收据由 0.2.11 在 09:52 写下；
+    /// 0.2.12 重启后只走了 blockReceiptOnTeamMismatch（只比 Team，不验结构），
+    /// 新门没机会拦它，dlopen 照样报 code signature invalid（errno=85，
+    /// codeBlobOffset=0x02513CE0）。点图标门（ensureLaunchableSignature，
+    /// 全逐项 + 强制重签）只在点图标时跑；重启路是另一套逻辑。
+    /// 收据本身没有门版本字段（ObjC 写 JSON，Swift 只读），旧版本收据无法
+    /// 区分——所以重启路对所有收据一律视为未验签，无条件重跑逐项。
+    /// 快查同步跑（逐项解析是纯计算）；需要修时不阻塞启动主线程，返回
+    /// needsRepair，由 routeOnLaunchIfNeeded 走异步修复 + 加载。
+    private enum ReceiptSignatureGate {
+        /// 逐项全过且上次不是签名失败且 LC_ID_DYLIB 在：直接走 dlopen
+        ///（今天的行为，不变）。
+        case proceed
+        /// 逐项有坏项、或上次死在 dlopen 签名失败、或缺 LC_ID_DYLIB：
+        /// 异步强制重打补丁 + 重签。
+        case needsRepair
+    }
+
+    private static func receiptSignatureGate() -> ReceiptSignatureGate {
+        guard let receipt = SBStore.shared.launchReceipt,
+              receipt.stage == "restart-requested"
+                || receipt.stage == "restart-confirmed" else { return .proceed }
+        let record = SBStore.shared.installedApps.first {
+            $0.bundleID == receipt.guestBundleID
+            && $0.diskDirectoryName == receipt.diskDirectoryName
+        } ?? SBStore.shared.app(with: receipt.guestBundleID)
+        guard let record = record else { return .proceed }
+        let executablePath = record.executableURL.path
+        guard FileManager.default.fileExists(atPath: executablePath) else { return .proceed }
+        // 先记一行逐项——重启路以前连这行都没有，坏签是放行还是根本没验，
+        // 看日志分不出来（0.2.12 的 hdsh 就是例子）。
+        let detail = SBCodesignCheck.signatureDetail(atPath: executablePath)
+        SBDiagLog.log("启动路由验签：\(record.bundleID) \(executablePath) \(SBInstaller.signatureDetailFields(detail: detail))")
+        // 未签名记录：只记不拦（与点图标门一致——二进制可能无签名走 JIT；
+        // 拦的活由 Team 门做，blockReceiptOnTeamMismatch 已跑过）。
+        guard record.signed else { return .proceed }
+        let detailValid = (detail["valid"] as? NSNumber)?.boolValue ?? false
+        // 与 ensureLaunchableSignature 同款判断：上次启动是不是死在 dlopen
+        // 签名失败（记录里的上次结果由启动路由在加载失败时写回）。
+        let lastLaunchSigFailed = record.lastLaunchResult?.success == false
+            && (record.lastLaunchResult?.message.contains("code signature invalid") ?? false)
+        let missingIDDylib = SBMachOHasIDDylib(executablePath) == 0
+        if detailValid && !lastLaunchSigFailed && !missingIDDylib {
+            return .proceed
+        }
+        return .needsRepair
+    }
+
+    /// 0.2.13：重启路的异步修复 + 加载。重打补丁 + 重签是秒级重活
+    ///（ZSign 全包重签），不能阻塞启动主线程（看门狗 20 秒）；修完回主
+    /// 线程加载客 App（客 main 是 UIKit，必须主线程）。修不好时写
+    /// guest-failed 收据、记上次启动结果，onRepairSettled 回主线程让调用
+    /// 方按收据弹错——不许静默失败。
+    private static func repairAndLaunchGuest(onRepairSettled: (@MainActor @Sendable () -> Void)?) {
+        Task {
+            guard let receipt = SBStore.shared.launchReceipt else { return }
+            let record = SBStore.shared.installedApps.first {
+                $0.bundleID == receipt.guestBundleID
+                && $0.diskDirectoryName == receipt.diskDirectoryName
+            } ?? SBStore.shared.app(with: receipt.guestBundleID)
+            guard let record = record else { return }
+            let bundleID = record.bundleID
+            do {
+                SBDiagLog.log("启动路由：\(bundleID) 重启路签名逐项不合格或上次死在 dlopen 签名失败，异步强制重打补丁+重签")
+                _ = try await SBInstaller.ensureLaunchableSignature(record)
+                SBDiagLog.log("启动路由：\(bundleID) 重启路重签完成，开始加载客 App")
+                let loaded = await MainActor.run {
+                    SBGuestLoader.shared().launchGuestIfRequested()
+                }
+                await MainActor.run {
+                    if !loaded {
+                        // 客加载失败：SBGuestLoader 已写收据（guest-failed）；
+                        // 清掉选中标记，回桌面。
+                        if let failedReceipt = SBStore.shared.launchReceipt,
+                           failedReceipt.stage == "guest-failed" {
+                            SBStore.shared.recordLaunchResult(
+                                bundleID: failedReceipt.guestBundleID, success: false,
+                                message: failedReceipt.stageDetail ?? "客 App 加载失败")
+                        }
+                        SBStore.shared.clearGuestSelection()
+                    }
+                    onRepairSettled?()
+                }
+            } catch {
+                // 修不好：ensureLaunchableSignature 的错误文案已写明 exact
+                // 坏项——写 guest-failed 收据、记失败，绝不走到 dlopen。
+                let message = error.localizedDescription
+                await MainActor.run {
+                    SBDiagLog.log("启动路由：\(bundleID) 重启路重签失败（[code=\(SBInstaller.errorCode(of: error))] \(message)），不加载")
+                    var failed = SBStore.shared.launchReceipt ?? SBLaunchReceipt.requested(
+                        guestBundleID: bundleID,
+                        containerUUID: record.containerUUID,
+                        diskDirectoryName: record.diskDirectoryName,
+                        keychainGroup: record.keychainGroup)
+                    failed.stage = "guest-failed"
+                    failed.stageDetail = message
+                    SBStore.shared.launchReceipt = failed
+                    SBStore.shared.recordLaunchResult(
+                        bundleID: bundleID, success: false, message: message)
+                    SBStore.shared.clearGuestSelection()
+                    onRepairSettled?()
+                }
+            }
+        }
+    }
+
     /// App 启动时调用一次。若本次是“重起进客 App”，尝试加载客 App；
     /// 加载失败时清掉选中标记、留收据，回桌面弹错（由桌面在 appear 时按收据弹）。
-    static func routeOnLaunchIfNeeded() {
+    /// - Parameter onRepairSettled: 0.2.13：重启路需要异步修复时（签名逐项不
+    ///   合格），修复完成后回主线程调一次——调用方借此按收据弹错；同步路
+    ///   （直接加载或 Team 门拦截）不调它，调用方照常在 route 返回后弹错。
+    static func routeOnLaunchIfNeeded(onRepairSettled: (@MainActor @Sendable () -> Void)? = nil) {
         ensureGuestHooksDylib()
         reconcileInstalledAppsWithDisk()
         clearStaleReceiptIfPackageMissing()
@@ -165,6 +276,15 @@ enum SBLaunchRouter {
                     bundleID: receipt.guestBundleID, success: false,
                     message: receipt.stageDetail ?? "系统没有重启应用，请重试")
             }
+            return
+        }
+        // 0.2.13：重启路的签名逐项门（见 receiptSignatureGate）。快查同步；
+        // 需要修时走异步修复 + 加载，不阻塞启动主线程。
+        switch receiptSignatureGate() {
+        case .proceed:
+            break
+        case .needsRepair:
+            repairAndLaunchGuest(onRepairSettled: onRepairSettled)
             return
         }
         let loaded = SBGuestLoader.shared().launchGuestIfRequested()
