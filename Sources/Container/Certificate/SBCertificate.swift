@@ -38,7 +38,7 @@ public enum SBCertificate {
 
     /// 0.2.19：注入件签名失败的统一文案。证书本身没问题（客应用用它
     /// 签得好好的，CyPwn/Asspp 逐项全过），不再让用户重导证书背锅。
-    static let hooksSignFailureReason = "注入组件签名失败：已用当前证书重签，内核仍不通过（证书本身没问题，详见启动日志）"
+    static let hooksSignFailureReason = "注入组件签名失败：已用当前证书重签，仍未能通过签名检查（证书本身没问题，详见启动日志）"
 
     /// 本进程内是否见过有效证书（供 checkStillExists 判断“证书丢了”用）。
     /// 跨进程靠“密码还在、文件没了”判断，不依赖本标记。
@@ -439,6 +439,17 @@ public enum SBCertificate {
         let fileSHA = sha256Hex(data)
         let fingerprint = leafFingerprint(data: data, password: password)
         SBDiagLog.log("注入件签名检查：证书文件SHA=\(fileSHA.prefix(12)) 叶子指纹=\(fingerprint?.prefix(12) ?? "算不出") Team=\(certTeamID)")
+        // 0.2.21：App Group 套件名诊断（只记现场，不改行为）。SBConstants
+        // appGroupSuiteName 由 Bundle.main.bundleIdentifier 推——真机上它是带
+        // Team 后缀的 com.mjorb.sealbox.3432ZHJUF9，推出 group.com.mjorb.
+        // sealbox.3432ZHJUF9，与 Release entitlements 的 group.com.mjorb.
+        // sealbox 对不上。UserDefaults(suiteName:) 对未授权组名是否返回 nil、
+        // SBStore 是否因此回落到 .standard（记录不随重装存活），本版不猜：
+        // 记下套件名与共享区/组容器是否可用，下一份日志定夺后再决定改不改。
+        let suiteName = SBConstants.appGroupSuiteName
+        let suiteOK = UserDefaults(suiteName: suiteName) != nil
+        let groupContainerOK = SBConstants.appGroupContainerURL != nil
+        SBDiagLog.log("注入件签名检查：App Group 套件名=\(suiteName) 共享区=\(suiteOK ? "可用" : "不可用") 组容器=\(groupContainerOK ? "可用" : "不可用")")
         if let pinned = sharedDefaults?.string(forKey: certificateFingerprintKey),
            let fingerprint,
            pinned != fingerprint {
@@ -452,62 +463,133 @@ public enum SBCertificate {
             SBDiagLog.log("注入件签名检查失败：注入件不在磁盘 \(tweaksURL.path)")
             return false
         }
-        // 0.2.18：Team 只证明签名里写的是当前 Team，不证明内核接受它。
-        // 0.2.17 真机（Asspp，2026-11-19 18:06:41）：Tweaks 件带当前
-        // Team，dlopen 仍被内核以 code signature invalid（errno=1）
-        // 拒绝——件上是宿主重签时 Seal（CodeSignKit）写的签名，不是我们
-        // ZSign 的（超块 5328 字节与 ZSign 的 6660 对不上，见 build log
-        // 0.2.18 节指纹算术）。所以先问内核（SBLCCheckCodeSignature，
-        // F_ADDFILESIGS_RETURN + F_CHECK_LV，与 dlopen 时 dyld 的那道
-        // 检查相同；只读，不改文件），内核说有效且 Team 一致才放行；
-        // 否则用当前证书（与客应用同一把）经 ZSign 重签，再问一次内核。
-        // 重签后必须内核验签通过才算数——Team 对上不等于内核接受。
-        // 0.2.20：首查用带失败现场的诊断版门——死在哪一步、errno、内核原话
-        // 都记下来（0.2.19 只说“仍不通过”，分不清是哪一步死的）。
+        // 0.2.21：注入件的放行判据改回静态验签＋Team，内核门只记诊断、不再拦启动。
+        // 证据：0.2.20 真机（22:46:02）门在 F_ADDFILESIGS_RETURN 死 errno=1
+        // （EPERM），0.2.19 同样；三个签名（Seal/CodeSignKit、ZSign 单后缀、
+        // ZSign 双后缀）全被它拒，门自检宿主与客主程序都过。XNU 原文
+        // （kern_descrip.c:4068-4094、ubc_subr.c:6577-7163）证明 EPERM 只能是
+        // mac_vnode_check_signature 的 AMFI 策略拒绝——不是 blob 畸形（那会是
+        // EBADEXEC）、不是 vnode 缓存（已有 blob 静默复用）、不是重叠
+        // （EALREADY）。门再拦，启动永远到不了 dlopen，ZSign 签的件能不能
+        // 加载永远测不到；LC 对 dylib 也只拿门做参考
+        // （LCUtilsExtensions.swift:57 决定要不要重签，不拦加载）。
+        // 静态逐项（CMS 链、页哈希、特殊槽）＋Team 已全过，放行后真正的加载
+        // 验证交给实际 dlopen（失败时 errno 进启动日志）。门的结果仍每次都记；
+        // 门不通过时再跑两组对照（同件放 tmp / 带客 entitlements 的同件），
+        // 下一份日志直接分出是路径、entitlements 还是件本身。
+        let hooksBundleID = Bundle.main.bundleIdentifier ?? "com.mjorb.sealbox"
         let firstGate = kernelGateDetail(path: tweaksURL.path)
-        if firstGate.passed,
-           teamIDOfSignedMachO(at: tweaksURL) == certTeamID {
-            SBDiagLog.log("注入件签名检查：内核验签通过 Team=\(certTeamID)（\(tweaksURL.path)，未重签）")
+        if hooksStaticValid(at: tweaksURL, teamID: certTeamID) {
+            if firstGate.passed {
+                SBDiagLog.log("注入件签名检查：内核验签通过 Team=\(certTeamID)（\(tweaksURL.path)，未重签）")
+            } else {
+                SBDiagLog.log("注入件签名检查：静态验签通过 Team=\(certTeamID) 放行（内核门诊断：\(firstGate.scene)，不拦启动）")
+                await logHooksGateDiscriminators(
+                    tweaksURL: tweaksURL, bundleID: hooksBundleID,
+                    certData: data, password: password, teamID: certTeamID)
+            }
             return true
         }
-        SBDiagLog.log("注入件签名检查：内核验签不通过或 Team 不一致，用当前证书重签注入件（Team=\(certTeamID)）\(firstGate.scene)")
-        // 0.2.20：注入件 identifier 必须带 Team 后缀（与客主程序同款：
-        // 宿主 Bundle ID + "." + Team）。件用纯宿主 Bundle ID
-        //（com.mjorb.sealbox）时逐项全过、内核门照样拒绝；客主程序
-        //（com.mjorb.sealbox.3432ZHJUF9）同证书同签名器同空 entitlements
-        // 能过。差异项逐项排除见 build log 0.2.20 节：LC_MAIN（LC 的注入
-        // 件也没有）、安装名（与 LC 同款 @rpath/）、execSegLimit 与超块
-        // 大小（随文件大小走）都已排除，只剩 identifier；原型
-        // hooks_identifier_prototype_0220.py 28/28：只改这一处，超块
-        // +30 字节、内部偏移自洽、DR 解码一致。不要用纯 Bundle ID，
-        // 也不要另起新名——与客同款。
-        let hooksBundleID = (Bundle.main.bundleIdentifier ?? "com.mjorb.sealbox") + "." + certTeamID
+        SBDiagLog.log("注入件签名检查：静态验签不通过或 Team 不一致，用当前证书重签注入件（bundleID=\(hooksBundleID) Team=\(certTeamID)）\(firstGate.scene)")
+        // 0.2.21：直接传宿主 Bundle ID 原值。0.2.20 在它后面又拼了一次
+        // ".Team"，写成双后缀 com.mjorb.sealbox.3432ZHJUF9.3432ZHJUF9——
+        // 真机上 Bundle.main.bundleIdentifier 本身就是带后缀的
+        // com.mjorb.sealbox.3432ZHJUF9（客主程序 identifier 为证，ZSign 原样
+        // 写传入值）。原型 hooks_gate_prototype_0221.py 32/32：新构造恰好
+        // 一遍后缀、与客同款、超块 6694 < 0x5000、DR 解码一致。
         let signed = await resignHooksDylibOnFreshCopy(
             tweaksURL: tweaksURL, bundleID: hooksBundleID, certData: data, password: password)
         guard signed else {
             return false
         }
         let afterGate = kernelGateDetail(path: tweaksURL.path)
-        guard afterGate.passed else {
-            // 0.2.19：重签后仍不通过时记重签后件的完整逐项 + 内核门自检。
-            // 宿主主程序正在运行，其签名内核必认；门若说宿主不通过，门
-            // 本身就是坏的（0.2.18 任务第 2 条：门从未在已知好件上证实过）。
-            // 重签后件的逐项与客主程序（能过的那个）逐项比，找“同证书同
-            // 签名器同空 entitlements，客过、件不过”的差别。
-            // 0.2.20：再加失败现场（步骤/errno/内核原话）——三者齐全，
-            // 下一份日志直接定夺，不用再猜。
-            let detail = SBCodesignCheck.signatureDetail(atPath: tweaksURL.path)
-            let hostSelfCheck = Bundle.main.executableURL.map { SBLCCheckCodeSignature($0.path) != 0 } ?? false
-            SBDiagLog.log("注入件签名检查失败：重签后内核验签仍不通过 \(tweaksURL.path) 证书 Team=\(certTeamID) \(afterGate.scene) 重签后件：\(SBInstaller.signatureDetailFields(detail: detail)) 内核门自检宿主主程序=\(hostSelfCheck ? "通过" : "不通过")")
-            return false
+        if hooksStaticValid(at: tweaksURL, teamID: certTeamID) {
+            if afterGate.passed {
+                SBDiagLog.log("注入件签名检查：重签后内核验签通过 Team=\(certTeamID)（\(tweaksURL.path)）")
+            } else {
+                SBDiagLog.log("注入件签名检查：重签后静态验签通过 Team=\(certTeamID) 放行（内核门诊断：\(afterGate.scene)，不拦启动）")
+                await logHooksGateDiscriminators(
+                    tweaksURL: tweaksURL, bundleID: hooksBundleID,
+                    certData: data, password: password, teamID: certTeamID)
+            }
+            return true
         }
-        let afterTeam = teamIDOfSignedMachO(at: tweaksURL)
-        if afterTeam != certTeamID {
-            SBDiagLog.log("注入件签名检查失败：重签后 Team 仍不一致 \(tweaksURL.path) 注入件 Team=\(afterTeam ?? "无") 证书 Team=\(certTeamID)")
-        } else {
-            SBDiagLog.log("注入件签名检查：重签后内核验签通过 Team=\(certTeamID)（\(tweaksURL.path)）")
+        // 静态仍不通过：记重签后件的完整逐项 + 内核门自检 + 门现场。
+        // 0.2.19：重签后仍不通过时记重签后件的完整逐项 + 内核门自检。
+        // 宿主主程序正在运行，其签名内核必认；门若说宿主不通过，门
+        // 本身就是坏的（0.2.18 任务第 2 条：门从未在已知好件上证实过）。
+        // 重签后件的逐项与客主程序（能过的那个）逐项比，找“同证书同
+        // 签名器同空 entitlements，客过、件不过”的差别。
+        // 0.2.20：再加失败现场（步骤/errno/内核原话）——三者齐全，
+        // 下一份日志直接定夺，不用再猜。
+        let detail = SBCodesignCheck.signatureDetail(atPath: tweaksURL.path)
+        let hostSelfCheck = Bundle.main.executableURL.map { SBLCCheckCodeSignature($0.path) != 0 } ?? false
+        SBDiagLog.log("注入件签名检查失败：重签后静态验签仍不通过 \(tweaksURL.path) 证书 Team=\(certTeamID) \(afterGate.scene) 重签后件：\(SBInstaller.signatureDetailFields(detail: detail)) 内核门自检宿主主程序=\(hostSelfCheck ? "通过" : "不通过")")
+        return false
+    }
+
+    /// 0.2.21：注入件静态验签＋Team（放行判据）。逐项 valid=YES 且 Team 与当前
+    /// 证书一致即放行；内核门的结果只记诊断。SBCodesignCheck 的 valid 覆盖
+    /// CMS 链、页哈希、特殊槽、备用 CD、execSeg 相容性（LC_MAIN 不进公式）。
+    private static func hooksStaticValid(at url: URL, teamID: String) -> Bool {
+        let detail = SBCodesignCheck.signatureDetail(atPath: url.path)
+        let valid = (detail["valid"] as? NSNumber)?.boolValue ?? false
+        return valid && teamIDOfSignedMachO(at: url) == teamID
+    }
+
+    /// 0.2.21：门对照诊断（只在内核门对 Tweaks 件不通过时跑，诊断用、不拦启动）：
+    /// (a) 同件拷到宿主 tmp/ 再过门——分路径（Tweaks vs tmp）；
+    /// (b) 同件带客最小 entitlements（application-identifier / team-identifier /
+    /// get-task-allow=false / keychain-access-groups）重签一份放 tmp/ 再过门——
+    /// 分 entitlements（件是空的、客有 entitlements）。
+    /// 两份临时件用后即删；任一步失败只记一行，不抛错、不影响放行判定。
+    private static func logHooksGateDiscriminators(
+        tweaksURL: URL, bundleID: String, certData: Data, password: String, teamID: String
+    ) async {
+        let fileManager = FileManager.default
+        let tmpDir = fileManager.temporaryDirectory
+        // (a) 同件放 tmp/
+        let tmpCopyURL = tmpDir.appendingPathComponent("SBHooksGate-\(UUID().uuidString).dylib")
+        do {
+            try fileManager.copyItem(at: tweaksURL, to: tmpCopyURL)
+            let gate = kernelGateDetail(path: tmpCopyURL.path)
+            SBDiagLog.log("门对照：同件放 tmp/ \(gate.passed ? "通过" : gate.scene)")
+        } catch {
+            SBDiagLog.log("门对照：同件放 tmp/ 未能拷贝 \(error.localizedDescription)")
         }
-        return afterTeam == certTeamID
+        try? fileManager.removeItem(at: tmpCopyURL)
+        // (b) 带客 entitlements 的同件放 tmp/
+        let entCopyURL = tmpDir.appendingPathComponent("SBHooksGateEnt-\(UUID().uuidString).dylib")
+        do {
+            try fileManager.copyItem(at: tweaksURL, to: entCopyURL)
+            if let entitlements = SBGuestEntitlementsMinimalForTeam(teamID, bundleID) {
+                let signed = await signMachOWithEntitlements(
+                    at: entCopyURL.path, bundleID: bundleID,
+                    certData: certData, password: password, entitlementXML: entitlements)
+                if signed {
+                    let gate = kernelGateDetail(path: entCopyURL.path)
+                    SBDiagLog.log("门对照：带客 entitlements 的同件放 tmp/ \(gate.passed ? "通过" : gate.scene)")
+                } else {
+                    SBDiagLog.log("门对照：带客 entitlements 的同件 重签失败")
+                }
+            } else {
+                SBDiagLog.log("门对照：带客 entitlements 的同件 未能生成 entitlements")
+            }
+        } catch {
+            SBDiagLog.log("门对照：带客 entitlements 的同件 未能拷贝 \(error.localizedDescription)")
+        }
+        try? fileManager.removeItem(at: entCopyURL)
+    }
+
+    /// 用给定 entitlements 签单个 Mach-O（SBSigner 转发 ZSign 的 entitlementXML 变体）。
+    private static func signMachOWithEntitlements(
+        at path: String, bundleID: String, certData: Data, password: String, entitlementXML: String
+    ) async -> Bool {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+            SBSigner.signMachO(atPath: path, bundleID: bundleID, certData: certData, password: password, entitlementXML: entitlementXML) { success, _ in
+                continuation.resume(returning: success)
+            }
+        }
     }
 
     /// 内核门诊断结果（0.2.20）：失败现场三件套——步骤、errno、内核原话。

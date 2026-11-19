@@ -211,18 +211,25 @@ public enum SBInstaller {
             let containerUUID = existing?.containerUUID ?? UUID().uuidString
             createdContainerUUID = existing == nil ? containerUUID : nil
             let containerDir = dataDir.appendingPathComponent(containerUUID, isDirectory: true)
-            try fileManager.createDirectory(
-                at: containerDir.appendingPathComponent("Documents", isDirectory: true),
-                withIntermediateDirectories: true
-            )
-            try fileManager.createDirectory(
-                at: containerDir.appendingPathComponent("Library/Caches", isDirectory: true),
-                withIntermediateDirectories: true
-            )
-            try fileManager.createDirectory(
-                at: containerDir.appendingPathComponent("tmp", isDirectory: true),
-                withIntermediateDirectories: true
-            )
+            // 0.2.21：0.2.20 真机（Asspp，22:46:21.820）安装死在第三处：
+            // "The file "tmp" couldn't be saved in the folder "4A8EB5AF-…""
+            // ——NSCocoaErrorDomain 516（文件已存在）：containerDir/tmp 路径上
+            // 已存在一个同名文件。verify 之后到 return 之间唯一的非 try? try
+            // 调用就是这三处 createDirectory，前两处同父目录已成功，父目录
+            // 不可能缺失；只能是目标路径上已有文件。谁写的文件未查到（全仓
+            // 没有任何代码往客容器写名为 "tmp" 的文件）：先记现场（容器是否
+            // 复用、目标路径上是文件），再容错（是文件就移走再建）。
+            SBDiagLog.log("安装容器：\(parsed.bundleID) 容器UUID=\(containerUUID) 复用旧容器=\(existing != nil)")
+            for relativePath in ["Documents", "Library/Caches", "tmp"] {
+                let target = containerDir.appendingPathComponent(relativePath, isDirectory: true)
+                var isDirectory: ObjCBool = false
+                if fileManager.fileExists(atPath: target.path, isDirectory: &isDirectory),
+                   !isDirectory.boolValue {
+                    SBDiagLog.log("安装容器：\(parsed.bundleID) \(relativePath) 路径上已有文件，先移走再建目录")
+                    try fileManager.removeItem(at: target)
+                }
+                try fileManager.createDirectory(at: target, withIntermediateDirectories: true)
+            }
 
             let keychainGroup = existing?.keychainGroup ?? allocateKeychainGroup()
 
