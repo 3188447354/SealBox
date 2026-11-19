@@ -103,16 +103,15 @@ static BOOL SBCDExecSegOK(const SBCodeDirectoryInfo *cd, uint32_t fileType) {
     return (cd->execSegFlags & 0x1) == 0; // CS_EXECSEG_MAIN_BINARY
 }
 
-/// 0.2.16：dylib/bundle 带 LC_MAIN 即不相容——LC_MAIN 是主程序入口命令，
-/// dyld 加载 dylib 时不认（0.2.15 真机：execSeg 修好后 dlopen 仍报
-/// code signature invalid，errno 从 85 变成 1；同一份日志里客 dylib
-/// 带 LC_MAIN=在，宿主自带 dylib 都没有 LC_MAIN 且能正常加载）。
-/// 主程序带 LC_MAIN 是对的。
+/// 0.2.17：LC_MAIN 不再是不合格项——LiveContainer 的打补丁器保留 LC_MAIN
+/// （LC 自己的客 dylib 都带 LC_MAIN），0.2.16“dylib 带 LC_MAIN 即无法
+/// 加载”的理论已被 0.2.16 真机日志证伪（LC_MAIN=无、逐项全过，dlopen
+/// 照样 errno=1）。本函数恒返回 YES（保留签名供诊断串显示 LC_MAIN 在/无，
+/// 但不再影响 valid 公式与修复门）。
 static BOOL SBLCMainOK(uint32_t fileType, BOOL hasLCMain) {
-    if (fileType == MH_EXECUTE) {
-        return YES;
-    }
-    return !hasLCMain;
+    (void)fileType;
+    (void)hasLCMain;
+    return YES;
 }
 
 /// 一次签名解析的全部结果：主 CD + 备用 CD + CMS 槽 + superblob 索引。
@@ -1638,13 +1637,6 @@ static void SBInspectCMS(const uint8_t *sig, uint32_t sigSize,
         }
         return NO;
     }
-    // 0.2.16：dylib 带 LC_MAIN 时 dyld 无法以 dylib 方式加载（见 SBLCMainOK）。
-    if (!SBLCMainOK(machoInfo.fileType, machoInfo.hasLCMain)) {
-        if (error) {
-            *error = SBCodeSignError(@"签名校验失败：dylib 带有 LC_MAIN（主程序入口命令），dyld 无法以 dylib 方式加载，须重打补丁去掉 LC_MAIN");
-        }
-        return NO;
-    }
     return YES;
 }
 
@@ -1688,7 +1680,7 @@ static void SBInspectCMS(const uint8_t *sig, uint32_t sigSize,
     detail[@"fileType"] = @0;
     detail[@"cryptid"] = @0;
     detail[@"hasLCMain"] = @NO;
-    detail[@"lcMainOK"] = @NO; // 0.2.16：dylib 带 LC_MAIN 即不合格
+    detail[@"lcMainOK"] = @NO; // 0.2.17：LC_MAIN 不再是不合格项；缺省 NO 只表示结构解析失败、未验出好结果。
     detail[@"idDylibName"] = [NSNull null];
     // 0.2.14 新增字段（缺省 = 未验出好结果，调用方按“坏”处理）。
     detail[@"cmsSignatureValid"] = @NO;
@@ -1747,13 +1739,10 @@ static void SBInspectCMS(const uint8_t *sig, uint32_t sigSize,
     if (!cdExecSegOK && detail[@"error"] == [NSNull null]) {
         detail[@"error"] = @"CodeDirectory 声明自己是主程序（execSegFlags 含 MAIN_BINARY），但文件不是主可执行文件，内核不认这种签名";
     }
-    // 0.2.16：dylib 带 LC_MAIN 即不合格（见 SBLCMainOK）。不相容时 valid=NO，
-    // 修复门按逐项不合格走强制重打补丁+重签（新打补丁器去掉 LC_MAIN）。
+    // 0.2.17：LC_MAIN 不再是不合格项（见 SBLCMainOK）。字段仍写进 detail
+    // 供诊断串显示，不再设 error、不再进 valid 公式。
     BOOL lcMainOK = SBLCMainOK(machoInfo.fileType, machoInfo.hasLCMain);
     detail[@"lcMainOK"] = @(lcMainOK);
-    if (!lcMainOK && detail[@"error"] == [NSNull null]) {
-        detail[@"error"] = @"dylib 带有 LC_MAIN（主程序入口命令），dyld 无法以 dylib 方式加载";
-    }
     // 0.2.14：LC 一致性——检查器与 dyld 都读 LC_CODE_SIGNATURE（见
     // SBFindSignature），没有“第二份读法”可核对；能核对的是 LC 给出的
     // 范围与 superblob 自身长度、CMS 槽是否落在 superblob 内。注意
@@ -1900,8 +1889,8 @@ static void SBInspectCMS(const uint8_t *sig, uint32_t sigSize,
         && cms.error[0] == '\0';
     // 0.2.15：valid 再加 CD execSeg 相容性（非签名项，是 CD 可用性：
     // dylib 的 CD 带 MAIN_BINARY 时签名逐项全过、内核照样拒收）。
-    // 0.2.16：valid 再加 LC_MAIN 相容性（dylib 带 LC_MAIN 时 dyld 无法加载）。
-    if (identifier.length > 0 && pagesOK && altOK && specialOK && cmsOK && lcOK && cdExecSegOK && lcMainOK) {
+    // 0.2.17：LC_MAIN 不再进 valid 公式（见 SBLCMainOK）。
+    if (identifier.length > 0 && pagesOK && altOK && specialOK && cmsOK && lcOK && cdExecSegOK) {
         detail[@"valid"] = @YES;
     }
     return detail;

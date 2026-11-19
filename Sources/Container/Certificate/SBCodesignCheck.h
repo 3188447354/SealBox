@@ -76,8 +76,8 @@ NS_ASSUME_NONNULL_BEGIN
 ///   cryptid（NSNumber，0.2.15：LC_ENCRYPTION_INFO 的 cryptid，0=未加密）
 ///   hasLCMain（BOOL，0.2.15）、idDylibName（NSString/NSNull，0.2.15：
 ///     LC_ID_DYLIB 的 install name）
-///   lcMainOK（BOOL，0.2.16：LC_MAIN 与文件类型是否相容——dylib/bundle
-///     带 LC_MAIN 即 NO，主程序带是 YES）
+///   lcMainOK（BOOL，0.2.17：恒 YES——LC_MAIN 不再是不合格项，见
+///     SBLCMainOK；字段保留供诊断串显示 LC_MAIN 在/无）
 ///   hasAltCD（BOOL）、altPageHashOK（BOOL，无备用 CD 时记 YES）
 ///   altFirstBadPage（NSNumber/NSNull）
 ///   specialSlotsOK（BOOL）、badSpecialSlot（NSNumber/NSNull，槽号）

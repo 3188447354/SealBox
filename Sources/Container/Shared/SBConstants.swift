@@ -41,7 +41,10 @@ enum SBConstants {
 
     /// Mach-O 补丁版本号；低于它的客 App 启动前重打补丁。
     /// 0.2.5：LC_ID_DYLIB、dylib 去重、entitlements、段数 mismatch 改为标记。
-    static let patchRevision = 2
+    /// 0.2.17：打补丁器与重签流程改用 LiveContainer 原样方法（LC 的
+    /// LCPatchExecSlice + 宿主 Bundle ID 全包重签 + 内核验签门），已装的
+    /// 旧包下次点图标/重启自动重打补丁+重签。
+    static let patchRevision = 3
 
     /// 钥匙串半隔离组数（与 entitlements.xml 的 128 组一致）。
     static let keychainGroupCount = 128
