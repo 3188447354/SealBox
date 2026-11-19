@@ -357,8 +357,13 @@ public enum SBCertificate {
     /// Tweaks 里的件（SBSigner.adhocSignMachOAtPath 零调用），所以客 App 在新进程
     /// 里加载注入件时会被拒，与自测 dlopen 报的错是同一个根。
     ///
-    /// 做法：先把包内件同步到 Tweaks，再比对 Team，不一致就用当前证书重签一次；
-    /// 签完再读一次 Team，确认一致才返回 true。并发调用会合并成一次签名
+    /// 做法：先把包内件同步到 Tweaks，再问内核（F_CHECK_LV，与 dlopen
+    /// 时 dyld 的那道检查相同）+ 比对 Team：内核说有效且 Team 一致才
+    /// 放行；否则用当前证书重签一次（与客应用同一把证书、同一 ZSign），
+    /// 签完再问一次内核 + 读一次 Team，两个都过才返回 true。
+    /// 0.2.18：之前只比 Team——0.2.17 真机（Asspp）证明 Team 对上也
+    /// 可能被内核拒绝（件上是 Seal/CodeSignKit 的签名），只比 Team
+    /// 等于没验。并发调用会合并成一次签名
     /// （HooksSignGate），不让两个 ZSign 同时写同一文件。
     /// - Returns: true = 已确认同 Team；false = 无证书、文件缺失、取不到 Team
     ///   或签名失败。调用方按失败处理：启动门直接拦、自测直接报红；首启后台
@@ -409,18 +414,36 @@ public enum SBCertificate {
             SBDiagLog.log("注入件签名检查失败：注入件不在磁盘 \(tweaksURL.path)")
             return false
         }
-        if teamIDOfSignedMachO(at: tweaksURL) == certTeamID {
+        // 0.2.18：Team 只证明签名里写的是当前 Team，不证明内核接受它。
+        // 0.2.17 真机（Asspp，2026-11-19 18:06:41）：Tweaks 件带当前
+        // Team，dlopen 仍被内核以 code signature invalid（errno=1）
+        // 拒绝——件上是宿主重签时 Seal（CodeSignKit）写的签名，不是我们
+        // ZSign 的（超块 5328 字节与 ZSign 的 6660 对不上，见 build log
+        // 0.2.18 节指纹算术）。所以先问内核（SBLCCheckCodeSignature，
+        // F_ADDFILESIGS_RETURN + F_CHECK_LV，与 dlopen 时 dyld 的那道
+        // 检查相同；只读，不改文件），内核说有效且 Team 一致才放行；
+        // 否则用当前证书（与客应用同一把）经 ZSign 重签，再问一次内核。
+        // 重签后必须内核验签通过才算数——Team 对上不等于内核接受。
+        if SBLCCheckCodeSignature(tweaksURL.path) != 0,
+           teamIDOfSignedMachO(at: tweaksURL) == certTeamID {
+            SBDiagLog.log("注入件签名检查：内核验签通过 Team=\(certTeamID)（\(tweaksURL.path)，未重签）")
             return true
         }
-        // Team 不一致（或无签名）：用当前证书重签，再读一次 Team 确认。
+        SBDiagLog.log("注入件签名检查：内核验签不通过或 Team 不一致，用当前证书重签注入件（Team=\(certTeamID)）")
         let signed = await signMachO(at: tweaksURL.path, bundleID: "com.mjorb.sealbox", certData: data, password: password)
         guard signed else {
             SBDiagLog.log("注入件签名检查失败：重签失败 \(tweaksURL.path) 证书 Team=\(certTeamID)")
             return false
         }
+        guard SBLCCheckCodeSignature(tweaksURL.path) != 0 else {
+            SBDiagLog.log("注入件签名检查失败：重签后内核验签仍不通过 \(tweaksURL.path) 证书 Team=\(certTeamID)")
+            return false
+        }
         let afterTeam = teamIDOfSignedMachO(at: tweaksURL)
         if afterTeam != certTeamID {
             SBDiagLog.log("注入件签名检查失败：重签后 Team 仍不一致 \(tweaksURL.path) 注入件 Team=\(afterTeam ?? "无") 证书 Team=\(certTeamID)")
+        } else {
+            SBDiagLog.log("注入件签名检查：重签后内核验签通过 Team=\(certTeamID)（\(tweaksURL.path)）")
         }
         return afterTeam == certTeamID
     }

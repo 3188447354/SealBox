@@ -745,6 +745,31 @@ public enum SBInstaller {
         let lastLaunchSigFailed = record.lastLaunchSigFailed
         SBDiagLog.log("签名修复门验签：\(record.bundleID) \(executablePath) \(signatureDetailFields(detail: gateDetail)) 上次签名失败标记=\(lastLaunchSigFailed ? "是" : "否")\(record.lastLaunchResult.map { "（\($0.message.prefix(80))）" } ?? "")")
         let detailValid = (gateDetail["valid"] as? NSNumber)?.boolValue ?? false
+        // 0.2.18：上次启动死在注入件签名上时，先修注入件，不白打客应用
+        // 的补丁。失败文案里带 SBGuestHooks.dylib 即上次 dlopen 死在注
+        // 入件（客主程序已过，dyld 加载注入件时被拒——0.2.17 真机 Asspp，
+        // 2026-11-19 18:06:41；18:13:59 修复门又只重打了客应用，白做工）。
+        // 注入件修好且客逐项也合格就直接返回；客逐项也坏才继续走下面
+        // 的客修复。无证书时修不了注入件，不抛注入件的错，落到下面
+        // 的客修复门按原逻辑处理（canRepair 会拦）。
+        let lastFailedOnHooks = lastLaunchSigFailed
+            && (record.lastLaunchResult?.message.contains("SBGuestHooks.dylib") ?? false)
+        if lastFailedOnHooks {
+            SBDiagLog.log("签名修复门：\(record.bundleID) 上次启动死在注入件签名（SBGuestHooks.dylib），先修注入件")
+            if SBCertificate.hasCertificate {
+                guard await SBCertificate.ensureHooksDylibSigned() else {
+                    throw SBError.signFailed(reason: "注入组件签名失败：无法用当前证书签名 SBGuestHooks.dylib，请重新导入证书后重试")
+                }
+                SBDiagLog.log("签名修复门：\(record.bundleID) 注入件已修好（内核验签通过）")
+                if detailValid {
+                    try verifyExecutableSignature(executablePath, bundleID: record.bundleID, checkTeam: true)
+                    return record
+                }
+                // 客逐项也坏：继续走下面的强制修复（客应用）。
+            } else {
+                SBDiagLog.log("签名修复门：\(record.bundleID) 上次死在注入件签名，但未导入证书，修不了注入件，走客应用修复门")
+            }
+        }
         if SBMachOHasIDDylib(executablePath) == 0 {
             // 0.2.11：无证书修不了，直接报缺 ID 的原因——不调 repatch，
             // 不然 repatch 的“没有导入证书”会盖掉真正的原因。
