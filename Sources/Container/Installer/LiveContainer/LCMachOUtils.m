@@ -14,7 +14,12 @@
 //      改为 "@loader_path/../../Tweaks/SBGuestHooks.dylib"（我们的客端 Hook
 //      件名；同一变量既用于匹配已注入的命令、也用于注入新命令，改一处即全通）。
 //   4. `#include "dyld_cache_format.h"` 保持原样；该头不在 LC 仓库里，
-//      同目录下有一份我们自己的最小兼容头（见 dyld_cache_format.h 注释）。
+//      由 litehook 自带的副本提供（litehook/external/include/
+//      dyld_cache_format.h，已在 HEADER_SEARCH_PATHS 里）。注意：不要在
+//      本仓库任何同步组里再放一个同名头——Xcode 的 header map 按 basename
+//      解析，第一轮 CI 红于此（见 build log 0.2.17）：我曾补过一份最小
+//      兼容头，litehook.c 的同名 include 被它截走，编译报
+//      struct dyld_cache_image_info 等类型不完整。
 // 注意：本文件不含 LiveContainer 的加载器挂钩（Tweaks/Dyld.m、LCBootstrap.m
 // 的 dlopen 绕过那几块未取，见 build log 0.2.17）；只取打补丁器与内核验签。
 
