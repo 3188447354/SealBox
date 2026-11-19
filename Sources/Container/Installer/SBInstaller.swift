@@ -482,7 +482,7 @@ public enum SBInstaller {
     /// 0.2.12：逐项字段扩到 CMS 全项（链、摘要、叶子到期、备用 CD、特殊槽）。
     /// 旧版只记“CMS 在位 + 页哈希”，KMusic 在 0.2.10/0.2.11 两份日志里
     /// 都没有任何逐项行——门是放行还是根本没验，无从判断。
-    static func signatureDetailFields(detail: NSDictionary) -> String {
+    static func signatureDetailFields(detail: [AnyHashable: Any]) -> String {
         let valid = (detail["valid"] as? NSNumber)?.boolValue ?? false
         let hasCMS = (detail["hasCMS"] as? NSNumber)?.boolValue ?? false
         let pageHashOK = (detail["pageHashOK"] as? NSNumber)?.boolValue ?? false
@@ -533,7 +533,7 @@ public enum SBInstaller {
     /// 抛错时点名——不许再只报一句“验签失败”就走到 dlopen 去撞墙。
     /// CMS 的具体坏因由 ObjC 的 cmsError 给（解析失败 / 链不完整都带原因），
     /// 这里不再另拼一个含糊的“链不完整”。
-    static func failingSignatureItems(detail: NSDictionary) -> [String] {
+    static func failingSignatureItems(detail: [AnyHashable: Any]) -> [String] {
         var items: [String] = []
         if (detail["valid"] as? NSNumber)?.boolValue ?? false {
             return items
