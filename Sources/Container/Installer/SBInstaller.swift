@@ -354,12 +354,15 @@ public enum SBInstaller {
         var segCountMismatch = record.segCountMismatch
         var signed = false
         var signingCertFingerprint: String? = nil
+        // 0.2.16：entryOffset 须在 do 块之前声明——记录在 do-catch 之后
+        // 重建，块内声明的变量到不了那里（同 segCountMismatch/signed 的
+        // 写法；第一轮 CI 红在 470 行找不到 repatchEntryOffset）。
+        var repatchEntryOffset: UInt64? = nil
         do {
             let hooksDylibPath = "@loader_path/../../Tweaks/\(SBConstants.guestHooksDylibName)"
             // 0.2.16：打补丁前先读 LC_MAIN 的 entryoff（同安装路径）。
             // 文件已是 0.2.16 打过的（LC_MAIN 已去掉）时读不到，用旧记录
             // 里存的值，不丢入口。
-            var repatchEntryOffset: UInt64? = nil
             var rawRepatchEntryOffset: UInt64 = 0
             if SBMachOEntryOffset(executablePath, &rawRepatchEntryOffset) != 0 {
                 repatchEntryOffset = rawRepatchEntryOffset
