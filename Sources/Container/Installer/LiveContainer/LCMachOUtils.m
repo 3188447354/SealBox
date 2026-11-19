@@ -588,6 +588,74 @@ bool checkCodeSignature(const char* path) {
     return ans;
 }
 
+// 0.2.20：checkCodeSignature 的诊断版——与 LC 原函数同逻辑（LCParseMachO 首个
+// arm64 切片、F_ADDFILESIGS_RETURN 后 F_CHECK_LV），但把失败现场带出来：
+// 哪一步死的、errno、内核的 lv_error_message 原话。0.2.19 的日志只说
+// “重签后内核验签仍不通过”，分不清是 F_ADDFILESIGS_RETURN 还是 F_CHECK_LV 死的、
+// 内核原话是什么——下一份日志靠这一处定夺。LC 的 checkCodeSignature 一字不动。
+bool checkCodeSignatureDetail(const char* path, int* outStep, int* outErrno, char* outMessage, size_t outMessageSize) {
+    if (outStep) *outStep = 0;
+    if (outErrno) *outErrno = 0;
+    if (outMessage && outMessageSize > 0) {
+        outMessage[0] = '\0';
+        outMessage[outMessageSize - 1] = '\0';
+    }
+    __block bool checked = false;
+    __block bool ans = false;
+    __block int step = 1; // 默认 1=无签名/非 arm64
+    __block int errNo = 0;
+    LCParseMachO(path, true, ^(const char *path, struct mach_header_64 *header, int fd, void *filePtr) {
+        if(checked || header->cputype != CPU_TYPE_ARM64) {
+            return;
+        }
+        checked = true;
+
+        struct code_signature_command* codeSignatureCommand = findSignatureCommand(header);
+        if(!codeSignatureCommand) {
+            step = 1;
+            return;
+        }
+        off_t sliceOffset = (void*)header - filePtr;
+        fsignatures_t siginfo;
+        siginfo.fs_file_start = sliceOffset;
+        siginfo.fs_blob_start = (void*)(long)(codeSignatureCommand->dataoff);
+        siginfo.fs_blob_size  = codeSignatureCommand->datasize;
+        int addFileSigsResult = fcntl(fd, F_ADDFILESIGS_RETURN, &siginfo);
+        if ( addFileSigsResult == -1 ) {
+            step = 2;
+            errNo = errno; // 立刻取，之后任何调用都可能改写 errno
+            ans = false;
+            return;
+        }
+
+        fchecklv_t checkInfo;
+        char     messageBuffer[512];
+        messageBuffer[0]                = '\0';
+        checkInfo.lv_error_message_size = sizeof(messageBuffer);
+        checkInfo.lv_error_message      = messageBuffer;
+        checkInfo.lv_file_start= sliceOffset;
+        int checkLVresult = fcntl(fd, F_CHECK_LV, &checkInfo);
+
+        if (checkLVresult == 0) {
+            step = 0;
+            ans = true;
+            return;
+        } else {
+            step = 3;
+            errNo = errno; // 立刻取
+            if (outMessage && outMessageSize > 0) {
+                strncpy(outMessage, messageBuffer, outMessageSize - 1);
+                outMessage[outMessageSize - 1] = '\0';
+            }
+            ans = false;
+            return;
+        }
+    });
+    if (outStep) *outStep = step;
+    if (outErrno) *outErrno = errNo;
+    return ans;
+}
+
 NSString* getExecutableEntitlementXML(NSString* path) {
     __block NSString* ans = @"Failed to find main executable?";
     // it seems the debug build messes the code signature region up, so we search the executable file on the disk instead.

@@ -246,3 +246,7 @@ void SBLCFixupBundleARM64e(const char *bundlePath) {
 int SBLCCheckCodeSignature(const char *path) {
     return checkCodeSignature(path) ? 1 : 0;
 }
+
+int SBLCCheckCodeSignatureDetail(const char *path, int *outStep, int *outErrno, char *outMessage, size_t outMessageSize) {
+    return checkCodeSignatureDetail(path, outStep, outErrno, outMessage, outMessageSize) ? 1 : 0;
+}

@@ -83,6 +83,16 @@ void SBLCFixupBundleARM64e(const char *bundlePath);
 /// - Returns: 内核认为签名有效返回 1，否则返回 0。
 int SBLCCheckCodeSignature(const char *path);
 
+/// 内核验签诊断版（0.2.20）：与 SBLCCheckCodeSignature 同逻辑，但把失败现场
+/// 带出来——死在哪一步、errno、内核的 lv_error_message 原话，供诊断日志用。
+/// - Parameters:
+///   - outStep: 0=通过、1=无 LC_CODE_SIGNATURE 或非 arm64、2=F_ADDFILESIGS_RETURN
+///     失败、3=F_CHECK_LV 失败（可传 NULL）。
+///   - outErrno: 失败那一步的 errno（可传 NULL）。
+///   - outMessage: 内核原话（仅第 3 步有；可传 NULL，传时 outMessageSize 须 >=1）。
+/// - Returns: 内核认为签名有效返回 1，否则返回 0。
+int SBLCCheckCodeSignatureDetail(const char *path, int *outStep, int *outErrno, char *outMessage, size_t outMessageSize);
+
 #ifdef __cplusplus
 }
 #endif
