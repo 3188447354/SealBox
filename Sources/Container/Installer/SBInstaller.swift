@@ -509,6 +509,19 @@ public enum SBInstaller {
         let lcDataOff = (detail["lcDataOff"] as? NSNumber)?.intValue ?? 0
         let lcDataSize = (detail["lcDataSize"] as? NSNumber)?.intValue ?? 0
         let superblobLength = (detail["superblobLength"] as? NSNumber)?.intValue ?? 0
+        // 0.2.15：CD 与 Mach-O 头字段——逐项全过仍被 dyld 拒绝时，这些是与签名无关的证据。
+        let cdVersion = (detail["cdVersion"] as? NSNumber)?.intValue ?? 0
+        let cdFlags = (detail["cdFlags"] as? NSNumber)?.intValue ?? 0
+        let cdExecSegFlags = (detail["cdExecSegFlags"] as? NSNumber)?.uint64Value ?? 0
+        let cdExecSegLimit = (detail["cdExecSegLimit"] as? NSNumber)?.uint64Value ?? 0
+        let cdCodeLimit = (detail["cdCodeLimit"] as? NSNumber)?.intValue ?? 0
+        let cdHashType = (detail["cdHashType"] as? NSNumber)?.intValue ?? 0
+        let cdPageSizeLog2 = (detail["cdPageSizeLog2"] as? NSNumber)?.intValue ?? 0
+        let cdExecSegOK = (detail["cdExecSegOK"] as? NSNumber)?.boolValue ?? false
+        let fileType = (detail["fileType"] as? NSNumber)?.intValue ?? 0
+        let cryptid = (detail["cryptid"] as? NSNumber)?.intValue ?? 0
+        let hasLCMain = (detail["hasLCMain"] as? NSNumber)?.boolValue ?? false
+        let idDylibName = detail["idDylibName"] as? String ?? ""
         let hasAltCD = (detail["hasAltCD"] as? NSNumber)?.boolValue ?? false
         let altPageHashOK = (detail["altPageHashOK"] as? NSNumber)?.boolValue ?? true
         let altFirstBadPage = detail["altFirstBadPage"] as? NSNumber
@@ -531,6 +544,14 @@ public enum SBInstaller {
             fields += "(坏槽=\(slot.intValue))"
         }
         fields += " LC=\(lcSignatureOK ? "一致" : "不一致")(off=0x\(String(lcDataOff, radix: 16)) size=0x\(String(lcDataSize, radix: 16)) superblob=0x\(String(superblobLength, radix: 16)))"
+        let fileTypeName: String
+        switch fileType {
+        case 2: fileTypeName = "MH_EXECUTE"
+        case 6: fileTypeName = "MH_DYLIB"
+        case 8: fileTypeName = "MH_BUNDLE"
+        default: fileTypeName = "0x\(String(fileType, radix: 16))"
+        }
+        fields += " CD[ver=0x\(String(cdVersion, radix: 16)) flags=0x\(String(cdFlags, radix: 16)) execSegFlags=0x\(String(cdExecSegFlags, radix: 16))\(cdExecSegOK ? "" : " 不相容") execSegLimit=0x\(String(cdExecSegLimit, radix: 16)) 限=0x\(String(cdCodeLimit, radix: 16)) sha\(cdHashType == 2 ? "256" : "1") 页2^\(cdPageSizeLog2)] 文件=\(fileTypeName) 加密=\(cryptid) LC_MAIN=\(hasLCMain ? "在" : "无") ID=\(idDylibName.isEmpty ? "无" : idDylibName)"
         if !cmsSignatureError.isEmpty {
             fields += " CMS验签原因：\(cmsSignatureError)"
         } else if !cmsAppleAttrsError.isEmpty {
@@ -591,6 +612,15 @@ public enum SBInstaller {
         }
         if !((detail["lcSignatureOK"] as? NSNumber)?.boolValue ?? false) {
             items.append("LC_CODE_SIGNATURE 与 superblob 长度对不上，或 CMS 槽超出 superblob")
+        }
+        // 0.2.15：CD execSeg 相容性——不是签名项，是 CD 可用性：dylib 的 CD
+        // 带 MAIN_BINARY 时签名逐项全过、内核照样在 mmap 时拒收，须重签
+        // （重签用修好的 ZSign，dylib 的 execSegFlags 会写 0）。
+        if !((detail["cdExecSegOK"] as? NSNumber)?.boolValue ?? false) {
+            let flags = (detail["cdExecSegFlags"] as? NSNumber)?.uint64Value ?? 0
+            let ft = (detail["fileType"] as? NSNumber)?.intValue ?? 0
+            let ftName = ft == 2 ? "MH_EXECUTE" : ft == 6 ? "MH_DYLIB" : ft == 8 ? "MH_BUNDLE" : "0x\(String(ft, radix: 16))"
+            items.append("CD 声明自己是主程序（execSegFlags=0x\(String(flags, radix: 16)) 含 MAIN_BINARY），但文件是 \(ftName)，内核不认这种签名，须重签")
         }
         if !((detail["pageHashOK"] as? NSNumber)?.boolValue ?? false) {
             if let bad = detail["firstBadPage"] as? NSNumber {

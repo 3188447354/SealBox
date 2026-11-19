@@ -29,20 +29,24 @@ NS_ASSUME_NONNULL_BEGIN
 + (nullable NSString *)teamIdentifierAtPath:(NSString *)path;
 
 /// 结构校验签名（0.2.12 收紧，0.2.14 再加 CMS 签名值密码学验签与
-/// Apple 9.1/9.2 属性比对）：superblob 与 CodeDirectory 可解析、
-/// identifier 非空、每页内容哈希与 CodeDirectory 存的哈希一致、CMS 签名块
-/// 可解析且证书链完整、叶子未过期、CMS 摘要与 CodeDirectory 对得上、
-/// CMS 签名值验签过、Apple 属性对得上、备用 CodeDirectory 页哈希与
-/// 特殊槽哈希全过。
+/// Apple 9.1/9.2 属性比对，0.2.15 再加 CD execSeg 相容性）：superblob 与
+/// CodeDirectory 可解析、identifier 非空、每页内容哈希与 CodeDirectory 存的
+/// 哈希一致、CMS 签名块可解析且证书链完整、叶子未过期、CMS 摘要与 CodeDirectory
+/// 对得上、CMS 签名值验签过、Apple 属性对上、备用 CodeDirectory 页哈希与
+/// 特殊槽哈希全过、CD execSegFlags 与文件类型相容（dylib 的 CD 不能带
+/// MAIN_BINARY，否则签名全过、内核照样拒收）。
 /// 失败时 error 的 localizedDescription 带中文原因。
 + (BOOL)validateSignatureAtPath:(NSString *)path error:(NSError **)error;
 
 /// 逐项签名检查（0.2.10 报错日志用，0.2.12 扩到 CMS 全项，0.2.14 再加
-/// CMS 签名值密码学验签 + Apple 9.1/9.2 属性比对 + LC 一致性）：不早退，
+/// CMS 签名值密码学验签 + Apple 9.1/9.2 属性比对 + LC 一致性，0.2.15
+/// 再加 CD execSeg 相容性 + Mach-O 头字段）：不早退，
 /// 各字段独立记；返回字典：
 ///   valid（BOOL）= identifier 在位 && CMS 逐项全过（可解析、链完整、
 ///     叶子未过期、摘要对上、签名值验签过、Apple 属性对上）&& 页哈希全过
 ///     && 备用 CD 页哈希全过 && 特殊槽全过 && LC 一致
+///     && CD execSeg 相容（0.2.15：dylib/bundle 的 CD 不能带 MAIN_BINARY，
+///     否则签名全过、内核照样在 mmap 时拒收；主程序带 MAIN_BINARY 是对的）
 ///   hasCMS（BOOL）、pageHashOK（BOOL）、firstBadPage（NSNumber/NSNull）
 ///   pageCount（NSNumber）、teamID（NSString/NSNull）
 ///   identifier（NSString/NSNull）、error（NSString/NSNull）
@@ -60,6 +64,15 @@ NS_ASSUME_NONNULL_BEGIN
 ///   cmsAppleAttrsError（NSString/NSNull，属性比对失败原因）
 ///   lcSignatureOK（BOOL，0.2.14：LC 范围与 superblob/CMS 槽一致）
 ///   lcDataOff / lcDataSize / superblobLength（NSNumber，LC 一致性数字）
+///   cdVersion / cdFlags / cdCodeLimit / cdHashType / cdPageSizeLog2
+///     （NSNumber，0.2.15：主 CD 字段）
+///   cdExecSegBase / cdExecSegLimit / cdExecSegFlags（NSNumber，0.2.15：
+///     主 CD 的 execSeg 字段；版本 < 0x20400 时为 0）
+///   cdExecSegOK（BOOL，0.2.15：CD execSegFlags 与文件类型是否相容）
+///   fileType（NSNumber，0.2.15：MH_EXECUTE=2 / MH_DYLIB=6 / MH_BUNDLE=8）
+///   cryptid（NSNumber，0.2.15：LC_ENCRYPTION_INFO 的 cryptid，0=未加密）
+///   hasLCMain（BOOL，0.2.15）、idDylibName（NSString/NSNull，0.2.15：
+///     LC_ID_DYLIB 的 install name）
 ///   hasAltCD（BOOL）、altPageHashOK（BOOL，无备用 CD 时记 YES）
 ///   altFirstBadPage（NSNumber/NSNull）
 ///   specialSlotsOK（BOOL）、badSpecialSlot（NSNumber/NSNull，槽号）

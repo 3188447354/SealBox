@@ -56,10 +56,15 @@ static inline uint32_t SBReadLE32(const uint8_t *p) {
     return ((uint32_t)p[0]) | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
+static inline uint64_t SBReadBE64(const uint8_t *p) {
+    return ((uint64_t)SBReadBE32(p) << 32) | (uint64_t)SBReadBE32(p + 4);
+}
+
 typedef struct {
     const uint8_t *cd; // CodeDirectory 起点（签名区内）
     uint32_t cdLength;
     uint32_t version;
+    uint32_t flags; // 0.2.15：CD 的 flags 字段（cd+12）
     uint32_t hashOffset;
     uint32_t identOffset;
     uint32_t nSpecialSlots;
@@ -71,7 +76,32 @@ typedef struct {
     uint32_t teamOffset; // 0 = 无 Team
     uint32_t preEncryptOffset; // 0x20500+ 才有；0 = 无 pre-encrypt 表
     uint32_t codeHashOffset; // 代码页槽表起点（见文件头注释的 0x20500 例外）
+    // 0.2.15：execSeg 字段（0x20400+ 才有，cd+64/72/80；版本更老时为 0）。
+    uint64_t execSegBase;
+    uint64_t execSegLimit;
+    uint64_t execSegFlags;
 } SBCodeDirectoryInfo;
+
+/// Mach-O 头与加载命令里与加载有关的字段（0.2.15）：filetype / 是否加密 /
+/// LC_MAIN 在否 / LC_ID_DYLIB 的 install name。签名检查本身不看它们，
+/// 但 dyld 加载时看——逐项全过仍被拒时，这些字段是与签名无关的证据。
+typedef struct {
+    uint32_t fileType; // MH_EXECUTE=2 / MH_DYLIB=6 / MH_BUNDLE=8，0=未读到
+    uint32_t cryptid; // LC_ENCRYPTION_INFO 的 cryptid，0=无加密命令或未加密
+    BOOL hasLCMain;
+    char idDylibName[256]; // LC_ID_DYLIB 的 install name，空串=无
+} SBMachOInfo;
+
+/// 0.2.15：CD 的 execSegFlags 是否与文件类型相容。MAIN_BINARY 只属于主可
+/// 执行文件——dylib/bundle 的 CD 带它会被内核在 mmap 时拒绝（0.2.14 真机：
+/// ZSign 给打过补丁的客主程序写了 execSegFlags=0x11，逐项全过、dlopen
+/// 照样报 code signature invalid）。主程序带 MAIN_BINARY 是对的。
+static BOOL SBCDExecSegOK(const SBCodeDirectoryInfo *cd, uint32_t fileType) {
+    if (fileType == MH_EXECUTE) {
+        return YES;
+    }
+    return (cd->execSegFlags & 0x1) == 0; // CS_EXECSEG_MAIN_BINARY
+}
 
 /// 一次签名解析的全部结果：主 CD + 备用 CD + CMS 槽 + superblob 索引。
 typedef struct {
@@ -95,8 +125,11 @@ static NSError *SBCodeSignError(NSString *reason) {
 
 /// 在 data（长度 len）里找 LC_CODE_SIGNATURE，返回签名区范围。
 /// 支持 thin arm64 与 fat（取 arm64 slice）。
+/// outInfo 为 NULL 时不抓头字段；非 NULL 时填 filetype/cryptid/
+/// LC_MAIN/LC_ID_DYLIB（0.2.15）。
 static BOOL SBFindSignature(const uint8_t *data, size_t len,
                             uint32_t *outOff, uint32_t *outSize,
+                            SBMachOInfo *outInfo,
                             NSString **outReason) {
     if (len < 4) {
         *outReason = @"文件太小，不是 Mach-O";
@@ -148,8 +181,15 @@ static BOOL SBFindSignature(const uint8_t *data, size_t len,
         *outReason = @"Mach-O 头不完整";
         return NO;
     }
+    // 0.2.15：顺带抓与加载有关的头字段（调用方传 NULL 时不抓）。
+    if (outInfo) {
+        memset(outInfo, 0, sizeof(*outInfo));
+        outInfo->fileType = SBReadLE32(macho + 12);
+    }
     uint32_t ncmds = SBReadLE32(macho + 16);
     const uint8_t *lc = macho + sizeof(struct mach_header_64);
+    BOOL foundSig = NO;
+    uint32_t foundOff = 0, foundSize = 0;
     for (uint32_t i = 0; i < ncmds; i++) {
         if ((size_t)(lc - macho) + sizeof(struct load_command) > machoLen) {
             *outReason = @"load command 越界";
@@ -162,6 +202,8 @@ static BOOL SBFindSignature(const uint8_t *data, size_t len,
             *outReason = @"load command 长度非法";
             return NO;
         }
+        // 0.2.15：LC_CODE_SIGNATURE 找到后不立即返回——后面的命令里还
+        // 可能有 LC_ENCRYPTION_INFO / LC_ID_DYLIB，继续扫完再回。
         if (cmd == LC_CODE_SIGNATURE) {
             if (cmdsize < sizeof(struct linkedit_data_command)) {
                 *outReason = @"LC_CODE_SIGNATURE 长度非法";
@@ -174,14 +216,43 @@ static BOOL SBFindSignature(const uint8_t *data, size_t len,
                 *outReason = @"签名区范围非法";
                 return NO;
             }
-            *outOff = dataoff;
-            *outSize = datasize;
-            return YES;
+            foundSig = YES;
+            foundOff = dataoff;
+            foundSize = datasize;
+        } else if (outInfo && (cmd == LC_ENCRYPTION_INFO || cmd == LC_ENCRYPTION_INFO_64)) {
+            // cryptid 在命令头后第 16 字节。
+            if (cmdsize >= 20) {
+                outInfo->cryptid = SBReadLE32(lc + 16);
+            }
+        } else if (outInfo && cmd == LC_MAIN) {
+            outInfo->hasLCMain = YES;
+        } else if (outInfo && cmd == LC_ID_DYLIB) {
+            if (cmdsize >= sizeof(struct dylib_command)) {
+                uint32_t nameOff = SBReadLE32(lc + 8);
+                if (nameOff < cmdsize) {
+                    size_t maxLen = (size_t)cmdsize - nameOff;
+                    if (maxLen > sizeof(outInfo->idDylibName) - 1) {
+                        maxLen = sizeof(outInfo->idDylibName) - 1;
+                    }
+                    const char *name = (const char *)lc + nameOff;
+                    size_t copyLen = 0;
+                    while (copyLen < maxLen && name[copyLen] != '\0') {
+                        copyLen++;
+                    }
+                    memcpy(outInfo->idDylibName, name, copyLen);
+                    outInfo->idDylibName[copyLen] = '\0';
+                }
+            }
         }
         lc += cmdsize;
     }
-    *outReason = @"没有 LC_CODE_SIGNATURE，未签名";
-    return NO;
+    if (!foundSig) {
+        *outReason = @"没有 LC_CODE_SIGNATURE，未签名";
+        return NO;
+    }
+    *outOff = foundOff;
+    *outSize = foundSize;
+    return YES;
 }
 
 /// 解析单个 CodeDirectory blob 的字段（cd 指向 blob 起点，avail 是签名区内
@@ -208,6 +279,18 @@ static BOOL SBParseCDBlob(const uint8_t *cd, uint32_t avail, size_t fileLen,
     out->cd = cd;
     out->cdLength = cdLength;
     out->version = SBReadBE32(cd + 8);
+    out->flags = SBReadBE32(cd + 12);
+    // 0.2.15：execSeg 字段只在 0x20400+ 的 CD 里有（头长 88 字节）；
+    // 版本更老时留 0（无该字段，判定按 0 处理即相容）。
+    if (out->version >= 0x20400) {
+        if (cdLength < 88) {
+            *outReason = @"CodeDirectory 太短，没有 execSeg 字段";
+            return NO;
+        }
+        out->execSegBase = SBReadBE64(cd + 64);
+        out->execSegLimit = SBReadBE64(cd + 72);
+        out->execSegFlags = SBReadBE64(cd + 80);
+    }
     out->hashOffset = SBReadBE32(cd + 16);
     out->identOffset = SBReadBE32(cd + 20);
     out->nSpecialSlots = SBReadBE32(cd + 24);
@@ -1423,7 +1506,7 @@ static void SBInspectCMS(const uint8_t *sig, uint32_t sigSize,
     size_t len = fileData.length;
     uint32_t sigOff = 0, sigSize = 0;
     NSString *reason = nil;
-    if (!SBFindSignature(bytes, len, &sigOff, &sigSize, &reason)) {
+    if (!SBFindSignature(bytes, len, &sigOff, &sigSize, NULL, &reason)) {
         return nil;
     }
     SBSignatureInfo info;
@@ -1445,7 +1528,9 @@ static void SBInspectCMS(const uint8_t *sig, uint32_t sigSize,
     size_t len = fileData.length;
     uint32_t sigOff = 0, sigSize = 0;
     NSString *reason = nil;
-    if (!SBFindSignature(bytes, len, &sigOff, &sigSize, &reason)) {
+    SBMachOInfo machoInfo;
+    memset(&machoInfo, 0, sizeof(machoInfo));
+    if (!SBFindSignature(bytes, len, &sigOff, &sigSize, &machoInfo, &reason)) {
         if (error) {
             *error = SBCodeSignError([NSString stringWithFormat:@"签名结构无效：%@", reason]);
         }
@@ -1531,6 +1616,16 @@ static void SBInspectCMS(const uint8_t *sig, uint32_t sigSize,
         }
         return NO;
     }
+    // 0.2.15：CD 的 execSegFlags 是否与文件类型相容（见 SBCDExecSegOK）。
+    // 签名本身全过也不等于 CD 能加载——dylib 的 CD 带 MAIN_BINARY 时
+    // 内核在 mmap 时拒绝，dyld 报 code signature invalid（0.2.14 真机）。
+    if (!SBCDExecSegOK(&info.cd, machoInfo.fileType)
+        || (info.hasAltCD && !SBCDExecSegOK(&info.altCD, machoInfo.fileType))) {
+        if (error) {
+            *error = SBCodeSignError(@"签名校验失败：CodeDirectory 声明自己是主程序（execSegFlags 含 MAIN_BINARY），但文件不是主可执行文件，内核不认这种签名，须重签");
+        }
+        return NO;
+    }
     return YES;
 }
 
@@ -1561,6 +1656,20 @@ static void SBInspectCMS(const uint8_t *sig, uint32_t sigSize,
     detail[@"altFirstBadPage"] = [NSNull null];
     detail[@"specialSlotsOK"] = @NO;
     detail[@"badSpecialSlot"] = [NSNull null];
+    // 0.2.15 新增字段（缺省 = 未验出好结果，调用方按“坏”处理）。
+    detail[@"cdVersion"] = @0;
+    detail[@"cdFlags"] = @0;
+    detail[@"cdCodeLimit"] = @0;
+    detail[@"cdHashType"] = @0;
+    detail[@"cdPageSizeLog2"] = @0;
+    detail[@"cdExecSegBase"] = @0;
+    detail[@"cdExecSegLimit"] = @0;
+    detail[@"cdExecSegFlags"] = @0;
+    detail[@"cdExecSegOK"] = @NO;
+    detail[@"fileType"] = @0;
+    detail[@"cryptid"] = @0;
+    detail[@"hasLCMain"] = @NO;
+    detail[@"idDylibName"] = [NSNull null];
     // 0.2.14 新增字段（缺省 = 未验出好结果，调用方按“坏”处理）。
     detail[@"cmsSignatureValid"] = @NO;
     detail[@"cmsSignatureError"] = [NSNull null];
@@ -1580,7 +1689,9 @@ static void SBInspectCMS(const uint8_t *sig, uint32_t sigSize,
     size_t len = fileData.length;
     uint32_t sigOff = 0, sigSize = 0;
     NSString *reason = nil;
-    if (!SBFindSignature(bytes, len, &sigOff, &sigSize, &reason)) {
+    SBMachOInfo machoInfo;
+    memset(&machoInfo, 0, sizeof(machoInfo));
+    if (!SBFindSignature(bytes, len, &sigOff, &sigSize, &machoInfo, &reason)) {
         detail[@"error"] = [NSString stringWithFormat:@"签名结构无效：%@", reason ?: @"找不到签名块"];
         return detail;
     }
@@ -1590,6 +1701,32 @@ static void SBInspectCMS(const uint8_t *sig, uint32_t sigSize,
         return detail;
     }
     detail[@"structureOK"] = @YES;
+    // 0.2.15：CD 与 Mach-O 头字段（与签名无关、dyld 加载时看的证据）。
+    // 主 CD 与备用 CD 由同一份 uExecSegFlags 生成，值相同，只记主 CD 的。
+    detail[@"cdVersion"] = @(info.cd.version);
+    detail[@"cdFlags"] = @(info.cd.flags);
+    detail[@"cdCodeLimit"] = @(info.cd.codeLimit);
+    detail[@"cdHashType"] = @(info.cd.hashType);
+    detail[@"cdPageSizeLog2"] = @(info.cd.pageSizeLog2);
+    detail[@"cdExecSegBase"] = @(info.cd.execSegBase);
+    detail[@"cdExecSegLimit"] = @(info.cd.execSegLimit);
+    detail[@"cdExecSegFlags"] = @(info.cd.execSegFlags);
+    detail[@"fileType"] = @(machoInfo.fileType);
+    detail[@"cryptid"] = @(machoInfo.cryptid);
+    detail[@"hasLCMain"] = @(machoInfo.hasLCMain);
+    if (machoInfo.idDylibName[0] != '\0') {
+        detail[@"idDylibName"] = [NSString stringWithUTF8String:machoInfo.idDylibName];
+    }
+    // 0.2.15：CD 的 execSegFlags 是否与文件类型相容。主 CD 与备用 CD
+    // 都要过（备用 CD 是 dyld 优先用的那份）。不相容时 valid=NO，
+    // 修复门按逐项不合格走强制重打补丁+重签（重签用修好的 ZSign，
+    // dylib 的 execSegFlags 会写 0），不是签名坏——签名逐项本身全过。
+    BOOL cdExecSegOK = SBCDExecSegOK(&info.cd, machoInfo.fileType)
+        && (!info.hasAltCD || SBCDExecSegOK(&info.altCD, machoInfo.fileType));
+    detail[@"cdExecSegOK"] = @(cdExecSegOK);
+    if (!cdExecSegOK && detail[@"error"] == [NSNull null]) {
+        detail[@"error"] = @"CodeDirectory 声明自己是主程序（execSegFlags 含 MAIN_BINARY），但文件不是主可执行文件，内核不认这种签名";
+    }
     // 0.2.14：LC 一致性——检查器与 dyld 都读 LC_CODE_SIGNATURE（见
     // SBFindSignature），没有“第二份读法”可核对；能核对的是 LC 给出的
     // 范围与 superblob 自身长度、CMS 槽是否落在 superblob 内。注意
@@ -1734,7 +1871,9 @@ static void SBInspectCMS(const uint8_t *sig, uint32_t sigSize,
         && cms.signatureValid
         && cms.appleAttrsValid
         && cms.error[0] == '\0';
-    if (identifier.length > 0 && pagesOK && altOK && specialOK && cmsOK && lcOK) {
+    // 0.2.15：valid 再加 CD execSeg 相容性（非签名项，是 CD 可用性：
+    // dylib 的 CD 带 MAIN_BINARY 时签名逐项全过、内核照样拒收）。
+    if (identifier.length > 0 && pagesOK && altOK && specialOK && cmsOK && lcOK && cdExecSegOK) {
         detail[@"valid"] = @YES;
     }
     return detail;

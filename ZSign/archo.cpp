@@ -376,7 +376,15 @@ bool ZArchO::BuildCodeSignature(ZSignAsset* pSignAsset,
 		}
 	}
 
-	if (NULL != strstr(strEntitlementsSlot.data() + 8, "<key>get-task-allow</key>")) {
+	// 0.2.15：MAIN_BINARY|ALLOW_UNSIGNED 只属于主可执行文件。打过补丁的客主
+	// 程序是 MH_DYLIB（IsExecute() 为假），它的 CD 若带 MAIN_BINARY 会被
+	// 内核在 mmap 时拒绝（code signature invalid），而逐项检查不看
+	// execSegFlags，所以逐项全过、dlopen 照样失败（0.2.14 真机：CyPwn）。
+	// entitlements 里 get-task-allow 键存在（最小项里恒有
+	// <key>get-task-allow</key><false/>）不能作为主程序的判据。
+	// Apple 的做法：主程序按 get-task-allow 的值定（Via false→0x1，
+	// 宿主 true→0x11），dylib 一律 0x0（OpenSSL 实测）。
+	if (IsExecute() && NULL != strstr(strEntitlementsSlot.data() + 8, "<key>get-task-allow</key>")) {
 		// TODO: Check if get-task-allow is actually set to true
 		uExecSegFlags |= CS_EXECSEG_MAIN_BINARY | CS_EXECSEG_ALLOW_UNSIGNED;
 	}
