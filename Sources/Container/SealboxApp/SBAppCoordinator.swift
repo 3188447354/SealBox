@@ -306,6 +306,11 @@ final class SBAppCoordinator: ObservableObject {
                 if appToLaunch.signed {
                     appToLaunch = try await SBInstaller.ensureLaunchableSignature(appToLaunch)
                 } else {
+                    // 0.2.12：未签名记录也记一行签名逐项——二进制可能带着旧
+                    // 签名（安装时签名失败照装、或记录过期），逐项是判断它
+                    // 能不能走 JIT 还是该重签的唯一依据；只记不拦，拦的活
+                    // 仍由 Team 比对做。
+                    SBDiagLog.log("签名修复门验签：\(appToLaunch.bundleID) \(appToLaunch.executableURL.path) \(SBInstaller.signatureDetailFields(at: appToLaunch.executableURL.path))")
                     try SBInstaller.checkTeamMatch(
                         appToLaunch.executableURL.path, bundleID: appToLaunch.bundleID)
                 }

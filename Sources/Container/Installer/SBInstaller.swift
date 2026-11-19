@@ -395,6 +395,15 @@ public enum SBInstaller {
                     SBDiagLog.log("重打补丁 entitlements 再签失败：[code=\(Self.errorCode(of: error))] \(entry.bundleID) \(entry.path) 错误：\(error.localizedDescription)（保留全包重签签名，继续）")
                 }
             }
+            // 0.2.12：重签后先单查 CMS 证书链（叶子 + WWDR 中间证书），
+            // 链不全直接报原因——不要等后面的验签才含糊报错。链不全时
+            // 外层 catch 会把主可执行文件还原回备份。
+            let chainDetail = SBCodesignCheck.signatureDetail(atPath: executablePath)
+            if !((chainDetail["cmsChainComplete"] as? NSNumber)?.boolValue ?? false) {
+                let chainReason = chainDetail["cmsError"] as? String ?? "CMS 证书链不完整"
+                SBDiagLog.log("重打补丁 CMS 链不完整：\(record.bundleID) \(executablePath) \(chainReason)（\(signatureDetailFields(detail: chainDetail))）")
+                throw SBError.signFailed(reason: "重签后 CMS 证书链不完整：\(chainReason)")
+            }
             // 0.2.7 签后验签：重签完立刻在本地验一遍主可执行文件，确认签名真能
             // 被系统接受再记 patchRevision——不要等到 dlopen 那步才由 dyld 报
             // 一个无法定位的 code signature invalid。任一失败都抛错，外层
@@ -424,6 +433,9 @@ public enum SBInstaller {
             throw error
         }
 
+        // 0.2.12：二进制已换，上次启动结果描述的是旧二进制——清掉 stale
+        // 标记，否则下次点图标还会因“上次死在 dlopen 签名失败”强制重打
+        //（每次点都重签一遍）。
         let updated = SBInstalledApp(
             recordID: record.recordID,
             bundleID: record.bundleID,
@@ -438,7 +450,7 @@ public enum SBInstaller {
             signed: signed,
             needsJIT: record.needsJIT,
             segCountMismatch: segCountMismatch,
-            lastLaunchResult: record.lastLaunchResult,
+            lastLaunchResult: nil,
             signingCertFingerprint: signingCertFingerprint,
             needsReimport: record.needsReimport,
             diskDirectoryName: record.diskDirectoryName,
@@ -464,7 +476,13 @@ public enum SBInstaller {
     /// 把签名逐项结果拼成日志字段（0.2.10 报错日志用）：
     /// 有效 / CMS / 页哈希（页数、首坏页）/ Team / identifier / 原因。
     static func signatureDetailFields(at path: String) -> String {
-        let detail = SBCodesignCheck.signatureDetail(atPath: path)
+        signatureDetailFields(detail: SBCodesignCheck.signatureDetail(atPath: path))
+    }
+
+    /// 0.2.12：逐项字段扩到 CMS 全项（链、摘要、叶子到期、备用 CD、特殊槽）。
+    /// 旧版只记“CMS 在位 + 页哈希”，KMusic 在 0.2.10/0.2.11 两份日志里
+    /// 都没有任何逐项行——门是放行还是根本没验，无从判断。
+    static func signatureDetailFields(detail: NSDictionary) -> String {
         let valid = (detail["valid"] as? NSNumber)?.boolValue ?? false
         let hasCMS = (detail["hasCMS"] as? NSNumber)?.boolValue ?? false
         let pageHashOK = (detail["pageHashOK"] as? NSNumber)?.boolValue ?? false
@@ -473,15 +491,106 @@ public enum SBInstaller {
         let teamID = detail["teamID"] as? String ?? "无"
         let identifier = detail["identifier"] as? String ?? "无"
         let error = detail["error"] as? String ?? ""
+        let cmsLength = (detail["cmsLength"] as? NSNumber)?.intValue ?? 0
+        let cmsCertCount = (detail["cmsCertCount"] as? NSNumber)?.intValue ?? 0
+        let cmsChainComplete = (detail["cmsChainComplete"] as? NSNumber)?.boolValue ?? false
+        let cmsCDHashOK = (detail["cmsCDHashOK"] as? NSNumber)?.boolValue ?? false
+        let cmsLeafCN = detail["cmsLeafCN"] as? String ?? "无"
+        let cmsIntermediateCN = detail["cmsIntermediateCN"] as? String ?? "无"
+        let cmsLeafExpiry = detail["cmsLeafExpiry"] as? String ?? "无"
+        let cmsLeafExpired = (detail["cmsLeafExpired"] as? NSNumber)?.boolValue ?? false
+        let cmsError = detail["cmsError"] as? String ?? ""
+        let hasAltCD = (detail["hasAltCD"] as? NSNumber)?.boolValue ?? false
+        let altPageHashOK = (detail["altPageHashOK"] as? NSNumber)?.boolValue ?? true
+        let altFirstBadPage = detail["altFirstBadPage"] as? NSNumber
+        let specialSlotsOK = (detail["specialSlotsOK"] as? NSNumber)?.boolValue ?? false
+        let badSpecialSlot = detail["badSpecialSlot"] as? NSNumber
         var fields = "签名逐项：有效=\(valid ? "是" : "否") CMS=\(hasCMS ? "在位" : "缺失") 页哈希=\(pageHashOK ? "全过" : "不过")(\(pageCount)页"
         if let bad = firstBadPage {
             fields += " 首坏页=\(bad.intValue)"
         }
         fields += ") Team=\(teamID) identifier=\(identifier)"
-        if !error.isEmpty {
+        if hasCMS {
+            fields += " CMS链=\(cmsChainComplete ? "完整" : "不完整")(\(cmsCertCount)张 \(cmsLength)字节) CMS摘要=\(cmsCDHashOK ? "对上" : "不对") 叶子=\(cmsLeafCN)(到期\(cmsLeafExpiry)\(cmsLeafExpired ? " 已过期" : "")) 中间=\(cmsIntermediateCN)"
+        }
+        fields += hasAltCD ? " 备用CD=\(altPageHashOK ? "全过" : "不过")" : " 备用CD=无"
+        if let bad = altFirstBadPage {
+            fields += "(首坏页=\(bad.intValue))"
+        }
+        fields += " 特殊槽=\(specialSlotsOK ? "全过" : "不过")"
+        if let slot = badSpecialSlot {
+            fields += "(坏槽=\(slot.intValue))"
+        }
+        if !cmsError.isEmpty {
+            fields += " CMS原因：\(cmsError)"
+        } else if !error.isEmpty {
             fields += " 原因：\(error)"
         }
         return fields
+    }
+
+    /// 0.2.12：把 signatureDetail 字典翻成“哪一项坏”的清单，供修复门
+    /// 抛错时点名——不许再只报一句“验签失败”就走到 dlopen 去撞墙。
+    /// CMS 的具体坏因由 ObjC 的 cmsError 给（解析失败 / 链不完整都带原因），
+    /// 这里不再另拼一个含糊的“链不完整”。
+    static func failingSignatureItems(detail: NSDictionary) -> [String] {
+        var items: [String] = []
+        if (detail["valid"] as? NSNumber)?.boolValue ?? false {
+            return items
+        }
+        if !((detail["structureOK"] as? NSNumber)?.boolValue ?? false) {
+            // superblob / 主 CD 解析就失败：逐项字段全是缺省值，点名没意义，
+            // 只报结构原因。
+            let error = detail["error"] as? String ?? "签名结构无效"
+            return ["签名结构无效：\(error)"]
+        }
+        let cmsError = detail["cmsError"] as? String ?? ""
+        if !((detail["hasCMS"] as? NSNumber)?.boolValue ?? false) {
+            items.append("缺 CMS 签名块")
+        } else if ((detail["cmsLength"] as? NSNumber)?.intValue ?? 0) <= 0 {
+            items.append("CMS 签名块为空")
+        } else if !cmsError.isEmpty {
+            items.append("CMS：\(cmsError)")
+        }
+        if (detail["cmsLeafExpired"] as? NSNumber)?.boolValue ?? false {
+            items.append("叶子证书已过期（到期 \(detail["cmsLeafExpiry"] as? String ?? "")）")
+        }
+        if (detail["hasCMS"] as? NSNumber)?.boolValue ?? false,
+           ((detail["cmsLength"] as? NSNumber)?.intValue ?? 0) > 0,
+           cmsError.isEmpty,
+           !((detail["cmsCDHashOK"] as? NSNumber)?.boolValue ?? false) {
+            items.append("CMS 摘要与 CodeDirectory 对不上（签名后文件被改过）")
+        }
+        if !((detail["pageHashOK"] as? NSNumber)?.boolValue ?? false) {
+            if let bad = detail["firstBadPage"] as? NSNumber {
+                items.append("第 \(bad.intValue) 页内容哈希与签名不符")
+            } else {
+                items.append("页哈希不过")
+            }
+        }
+        if (detail["hasAltCD"] as? NSNumber)?.boolValue ?? false,
+           !((detail["altPageHashOK"] as? NSNumber)?.boolValue ?? false) {
+            if let bad = detail["altFirstBadPage"] as? NSNumber {
+                items.append("备用 CodeDirectory 第 \(bad.intValue) 页内容哈希不符")
+            } else {
+                items.append("备用 CodeDirectory 页哈希不过")
+            }
+        }
+        if !((detail["specialSlotsOK"] as? NSNumber)?.boolValue ?? false) {
+            if let slot = detail["badSpecialSlot"] as? NSNumber {
+                items.append("特殊槽 \(slot.intValue) 哈希与签名不符")
+            } else {
+                items.append("特殊槽哈希不符")
+            }
+        }
+        if items.isEmpty {
+            items.append("签名逐项不合格（原因未知）")
+        }
+        return items
+    }
+
+    static func failingSignatureItems(at path: String) -> [String] {
+        failingSignatureItems(detail: SBCodesignCheck.signatureDetail(atPath: path))
     }
 
     /// 只抛错、不静默：调用方在 do 块内，抛错会走 catch 还原备份。
@@ -528,20 +637,6 @@ public enum SBInstaller {
         }
     }
 
-    /// 0.2.8：点图标前的签名修复门（Via 案：patchRevision 已是当前值，
-    /// 但安装时签的名是坏的——0.2.5 安装走 ZSign 时签名结构有问题，
-    /// 记录却写 signed=true；点图标直接启动，dlopen 才报 code signature
-    /// invalid）。
-    /// - 先验签：结构/CMS 坏 → 走 repatchInstalledApp 修一次（重打补丁+
-    ///   重签+验签）；修不好抛错，不启动。
-    /// - Team 不一致 → 直接抛 teamMismatch，不走 repatch（0.2.11：重签
-    ///   换不了宿主的 Team，走 repatch 只是白做工；且无证书时 repatch 的
-    ///   signFailed 会盖掉真正的 teamMismatch）。
-    /// - LC_ID_DYLIB 缺失 → 走 repatchInstalledApp（补 ID）；无证书时
-    ///   修不了，直接抛缺 ID 的原因。
-    /// - 全过 → 原样返回，不动记录。
-    /// 0.2.11：调用方不再保证已导入证书——门无证书也能验（结构 + Team），
-    /// 只拦不修；无证书时验签失败直接抛原错，不调 repatch。
     /// 点图标时修复门能否动手重打补丁：p12 文件在且钥匙串密码非空
     ///（与 SBCertificate.hasCertificate 同条件；门本身不依赖证书也能验）。
     private static var canRepair: Bool {
@@ -552,8 +647,32 @@ public enum SBInstaller {
         return true
     }
 
+    /// 0.2.12：点图标前的签名修复门。
+    /// - 无条件先跑完整签名逐项并记进日志（0.2.11 的盲区：KMusic 在两份
+    ///   真机日志里都没有一行签名逐项，门是放行还是根本没验，无从判断。
+    ///   逐项现已含 CMS 证书链（叶子 + WWDR 中间证书）、CMS 摘要、备用
+    ///   CD、特殊槽，不再是 0.2.10 的“CMS 在位 + 页哈希”两项）。
+    /// - 逐项全过且上次不是签名失败：走原有验签（含 Team），原样返回。
+    /// - 逐项任一坏、或上次启动死在 dlopen 签名失败：强制修复——先比 Team
+    ///   （不一致直接抛，不白打补丁），有证书时 repatch + 用当前证书重签，
+    ///   重签后复验再跑一次逐项并记结果；仍坏抛错写明 exact 哪一项坏，
+    ///   绝不走到 dlopen 去撞墙。无证书时只拦不修，抛原错。
+    /// - LC_ID_DYLIB 缺失 → 走 repatchInstalledApp（补 ID）；无证书时
+    ///   修不了，直接抛缺 ID 的原因。
+    /// - Team 不一致 → 直接抛 teamMismatch，不走 repatch（0.2.11：重签
+    ///   换不了宿主的 Team，走 repatch 只是白做工；且无证书时 repatch 的
+    ///   signFailed 会盖掉真正的 teamMismatch）。
     static func ensureLaunchableSignature(_ record: SBInstalledApp) async throws -> SBInstalledApp {
         let executablePath = record.executableURL.path
+        let gateDetail = SBCodesignCheck.signatureDetail(atPath: executablePath)
+        SBDiagLog.log("签名修复门验签：\(record.bundleID) \(executablePath) \(signatureDetailFields(detail: gateDetail))")
+        let detailValid = (gateDetail["valid"] as? NSNumber)?.boolValue ?? false
+        // 上次启动是不是死在 dlopen 签名失败：记录里的上次结果由启动路由
+        // 在加载失败时写回（SBStore.recordLaunchResult），失败原因里带
+        // dyld 原文 "code signature invalid"。逐项全过也拦不住这一项——
+        // CMS 密码学验签不过时逐项查不出来，只有 dyld 报得出来。
+        let lastLaunchSigFailed = record.lastLaunchResult?.success == false
+            && (record.lastLaunchResult?.message.contains("code signature invalid") ?? false)
         if SBMachOHasIDDylib(executablePath) == 0 {
             // 0.2.11：无证书修不了，直接报缺 ID 的原因——不调 repatch，
             // 不然 repatch 的“没有导入证书”会盖掉真正的原因。
@@ -564,20 +683,35 @@ public enum SBInstaller {
             SBDiagLog.log("签名修复门：\(record.bundleID) \(executablePath) 缺 LC_ID_DYLIB，走重打补丁")
             return try await repatchInstalledApp(record)
         }
-        do {
+        if detailValid && !lastLaunchSigFailed {
             try verifyExecutableSignature(executablePath, bundleID: record.bundleID, checkTeam: true)
             return record
-        } catch {
-            // 0.2.11：Team 不一致重签修不好，直接抛，不白走 repatch；无证书
-            // 时也直接抛原错，不让 repatch 的 signFailed（“没有导入证书”）
-            // 盖掉真正的验签失败。
-            if case SBError.teamMismatch = error { throw error }
-            guard canRepair else { throw error }
-            NSLog("[SBInstaller] ensureLaunchableSignature: %@ 验签失败（%@），走重打补丁修复",
-                  record.bundleID, error.localizedDescription)
-            SBDiagLog.log("签名修复门：\(record.bundleID) \(executablePath) 验签失败（[code=\(Self.errorCode(of: error))] \(error.localizedDescription)），走重打补丁修复")
-            return try await repatchInstalledApp(record)
         }
+        // 强制修复：逐项有坏项，或上次启动死在 dlopen 签名失败。
+        // Team 不一致重签修不好：先比 Team，不一致直接抛，不白走 repatch。
+        try checkTeamMatch(executablePath, bundleID: record.bundleID)
+        let reason: String
+        if !detailValid {
+            reason = "签名逐项不合格：\(failingSignatureItems(detail: gateDetail).joined(separator: "；"))"
+        } else {
+            reason = "上次启动死在 dlopen 签名失败（code signature invalid）"
+        }
+        guard canRepair else {
+            throw SBError.signFailed(reason: "\(reason)，且未导入证书，无法重签修复")
+        }
+        NSLog("[SBInstaller] ensureLaunchableSignature: %@ 强制重打补丁修复（%@）",
+              record.bundleID, reason)
+        SBDiagLog.log("签名修复门：\(record.bundleID) \(executablePath) 强制重打补丁+重签（\(reason)）")
+        let repaired = try await repatchInstalledApp(record)
+        // 重签后复验：再跑一次逐项并记结果；仍不合格就抛错点名，不走到 dlopen。
+        let postDetail = SBCodesignCheck.signatureDetail(atPath: repaired.executableURL.path)
+        SBDiagLog.log("签名修复门复验：\(record.bundleID) \(repaired.executableURL.path) \(signatureDetailFields(detail: postDetail))")
+        let postItems = failingSignatureItems(detail: postDetail)
+        if !postItems.isEmpty {
+            throw SBError.signFailed(reason: "重签后签名仍不合格：\(postItems.joined(separator: "；"))")
+        }
+        // repatchInstalledApp 已在返回的记录里清掉 stale 的 lastLaunchResult。
+        return repaired
     }
 
     /// 从解析出的 .app 路径反推解析时的临时根目录：往上找到名字以

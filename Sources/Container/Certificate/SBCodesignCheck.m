@@ -19,6 +19,17 @@
 //   第 i 页覆盖文件字节 [i*pageSize, min((i+1)*pageSize, codeLimit))，
 //   槽在代码表起点 + i*hashSize。
 //   hashType：1 = SHA-1，2 = SHA-256，3 = SHA-256 截断取前 20 字节，4 = SHA-384。
+// - CMS 签名块（superblob 槽 0x10000）：blob 头 8 字节后是 PKCS#7 SignedData
+//   （Apple codesign 写 BER 不定长、外层 SEQ 是 30 80；OpenSSL/ZSign 写定长
+//   DER——解析器两种都支持，见 SBDerReadTLV）。
+//   0.2.12：逐项检查 CMS：可解析、证书链完整（叶子→WWDR 中间证书→根，
+//   自签单证书也算完整）、叶子未过期、SignerInfo 的 messageDigest 与文件里
+//   的 CodeDirectory 对得上；备用 CodeDirectory（槽 0x1000，SHA-256，dyld
+//   优先用）页哈希、特殊槽（entitlements 等）哈希也都验。
+//   仍不做的事（能力边界）：CMS 签名本身的密码学验签（RSA/ECDSA 验签、
+//   证书链的系统信任评估）——那是 dyld 的事；这里能做的极限是“链的每张
+//   证书都在 CMS 里、没过期、摘要对得上”。逐项全过仍被 dyld 拒绝时，
+//   调用方靠“上次启动死在 dlopen 签名失败”触发强制重签（见 SBInstaller）。
 #import "SBCodesignCheck.h"
 
 #import <CommonCrypto/CommonCrypto.h>
@@ -28,6 +39,7 @@
 static const uint32_t SBCSMagicEmbeddedSignature = 0xfade0cc0;
 static const uint32_t SBCSMagicCodeDirectory = 0xfade0c02;
 static const uint32_t SBCSlotCodeDirectory = 0;
+static const uint32_t SBCSlotAlternateCodeDirectory = 0x1000;
 static const uint32_t SBCSlotSignatureSlot = 0x10000;
 static const uint32_t SBCPUTypeARM64 = 0x0100000C;
 
@@ -54,8 +66,20 @@ typedef struct {
     uint32_t teamOffset; // 0 = 无 Team
     uint32_t preEncryptOffset; // 0x20500+ 才有；0 = 无 pre-encrypt 表
     uint32_t codeHashOffset; // 代码页槽表起点（见文件头注释的 0x20500 例外）
-    BOOL hasSignatureSlot;
 } SBCodeDirectoryInfo;
+
+/// 一次签名解析的全部结果：主 CD + 备用 CD + CMS 槽 + superblob 索引。
+typedef struct {
+    SBCodeDirectoryInfo cd; // 主 CodeDirectory（槽 0）
+    BOOL hasAltCD;
+    SBCodeDirectoryInfo altCD; // 备用 CodeDirectory（槽 0x1000，SHA-256）
+    BOOL hasSignatureSlot;
+    uint32_t cmsOffset; // CMS blob 在签名区内的偏移（0 = 无）
+    uint32_t cmsBlobLength; // CMS blob 长度字段（含 8 字节头），0 = 无
+    uint32_t slotTypes[16]; // superblob 索引（特殊槽哈希用）
+    uint32_t slotOffsets[16];
+    uint32_t slotCount;
+} SBSignatureInfo;
 
 static NSError *SBCodeSignError(NSString *reason) {
     return [NSError errorWithDomain:@"SBCodesignCheck"
@@ -154,56 +178,20 @@ static BOOL SBFindSignature(const uint8_t *data, size_t len,
     return NO;
 }
 
-/// 解析 superblob + CodeDirectory。data 是整个文件内容，sigOff/sigSize 是签名区。
-static BOOL SBParseCodeDirectory(const uint8_t *data, size_t len,
-                                 uint32_t sigOff, uint32_t sigSize,
-                                 SBCodeDirectoryInfo *out,
-                                 NSString **outReason) {
-    const uint8_t *sig = data + sigOff;
-    if (sigSize < 12 || SBReadBE32(sig) != SBCSMagicEmbeddedSignature) {
-        *outReason = @"签名区不是 superblob";
+/// 解析单个 CodeDirectory blob 的字段（cd 指向 blob 起点，avail 是签名区内
+/// 剩余长度，fileLen 是整个文件长度，供 codeLimit 校验用）。
+static BOOL SBParseCDBlob(const uint8_t *cd, uint32_t avail, size_t fileLen,
+                          SBCodeDirectoryInfo *out,
+                          NSString **outReason) {
+    // 0.2.3: 读 magic（cd+0）+ length（cd+4）需要 8 字节，不是 4 字节；
+    // 只保证 4 字节时 cd+4 的读会越界（损坏的签名才触发）。
+    if (avail < 8) {
+        *outReason = @"CodeDirectory 越界";
         return NO;
     }
-    uint32_t blobLength = SBReadBE32(sig + 4);
-    uint32_t count = SBReadBE32(sig + 8);
-    if (blobLength > sigSize || 12 + count * 8 > sigSize) {
-        *outReason = @"superblob 长度非法";
-        return NO;
-    }
-    const uint8_t *cd = NULL;
-    uint32_t cdLength = 0;
-    BOOL hasSignatureSlot = NO;
-    for (uint32_t i = 0; i < count; i++) {
-        if ((uint64_t)12 + (uint64_t)(i + 1) * 8 > sigSize) {
-            *outReason = @"superblob 索引越界";
-            return NO;
-        }
-        const uint8_t *entry = sig + 12 + i * 8;
-        uint32_t type = SBReadBE32(entry);
-        uint32_t offset = SBReadBE32(entry + 4);
-        if (offset >= sigSize) {
-            *outReason = @"superblob 索引越界";
-            return NO;
-        }
-        if (type == SBCSlotCodeDirectory && cd == NULL) {
-            cd = sig + offset;
-            // 0.2.3: 读 magic（cd+0）+ length（cd+4）需要 8 字节，不是 4 字节；
-            // 只保证 4 字节时 cd+4 的读会越界（损坏的签名才触发）。
-            if (sigSize - offset < 8) {
-                *outReason = @"CodeDirectory 越界";
-                return NO;
-            }
-            cdLength = SBReadBE32(cd + 4);
-            if (cdLength < 44 || offset + cdLength > sigSize) {
-                *outReason = @"CodeDirectory 长度非法";
-                return NO;
-            }
-        } else if (type == SBCSlotSignatureSlot) {
-            hasSignatureSlot = YES;
-        }
-    }
-    if (cd == NULL) {
-        *outReason = @"superblob 里没有 CodeDirectory";
+    uint32_t cdLength = SBReadBE32(cd + 4);
+    if (cdLength < 44 || cdLength > avail) {
+        *outReason = @"CodeDirectory 长度非法";
         return NO;
     }
     if (SBReadBE32(cd) != SBCSMagicCodeDirectory) {
@@ -222,7 +210,6 @@ static BOOL SBParseCodeDirectory(const uint8_t *data, size_t len,
     out->hashSize = cd[36];
     out->hashType = cd[37];
     out->pageSizeLog2 = cd[39];
-    out->hasSignatureSlot = hasSignatureSlot;
     // 0.2.3: teamOffset（cd+48）需要 cdLength ≥ 52，preEncryptOffset（cd+92）
     // 需要 cdLength ≥ 96；只校验 ≥44 时，损坏的签名会在这里越读。
     if (out->version >= 0x20200) {
@@ -256,7 +243,7 @@ static BOOL SBParseCodeDirectory(const uint8_t *data, size_t len,
         *outReason = @"CodeDirectory identifier 越界";
         return NO;
     }
-    if (out->codeLimit == 0 || (uint64_t)out->codeLimit > len) {
+    if (out->codeLimit == 0 || (uint64_t)out->codeLimit > fileLen) {
         *outReason = @"CodeDirectory codeLimit 越界";
         return NO;
     }
@@ -264,7 +251,70 @@ static BOOL SBParseCodeDirectory(const uint8_t *data, size_t len,
         *outReason = @"CodeDirectory pageSize 非法";
         return NO;
     }
-    (void)len;
+    return YES;
+}
+
+/// 解析 superblob：主 CodeDirectory、备用 CodeDirectory（槽 0x1000，
+/// SHA-256，dyld 优先用）、CMS 签名块（槽 0x10000）与 superblob 索引。
+/// data 是整个文件内容，sigOff/sigSize 是签名区。
+static BOOL SBParseSignature(const uint8_t *data, size_t len,
+                             uint32_t sigOff, uint32_t sigSize,
+                             SBSignatureInfo *out,
+                             NSString **outReason) {
+    const uint8_t *sig = data + sigOff;
+    if (sigSize < 12 || SBReadBE32(sig) != SBCSMagicEmbeddedSignature) {
+        *outReason = @"签名区不是 superblob";
+        return NO;
+    }
+    uint32_t blobLength = SBReadBE32(sig + 4);
+    uint32_t count = SBReadBE32(sig + 8);
+    if (blobLength > sigSize || 12 + count * 8 > sigSize) {
+        *outReason = @"superblob 长度非法";
+        return NO;
+    }
+    memset(out, 0, sizeof(*out));
+    BOOL foundCD = NO;
+    for (uint32_t i = 0; i < count; i++) {
+        if ((uint64_t)12 + (uint64_t)(i + 1) * 8 > sigSize) {
+            *outReason = @"superblob 索引越界";
+            return NO;
+        }
+        const uint8_t *entry = sig + 12 + i * 8;
+        uint32_t type = SBReadBE32(entry);
+        uint32_t offset = SBReadBE32(entry + 4);
+        if (offset >= sigSize) {
+            *outReason = @"superblob 索引越界";
+            return NO;
+        }
+        if (out->slotCount < 16) {
+            out->slotTypes[out->slotCount] = type;
+            out->slotOffsets[out->slotCount] = offset;
+            out->slotCount++;
+        }
+        if (type == SBCSlotCodeDirectory && !foundCD) {
+            if (!SBParseCDBlob(sig + offset, sigSize - offset, len, &out->cd, outReason)) {
+                return NO;
+            }
+            foundCD = YES;
+        } else if (type == SBCSlotAlternateCodeDirectory && !out->hasAltCD) {
+            if (!SBParseCDBlob(sig + offset, sigSize - offset, len, &out->altCD, outReason)) {
+                return NO;
+            }
+            out->hasAltCD = YES;
+        } else if (type == SBCSlotSignatureSlot) {
+            out->hasSignatureSlot = YES;
+            out->cmsOffset = offset;
+            if (sigSize - offset < 8) {
+                *outReason = @"CMS 签名块越界";
+                return NO;
+            }
+            out->cmsBlobLength = SBReadBE32(sig + offset + 4);
+        }
+    }
+    if (!foundCD) {
+        *outReason = @"superblob 里没有 CodeDirectory";
+        return NO;
+    }
     return YES;
 }
 
@@ -317,6 +367,677 @@ static BOOL SBVerifyPageHash(const uint8_t *page, size_t pageLen,
     return memcmp(digest, expected, hashSize) == 0;
 }
 
+/// 逐页验一个 CodeDirectory 的代码页哈希（与旧 validateSignature 同款循环）。
+static BOOL SBVerifyCDPages(const uint8_t *bytes,
+                            const SBCodeDirectoryInfo *info,
+                            uint32_t *firstBadPage,
+                            NSString **outReason) {
+    uint32_t pageSize = 1u << info->pageSizeLog2;
+    for (uint32_t i = 0; i < info->nCodeSlots; i++) {
+        uint64_t pageStart = (uint64_t)i * pageSize;
+        if (pageStart >= info->codeLimit) {
+            if (firstBadPage) {
+                *firstBadPage = UINT32_MAX; // 结构错，不是某页哈希错
+            }
+            if (outReason) {
+                *outReason = @"代码页超出 codeLimit";
+            }
+            return NO;
+        }
+        uint64_t remaining = (uint64_t)info->codeLimit - pageStart;
+        size_t pageLen = (size_t)MIN((uint64_t)pageSize, remaining);
+        // 代码槽 i 在代码表起点 + i*hashSize（特殊槽在 hashOffset 之前，不占这里）。
+        const uint8_t *expected = info->cd + info->codeHashOffset
+            + (uint64_t)i * info->hashSize;
+        if (!SBVerifyPageHash(bytes + pageStart, pageLen,
+                             info->hashType, info->hashSize, expected)) {
+            if (firstBadPage) {
+                *firstBadPage = i;
+            }
+            return NO;
+        }
+    }
+    return YES;
+}
+
+/// 验特殊槽（1..7：info.plist、requirements、resources、entitlements 等）：
+/// 每个槽的 blob 在 superblob 里的长度取“下一槽偏移 - 本槽偏移”（末槽到
+/// 签名区尾）；blob 哈希与该 CD 的特殊槽哈希表（hashOffset - type*hashSize）
+/// 逐字节比对。badSlot 记首个不符的槽号。
+static BOOL SBVerifySpecialSlots(const uint8_t *sig, uint32_t sigSize,
+                                 const SBSignatureInfo *sigInfo,
+                                 const SBCodeDirectoryInfo *info,
+                                 uint32_t *badSlot) {
+    if (info->nSpecialSlots == 0) {
+        return YES;
+    }
+    // 槽偏移按升序排（索引里一般已是升序，但不依赖它）。
+    uint32_t offsets[16];
+    uint32_t n = sigInfo->slotCount < 16 ? sigInfo->slotCount : 16;
+    for (uint32_t i = 0; i < n; i++) {
+        offsets[i] = sigInfo->slotOffsets[i];
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        for (uint32_t j = i + 1; j < n; j++) {
+            if (offsets[j] < offsets[i]) {
+                uint32_t t = offsets[i];
+                offsets[i] = offsets[j];
+                offsets[j] = t;
+            }
+        }
+    }
+    for (uint32_t s = 0; s < sigInfo->slotCount; s++) {
+        uint32_t type = sigInfo->slotTypes[s];
+        if (type < 1 || type > 7 || type > info->nSpecialSlots) {
+            continue;
+        }
+        uint32_t offset = sigInfo->slotOffsets[s];
+        // 下一槽偏移（没有就到签名区尾）即本 blob 长度。
+        uint32_t end = sigSize;
+        for (uint32_t i = 0; i < n; i++) {
+            if (offsets[i] > offset && offsets[i] < end) {
+                end = offsets[i];
+            }
+        }
+        uint32_t blobLen = end - offset;
+        if (blobLen < 8) {
+            if (badSlot) {
+                *badSlot = type;
+            }
+            return NO;
+        }
+        const uint8_t *expected = info->cd + info->hashOffset
+            - (uint64_t)type * info->hashSize;
+        if (!SBVerifyPageHash(sig + offset, blobLen,
+                             info->hashType, info->hashSize, expected)) {
+            if (badSlot) {
+                *badSlot = type;
+            }
+            return NO;
+        }
+    }
+    return YES;
+}
+
+// MARK: - DER / CMS 解析（0.2.12）
+//
+// 只实现 PKCS#7 SignedData 需要的子集：TLV（定长 DER + 不定长 BER）、
+// 证书集、SignerInfo 的 messageDigest 属性。解析是严格的：标签不对、
+// 长度越界、容器没在 TLV 边界上结束，全部当解析失败（不静默跳过——
+// 0.2.11 的教训：只查“槽在不在”会把截断/空 CMS 当成好的放行）。
+
+typedef struct {
+    uint8_t tag;
+    const uint8_t *content; // 内容起点
+    uint32_t contentLen;
+    uint32_t totalLen; // 头 + 内容（不定长时含结尾的 EOC）
+} SBDerTLV;
+
+#define SBDerMaxDepth 16
+#define SBDerMaxChildren 16
+
+/// 读一个 TLV。off 是 buf 内偏移（buf 长 len）。不定长（0x80）时扫子项
+/// 直到 EOC（00 00），contentLen 即 EOC 之前的子项总长。
+static BOOL SBDerReadTLV(const uint8_t *buf, size_t len, size_t off,
+                         SBDerTLV *out, NSString **reason, int depth) {
+    if (depth > SBDerMaxDepth) {
+        if (reason) *reason = @"DER 嵌套太深";
+        return NO;
+    }
+    if (off + 2 > len) {
+        if (reason) *reason = @"DER 越界";
+        return NO;
+    }
+    uint8_t tag = buf[off];
+    if (tag == 0x1F) { // 多字节标签：CMS 里不需要
+        if (reason) *reason = @"DER 多字节标签不支持";
+        return NO;
+    }
+    uint8_t lenByte = buf[off + 1];
+    size_t headerLen = 2;
+    uint32_t contentLen = 0;
+    BOOL indefinite = NO;
+    if (lenByte == 0x80) {
+        indefinite = YES;
+    } else if (lenByte & 0x80) {
+        uint8_t n = lenByte & 0x7F;
+        if (n == 0 || n > 4 || off + 2 + n > len) {
+            if (reason) *reason = @"DER 长度字段非法";
+            return NO;
+        }
+        for (uint8_t i = 0; i < n; i++) {
+            contentLen = (contentLen << 8) | buf[off + 2 + i];
+        }
+        headerLen = 2 + n;
+    } else {
+        contentLen = lenByte;
+    }
+    if (indefinite) {
+        // 扫子项直到 EOC。
+        size_t p = off + headerLen;
+        while (YES) {
+            if (p + 2 > len) {
+                if (reason) *reason = @"DER 不定长内容没有 EOC";
+                return NO;
+            }
+            if (buf[p] == 0x00 && buf[p + 1] == 0x00) {
+                contentLen = (uint32_t)(p - (off + headerLen));
+                out->tag = tag;
+                out->content = buf + off + headerLen;
+                out->contentLen = contentLen;
+                out->totalLen = (uint32_t)((p + 2) - off);
+                return YES;
+            }
+            SBDerTLV child;
+            if (!SBDerReadTLV(buf, len, p, &child, reason, depth + 1)) {
+                return NO;
+            }
+            p += child.totalLen;
+        }
+    }
+    if (off + headerLen + contentLen > len) {
+        if (reason) *reason = @"DER 内容越界";
+        return NO;
+    }
+    out->tag = tag;
+    out->content = buf + off + headerLen;
+    out->contentLen = contentLen;
+    out->totalLen = (uint32_t)(headerLen + contentLen);
+    return YES;
+}
+
+/// 列出一个构造型 TLV 的全部子项（必须恰好在内容尾结束）。
+typedef struct {
+    SBDerTLV items[SBDerMaxChildren];
+    uint32_t count;
+} SBDerChildren;
+
+static BOOL SBDerChildren(const uint8_t *buf, size_t len,
+                          const SBDerTLV *parent,
+                          SBDerChildren *out, NSString **reason, int depth) {
+    size_t start = (size_t)(parent->content - buf);
+    size_t end = start + parent->contentLen;
+    size_t p = start;
+    out->count = 0;
+    while (p < end) {
+        if (out->count >= SBDerMaxChildren) {
+            if (reason) *reason = @"DER 子项太多";
+            return NO;
+        }
+        SBDerTLV child;
+        if (!SBDerReadTLV(buf, len, p, &child, reason, depth + 1)) {
+            return NO;
+        }
+        if (p + child.totalLen > end) {
+            if (reason) *reason = @"DER 子项越出容器";
+            return NO;
+        }
+        out->items[out->count++] = child;
+        p += child.totalLen;
+    }
+    if (p != end) {
+        if (reason) *reason = @"DER 容器长度与子项不符";
+        return NO;
+    }
+    return YES;
+}
+
+/// 格里高利历转天数（Howard Hinnant 算法），供证书有效期比较用。
+static int64_t SBDaysFromCivil(int y, unsigned m, unsigned d) {
+    y -= m <= 2;
+    int64_t era = (y >= 0 ? y : y - 399) / 400;
+    unsigned yoe = (unsigned)(y - era * 400);
+    unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + (int64_t)doe - 719468;
+}
+
+/// 解析 UTCTime（YYMMDDHHMMSSZ）或 GeneralizedTime（YYYYMMDDHHMMSSZ，
+/// 允许小数秒）。返回自 epoch 的秒数，失败返回 INT64_MIN。
+static int64_t SBDerTimeToEpoch(const SBDerTLV *timeTLV) {
+    const uint8_t *s = timeTLV->content;
+    uint32_t n = timeTLV->contentLen;
+    if (timeTLV->tag == 0x17) { // UTCTime
+        if (n != 13 || s[12] != 'Z') return INT64_MIN;
+        int yy = (s[0] - '0') * 10 + (s[1] - '0');
+        int year = yy < 50 ? 2000 + yy : 1900 + yy;
+        int mo = (s[2] - '0') * 10 + (s[3] - '0');
+        int d = (s[4] - '0') * 10 + (s[5] - '0');
+        int h = (s[6] - '0') * 10 + (s[7] - '0');
+        int mi = (s[8] - '0') * 10 + (s[9] - '0');
+        int sec = (s[10] - '0') * 10 + (s[11] - '0');
+        if (mo < 1 || mo > 12 || d < 1 || d > 31 || h > 23 || mi > 59 || sec > 60) return INT64_MIN;
+        return SBDaysFromCivil(year, (unsigned)mo, (unsigned)d) * 86400 + h * 3600 + mi * 60 + sec;
+    }
+    if (timeTLV->tag == 0x18) { // GeneralizedTime
+        if (n < 15) return INT64_MIN;
+        if (s[14] != 'Z') {
+            // 允许小数秒：YYYYMMDDHHMMSS.fffZ
+            if (n < 17 || s[14] != '.') return INT64_MIN;
+            uint32_t i = 15;
+            while (i < n && s[i] >= '0' && s[i] <= '9') i++;
+            if (i >= n || s[i] != 'Z') return INT64_MIN;
+        }
+        int year = (s[0] - '0') * 1000 + (s[1] - '0') * 100 + (s[2] - '0') * 10 + (s[3] - '0');
+        int mo = (s[4] - '0') * 10 + (s[5] - '0');
+        int d = (s[6] - '0') * 10 + (s[7] - '0');
+        int h = (s[8] - '0') * 10 + (s[9] - '0');
+        int mi = (s[10] - '0') * 10 + (s[11] - '0');
+        int sec = (s[12] - '0') * 10 + (s[13] - '0');
+        if (mo < 1 || mo > 12 || d < 1 || d > 31 || h > 23 || mi > 59 || sec > 60) return INT64_MIN;
+        return SBDaysFromCivil(year, (unsigned)mo, (unsigned)d) * 86400 + h * 3600 + mi * 60 + sec;
+    }
+    return INT64_MIN;
+}
+
+/// 从一个 TLV 值里拷字符串（PrintableString / UTF8String / TeletexString
+/// 原样拷；BMPString 由 UTF-16BE 转 UTF-8）。
+static void SBDerCopyString(const SBDerTLV *value, char *out, size_t outSize) {
+    if (outSize == 0) return;
+    out[0] = '\0';
+    if (value->tag == 0x1E) { // BMPString
+        size_t n = value->contentLen / 2;
+        size_t j = 0;
+        for (size_t i = 0; i < n && j + 1 < outSize; i++) {
+            uint16_t ch = ((uint16_t)value->content[i * 2] << 8) | value->content[i * 2 + 1];
+            if (ch < 0x80) {
+                out[j++] = (char)ch;
+            } else if (ch < 0x800 && j + 2 < outSize) {
+                out[j++] = (char)(0xC0 | (ch >> 6));
+                out[j++] = (char)(0x80 | (ch & 0x3F));
+            } else if (j + 3 < outSize) {
+                out[j++] = (char)(0xE0 | (ch >> 12));
+                out[j++] = (char)(0x80 | ((ch >> 6) & 0x3F));
+                out[j++] = (char)(0x80 | (ch & 0x3F));
+            } else {
+                break;
+            }
+        }
+        out[j] = '\0';
+        return;
+    }
+    size_t n = value->contentLen < outSize - 1 ? value->contentLen : outSize - 1;
+    memcpy(out, value->content, n);
+    out[n] = '\0';
+}
+
+/// 在 Name（RDNSequence）里找 CN（OID 2.5.4.3）。nameTLVStart 是原始 TLV
+///（含标签头），在里面扫 OID 字节再读后面的值 TLV。
+static void SBDerNameCN(const uint8_t *nameTLVStart, uint32_t nameTLVLen,
+                        char *out, size_t outSize) {
+    static const uint8_t kCNOID[5] = { 0x06, 0x03, 0x55, 0x04, 0x03 };
+    if (outSize == 0) return;
+    out[0] = '\0';
+    if (nameTLVLen < 5) return;
+    for (uint32_t i = 0; i + 5 <= nameTLVLen; i++) {
+        if (memcmp(nameTLVStart + i, kCNOID, 5) != 0) continue;
+        SBDerTLV value;
+        if (!SBDerReadTLV(nameTLVStart, nameTLVLen, i + 5, &value, NULL, 0)) continue;
+        if (value.tag != 0x0C && value.tag != 0x13 && value.tag != 0x14
+            && value.tag != 0x1E && value.tag != 0x1C) {
+            continue;
+        }
+        SBDerCopyString(&value, out, outSize);
+        return;
+    }
+}
+
+/// 字节串里是否含子串（memmem 的手写版）。
+static BOOL SBBytesContain(const uint8_t *hay, size_t hayLen,
+                           const char *needle) {
+    size_t nLen = strlen(needle);
+    if (nLen == 0 || hayLen < nLen) return NO;
+    for (size_t i = 0; i + nLen <= hayLen; i++) {
+        if (memcmp(hay + i, needle, nLen) == 0) return YES;
+    }
+    return NO;
+}
+
+typedef struct {
+    const uint8_t *issuerTLV; // 完整 TLV（含标签头），供链比对用
+    uint32_t issuerTLVLen;
+    const uint8_t *subjectTLV;
+    uint32_t subjectTLVLen;
+    char cn[128];
+    char issuerCN[128];
+    int64_t notAfter; // INT64_MIN = 解析失败
+    char notAfterRaw[32];
+} SBDerCert;
+
+#define SBMaxCerts 8
+
+/// 解析一张证书：只取 TBS 里的 issuer / validity.notAfter / subject，
+/// 以及 subject/issuer 的 CN。标签顺序严格校验（0.2.12 原型实证：
+/// 截断的 CMS 会把损坏区读成一串空 TLV，必须靠标签顺序拦住）。
+static BOOL SBParseCert(const SBDerTLV *certTLV,
+                        const uint8_t *buf, size_t len,
+                        SBDerCert *out, NSString **reason) {
+    if (certTLV->tag != 0x30) {
+        if (reason) *reason = @"证书不是 SEQUENCE";
+        return NO;
+    }
+    SBDerChildren kids;
+    if (!SBDerChildren(buf, len, certTLV, &kids, reason, 0)) return NO;
+    if (kids.count < 1 || kids.items[0].tag != 0x30) {
+        if (reason) *reason = @"证书里没有 TBSCertificate";
+        return NO;
+    }
+    SBDerChildren tbs;
+    if (!SBDerChildren(buf, len, &kids.items[0], &tbs, reason, 0)) return NO;
+    // TBS：[0] 版本（可选）、INTEGER 序列号、SEQ 签名算法、SEQ issuer、
+    // SEQ validity、SEQ subject。
+    uint32_t idx = 0;
+    if (idx < tbs.count && tbs.items[idx].tag == 0xA0) idx++;
+    static const uint8_t kExpected[5] = { 0x02, 0x30, 0x30, 0x30, 0x30 };
+    static const char *kNames[5] = { "serial", "signature", "issuer", "validity", "subject" };
+    for (int k = 0; k < 5; k++) {
+        if (idx + (uint32_t)k >= tbs.count || tbs.items[idx + k].tag != kExpected[k]
+            || tbs.items[idx + k].contentLen == 0) {
+            if (reason) {
+                *reason = [NSString stringWithFormat:@"证书 TBS 字段 %@ 缺失或为空",
+                           [NSString stringWithUTF8String:kNames[k]]];
+            }
+            return NO;
+        }
+    }
+    SBDerTLV issuer = tbs.items[idx + 2];
+    SBDerTLV validity = tbs.items[idx + 3];
+    SBDerTLV subject = tbs.items[idx + 4];
+    SBDerChildren times;
+    if (!SBDerChildren(buf, len, &validity, &times, reason, 0)) return NO;
+    if (times.count < 2
+        || (times.items[0].tag != 0x17 && times.items[0].tag != 0x18)
+        || (times.items[1].tag != 0x17 && times.items[1].tag != 0x18)) {
+        if (reason) *reason = @"证书 validity 时间标签不对";
+        return NO;
+    }
+    int64_t notAfter = SBDerTimeToEpoch(&times.items[1]);
+    if (notAfter == INT64_MIN) {
+        if (reason) *reason = @"证书到期日解析失败";
+        return NO;
+    }
+    memset(out, 0, sizeof(*out));
+    // 完整 TLV 的起点 = 内容起点 - 头长。
+    const uint8_t *issuerStart = issuer.content - (issuer.totalLen - issuer.contentLen);
+    const uint8_t *subjectStart = subject.content - (subject.totalLen - subject.contentLen);
+    out->issuerTLV = issuerStart;
+    out->issuerTLVLen = issuer.totalLen;
+    out->subjectTLV = subjectStart;
+    out->subjectTLVLen = subject.totalLen;
+    SBDerNameCN(subjectStart, subject.totalLen, out->cn, sizeof(out->cn));
+    SBDerNameCN(issuerStart, issuer.totalLen, out->issuerCN, sizeof(out->issuerCN));
+    out->notAfter = notAfter;
+    size_t rawLen = times.items[1].contentLen < sizeof(out->notAfterRaw) - 1
+        ? times.items[1].contentLen : sizeof(out->notAfterRaw) - 1;
+    memcpy(out->notAfterRaw, times.items[1].content, rawLen);
+    out->notAfterRaw[rawLen] = '\0';
+    return YES;
+}
+
+typedef struct {
+    uint32_t cmsDERLength;
+    uint32_t certCount;
+    BOOL parseOK;
+    BOOL chainComplete;
+    BOOL hasWWDR;
+    BOOL leafExpired;
+    BOOL cdHashOK;
+    char leafCN[128];
+    char intermediateCN[128];
+    char leafExpiry[32];
+    char error[256];
+} SBCMSDetail;
+
+/// 验 CMS 签名块：可解析、链完整、叶子未过期、messageDigest 与 CD 对得上。
+/// sig 是签名区起点；cmsOffset/cmsBlobLength 来自 superblob 索引；
+/// cdInfo 是主 CodeDirectory（摘要对它算）。
+static void SBInspectCMS(const uint8_t *sig, uint32_t sigSize,
+                         uint32_t cmsOffset, uint32_t cmsBlobLength,
+                         const SBCodeDirectoryInfo *cdInfo,
+                         SBCMSDetail *out) {
+    memset(out, 0, sizeof(*out));
+    if (cmsBlobLength < 8) {
+        snprintf(out->error, sizeof(out->error), "CMS 签名块长度非法");
+        return;
+    }
+    uint32_t derLen = cmsBlobLength - 8;
+    out->cmsDERLength = derLen;
+    if (derLen == 0 || (uint64_t)cmsOffset + 8 + derLen > sigSize) {
+        snprintf(out->error, sizeof(out->error), "CMS 签名块为空或越界");
+        return;
+    }
+    const uint8_t *der = sig + cmsOffset + 8;
+    NSString *reason = nil;
+    // ContentInfo ::= SEQ { OID, [0] SignedData }
+    SBDerTLV top;
+    if (!SBDerReadTLV(der, derLen, 0, &top, &reason, 0) || top.tag != 0x30) {
+        snprintf(out->error, sizeof(out->error), "CMS 解析失败：%s",
+                 reason.UTF8String ?: "外层不是 SEQUENCE");
+        return;
+    }
+    SBDerChildren ci;
+    if (!SBDerChildren(der, derLen, &top, &ci, &reason, 0)
+        || ci.count < 2 || ci.items[0].tag != 0x06 || ci.items[1].tag != 0xA0) {
+        snprintf(out->error, sizeof(out->error), "CMS 解析失败：%s",
+                 reason.UTF8String ?: "ContentInfo 结构不对");
+        return;
+    }
+    SBDerChildren sdWrap;
+    if (!SBDerChildren(der, derLen, &ci.items[1], &sdWrap, &reason, 0)
+        || sdWrap.count < 1 || sdWrap.items[0].tag != 0x30) {
+        snprintf(out->error, sizeof(out->error), "CMS 解析失败：%s",
+                 reason.UTF8String ?: "没有 SignedData");
+        return;
+    }
+    SBDerChildren sd;
+    if (!SBDerChildren(der, derLen, &sdWrap.items[0], &sd, &reason, 0)
+        || sd.count < 3 || sd.items[0].tag != 0x02
+        || sd.items[1].tag != 0x31 || sd.items[2].tag != 0x30) {
+        snprintf(out->error, sizeof(out->error), "CMS 解析失败：%s",
+                 reason.UTF8String ?: "SignedData 结构不对");
+        return;
+    }
+    // 证书集 [0] 与签名者信息 SET（位置不固定，按标签找）。
+    SBDerCert certs[SBMaxCerts];
+    uint32_t certCount = 0;
+    const SBDerTLV *signerInfos = NULL;
+    for (uint32_t i = 3; i < sd.count; i++) {
+        if (sd.items[i].tag == 0xA0 && certCount == 0) {
+            SBDerChildren certKids;
+            if (!SBDerChildren(der, derLen, &sd.items[i], &certKids, &reason, 0)) {
+                snprintf(out->error, sizeof(out->error), "CMS 解析失败：%s",
+                         reason.UTF8String ?: "证书集结构不对");
+                return;
+            }
+            for (uint32_t c = 0; c < certKids.count; c++) {
+                if (certCount >= SBMaxCerts) {
+                    snprintf(out->error, sizeof(out->error), "CMS 解析失败：证书太多（>%u 张）", SBMaxCerts);
+                    return;
+                }
+                if (!SBParseCert(&certKids.items[c], der, derLen, &certs[certCount], &reason)) {
+                    snprintf(out->error, sizeof(out->error), "CMS 解析失败：%s",
+                             reason.UTF8String ?: "证书解析失败");
+                    return;
+                }
+                certCount++;
+            }
+        } else if (sd.items[i].tag == 0x31 && signerInfos == NULL) {
+            signerInfos = &sd.items[i];
+        }
+    }
+    out->certCount = certCount;
+    if (signerInfos == NULL) {
+        snprintf(out->error, sizeof(out->error), "CMS 解析失败：没有 SignerInfo");
+        return;
+    }
+    SBDerChildren siSet;
+    if (!SBDerChildren(der, derLen, signerInfos, &siSet, &reason, 0)
+        || siSet.count < 1 || siSet.items[0].tag != 0x30) {
+        snprintf(out->error, sizeof(out->error), "CMS 解析失败：%s",
+                 reason.UTF8String ?: "SignerInfo 不是 SEQUENCE");
+        return;
+    }
+    SBDerChildren si;
+    if (!SBDerChildren(der, derLen, &siSet.items[0], &si, &reason, 0)
+        || si.count < 3 || si.items[0].tag != 0x02
+        || si.items[1].tag != 0x30 || si.items[2].tag != 0x30) {
+        snprintf(out->error, sizeof(out->error), "CMS 解析失败：%s",
+                 reason.UTF8String ?: "SignerInfo 结构不对");
+        return;
+    }
+    // 摘要算法 OID（SignerInfo 的 digestAlgorithm SEQ 的首个 OID）。
+    SBDerChildren algSeq;
+    static const uint8_t kSHA1OID[5] = { 0x2B, 0x0E, 0x03, 0x02, 0x1A };
+    static const uint8_t kSHA256OID[9] = { 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01 };
+    static const uint8_t kSHA384OID[9] = { 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02 };
+    uint8_t hashType = 0;
+    if (SBDerChildren(der, derLen, &si.items[2], &algSeq, NULL, 0)
+        && algSeq.count >= 1 && algSeq.items[0].tag == 0x06) {
+        const SBDerTLV *oid = &algSeq.items[0];
+        if (oid->contentLen == 5 && memcmp(oid->content, kSHA1OID, 5) == 0) hashType = 1;
+        else if (oid->contentLen == 9 && memcmp(oid->content, kSHA256OID, 9) == 0) hashType = 2;
+        else if (oid->contentLen == 9 && memcmp(oid->content, kSHA384OID, 9) == 0) hashType = 4;
+    }
+    if (hashType == 0) {
+        snprintf(out->error, sizeof(out->error), "CMS 解析失败：摘要算法 OID 不认");
+        return;
+    }
+    // messageDigest 属性（OID 1.2.840.113549.1.9.4）。
+    static const uint8_t kMessageDigestOID[9] = { 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x04 };
+    const uint8_t *msgDigest = NULL;
+    uint32_t msgDigestLen = 0;
+    for (uint32_t i = 3; i < si.count; i++) {
+        if (si.items[i].tag != 0xA0) continue;
+        SBDerChildren attrs;
+        if (!SBDerChildren(der, derLen, &si.items[i], &attrs, &reason, 0)) {
+            snprintf(out->error, sizeof(out->error), "CMS 解析失败：%s",
+                     reason.UTF8String ?: "签名属性结构不对");
+            return;
+        }
+        for (uint32_t a = 0; a < attrs.count; a++) {
+            if (attrs.items[a].tag != 0x30) continue;
+            SBDerChildren attr;
+            if (!SBDerChildren(der, derLen, &attrs.items[a], &attr, NULL, 0)
+                || attr.count < 2 || attr.items[0].tag != 0x06
+                || attr.items[0].contentLen != 9
+                || memcmp(attr.items[0].content, kMessageDigestOID, 9) != 0
+                || attr.items[1].tag != 0x31) {
+                continue;
+            }
+            SBDerChildren vals;
+            if (!SBDerChildren(der, derLen, &attr.items[1], &vals, NULL, 0)
+                || vals.count < 1 || vals.items[0].tag != 0x04) {
+                continue;
+            }
+            msgDigest = vals.items[0].content;
+            msgDigestLen = vals.items[0].contentLen;
+        }
+    }
+    if (msgDigest == NULL) {
+        snprintf(out->error, sizeof(out->error), "CMS 解析失败：SignerInfo 里没有 messageDigest 属性");
+        return;
+    }
+    out->parseOK = YES;
+    // 链：叶子 = 主体不等于任何其他证书签发者的那张；C2 = 主体等于叶子
+    // 签发者的那张；C2 自签、或另有 C3 主体等于 C2 签发者，链才完整。
+    // （自签单证书：叶子就是 C2、且自签，算完整——CI 自签宿主就这结构。）
+    int leafIdx = -1;
+    for (uint32_t i = 0; i < certCount; i++) {
+        BOOL isIssuerOfAnother = NO;
+        for (uint32_t j = 0; j < certCount; j++) {
+            if (i == j) continue;
+            if (certs[i].subjectTLVLen == certs[j].issuerTLVLen
+                && memcmp(certs[i].subjectTLV, certs[j].issuerTLV, certs[i].subjectTLVLen) == 0) {
+                isIssuerOfAnother = YES;
+                break;
+            }
+        }
+        if (!isIssuerOfAnother) {
+            if (leafIdx >= 0) { leafIdx = -2; break; } // 两张候选叶子
+            leafIdx = (int)i;
+        }
+    }
+    if (leafIdx < 0) {
+        snprintf(out->error, sizeof(out->error), "CMS 证书链不完整：找不到唯一叶子证书（共 %u 张）", certCount);
+        return;
+    }
+    SBDerCert *leaf = &certs[leafIdx];
+    snprintf(out->leafCN, sizeof(out->leafCN), "%s", leaf->cn);
+    snprintf(out->leafExpiry, sizeof(out->leafExpiry), "%s", leaf->notAfterRaw);
+    int c2Idx = -1;
+    for (uint32_t i = 0; i < certCount; i++) {
+        if (i == (uint32_t)leafIdx) continue;
+        if (certs[i].subjectTLVLen == leaf->issuerTLVLen
+            && memcmp(certs[i].subjectTLV, leaf->issuerTLV, leaf->issuerTLVLen) == 0) {
+            c2Idx = (int)i;
+            break;
+        }
+    }
+    BOOL selfSignedLeaf = (leaf->subjectTLVLen == leaf->issuerTLVLen
+        && memcmp(leaf->subjectTLV, leaf->issuerTLV, leaf->subjectTLVLen) == 0);
+    if (c2Idx < 0 && !selfSignedLeaf) {
+        snprintf(out->error, sizeof(out->error),
+                 "CMS 证书链不完整：叶子证书（%s）的签发者（%s）在 CMS 里找不到对应的中间证书",
+                 leaf->cn, leaf->issuerCN);
+        return;
+    }
+    if (c2Idx >= 0) {
+        SBDerCert *c2 = &certs[c2Idx];
+        snprintf(out->intermediateCN, sizeof(out->intermediateCN), "%s", c2->cn);
+        out->hasWWDR = SBBytesContain(c2->subjectTLV, c2->subjectTLVLen,
+                                     "Worldwide Developer Relations");
+        BOOL c2SelfSigned = (c2->subjectTLVLen == c2->issuerTLVLen
+            && memcmp(c2->subjectTLV, c2->issuerTLV, c2->subjectTLVLen) == 0);
+        if (!c2SelfSigned) {
+            BOOL foundC3 = NO;
+            for (uint32_t i = 0; i < certCount; i++) {
+                if (i == (uint32_t)c2Idx) continue;
+                if (certs[i].subjectTLVLen == c2->issuerTLVLen
+                    && memcmp(certs[i].subjectTLV, c2->issuerTLV, c2->issuerTLVLen) == 0) {
+                    foundC3 = YES;
+                    break;
+                }
+            }
+            if (!foundC3) {
+                snprintf(out->error, sizeof(out->error),
+                         "CMS 证书链不完整：中间证书（%s）的签发者在 CMS 里找不到对应的根证书",
+                         c2->cn);
+                return;
+            }
+        }
+    } else {
+        // 自签叶子：中间证书就是它自己。
+        snprintf(out->intermediateCN, sizeof(out->intermediateCN), "%s", leaf->cn);
+        out->hasWWDR = NO;
+    }
+    out->chainComplete = YES;
+    // 叶子过期？
+    if (leaf->notAfter < (int64_t)time(NULL)) {
+        out->leafExpired = YES;
+    }
+    // messageDigest 与 CodeDirectory 对得上？
+    uint8_t digest[CC_SHA384_DIGEST_LENGTH];
+    size_t digestLen = 0;
+    switch (hashType) {
+        case 1:
+            CC_SHA1(cdInfo->cd, (CC_LONG)cdInfo->cdLength, digest);
+            digestLen = CC_SHA1_DIGEST_LENGTH;
+            break;
+        case 2:
+            CC_SHA256(cdInfo->cd, (CC_LONG)cdInfo->cdLength, digest);
+            digestLen = CC_SHA256_DIGEST_LENGTH;
+            break;
+        case 4:
+            CC_SHA384(cdInfo->cd, (CC_LONG)cdInfo->cdLength, digest);
+            digestLen = CC_SHA384_DIGEST_LENGTH;
+            break;
+        default:
+            break;
+    }
+    out->cdHashOK = (digestLen > 0 && msgDigestLen == digestLen
+                     && memcmp(digest, msgDigest, digestLen) == 0);
+}
+
 @implementation SBCodesignCheck
 
 + (nullable NSString *)teamIdentifierAtPath:(NSString *)path {
@@ -331,11 +1052,11 @@ static BOOL SBVerifyPageHash(const uint8_t *page, size_t pageLen,
     if (!SBFindSignature(bytes, len, &sigOff, &sigSize, &reason)) {
         return nil;
     }
-    SBCodeDirectoryInfo info;
-    if (!SBParseCodeDirectory(bytes, len, sigOff, sigSize, &info, &reason)) {
+    SBSignatureInfo info;
+    if (!SBParseSignature(bytes, len, sigOff, sigSize, &info, &reason)) {
         return nil;
     }
-    return SBReadCDString(&info, info.teamOffset);
+    return SBReadCDString(&info.cd, info.cd.teamOffset);
 }
 
 + (BOOL)validateSignatureAtPath:(NSString *)path error:(NSError **)error {
@@ -356,14 +1077,14 @@ static BOOL SBVerifyPageHash(const uint8_t *page, size_t pageLen,
         }
         return NO;
     }
-    SBCodeDirectoryInfo info;
-    if (!SBParseCodeDirectory(bytes, len, sigOff, sigSize, &info, &reason)) {
+    SBSignatureInfo info;
+    if (!SBParseSignature(bytes, len, sigOff, sigSize, &info, &reason)) {
         if (error) {
             *error = SBCodeSignError([NSString stringWithFormat:@"签名结构无效：%@", reason]);
         }
         return NO;
     }
-    NSString *identifier = SBReadCDString(&info, info.identOffset);
+    NSString *identifier = SBReadCDString(&info.cd, info.cd.identOffset);
     if (identifier == nil || identifier.length == 0) {
         if (error) {
             *error = SBCodeSignError(@"签名结构无效：CodeDirectory 没有 identifier");
@@ -377,27 +1098,58 @@ static BOOL SBVerifyPageHash(const uint8_t *page, size_t pageLen,
         return NO;
     }
     // 每页内容哈希与 CodeDirectory 里存的哈希逐页比对。
-    uint32_t pageSize = 1u << info.pageSizeLog2;
-    for (uint32_t i = 0; i < info.nCodeSlots; i++) {
-        uint64_t pageStart = (uint64_t)i * pageSize;
-        if (pageStart >= info.codeLimit) {
-            if (error) {
+    uint32_t firstBadPage = 0;
+    if (!SBVerifyCDPages(bytes, &info.cd, &firstBadPage, &reason)) {
+        if (error) {
+            if (firstBadPage == UINT32_MAX) {
                 *error = SBCodeSignError(@"签名结构无效：代码页超出 codeLimit");
+            } else {
+                *error = SBCodeSignError([NSString stringWithFormat:@"签名校验失败：第 %u 页内容哈希与签名里存的不一致，文件可能被改过", firstBadPage]);
             }
-            return NO;
         }
-        uint64_t remaining = (uint64_t)info.codeLimit - pageStart;
-        size_t pageLen = (size_t)MIN((uint64_t)pageSize, remaining);
-        // 代码槽 i 在代码表起点 + i*hashSize（特殊槽在 hashOffset 之前，不占这里）。
-        const uint8_t *expected = info.cd + info.codeHashOffset
-            + (uint64_t)i * info.hashSize;
-        if (!SBVerifyPageHash(bytes + pageStart, pageLen,
-                             info.hashType, info.hashSize, expected)) {
+        return NO;
+    }
+    // 0.2.12：CMS 逐项——可解析、链完整、叶子未过期、摘要与 CD 对得上。
+    // 旧版只查“CMS 槽在不在”，截断/空 CMS、缺中间证书、过期叶子、签名后
+    // 改 CD 都能混过去，dyld 才在 dlopen 时报 code signature invalid。
+    SBCMSDetail cms;
+    SBInspectCMS(bytes + sigOff, sigSize, info.cmsOffset, info.cmsBlobLength,
+                 &info.cd, &cms);
+    if (!cms.parseOK || !cms.chainComplete || cms.leafExpired || !cms.cdHashOK) {
+        if (error) {
+            if (cms.error[0] != '\0') {
+                *error = SBCodeSignError([NSString stringWithFormat:@"签名校验失败：%@", [NSString stringWithUTF8String:cms.error]]);
+            } else if (cms.leafExpired) {
+                *error = SBCodeSignError([NSString stringWithFormat:@"签名校验失败：叶子证书已过期（到期 %@）", [NSString stringWithUTF8String:cms.leafExpiry]]);
+            } else if (!cms.cdHashOK) {
+                *error = SBCodeSignError(@"签名校验失败：CMS 摘要与 CodeDirectory 对不上，签名后文件被改过");
+            } else {
+                *error = SBCodeSignError(@"签名校验失败：CMS 证书链不完整");
+            }
+        }
+        return NO;
+    }
+    // 备用 CodeDirectory（SHA-256，dyld 优先用）页哈希。
+    if (info.hasAltCD) {
+        uint32_t altBadPage = 0;
+        if (!SBVerifyCDPages(bytes, &info.altCD, &altBadPage, &reason)) {
             if (error) {
-                *error = SBCodeSignError([NSString stringWithFormat:@"签名校验失败：第 %u 页内容哈希与签名里存的不一致，文件可能被改过", i]);
+                if (altBadPage == UINT32_MAX) {
+                    *error = SBCodeSignError(@"签名结构无效：备用 CodeDirectory 代码页超出 codeLimit");
+                } else {
+                    *error = SBCodeSignError([NSString stringWithFormat:@"签名校验失败：备用 CodeDirectory 第 %u 页内容哈希与签名里存的不一致", altBadPage]);
+                }
             }
             return NO;
         }
+    }
+    // 特殊槽（entitlements 等）哈希。
+    uint32_t badSlot = 0;
+    if (!SBVerifySpecialSlots(bytes + sigOff, sigSize, &info, &info.cd, &badSlot)) {
+        if (error) {
+            *error = SBCodeSignError([NSString stringWithFormat:@"签名校验失败：特殊槽 %u 哈希与签名里存的不一致，签名后文件被改过", badSlot]);
+        }
+        return NO;
     }
     return YES;
 }
@@ -412,6 +1164,23 @@ static BOOL SBVerifyPageHash(const uint8_t *page, size_t pageLen,
     detail[@"teamID"] = [NSNull null];
     detail[@"identifier"] = [NSNull null];
     detail[@"error"] = [NSNull null];
+    detail[@"structureOK"] = @NO; // superblob + 主 CD 是否解析成功
+    // 0.2.12 新增字段（缺省 = 未验出好结果，调用方按“坏”处理）。
+    detail[@"cmsLength"] = @0;
+    detail[@"cmsCertCount"] = @0;
+    detail[@"cmsHasWWDR"] = @NO;
+    detail[@"cmsChainComplete"] = @NO;
+    detail[@"cmsCDHashOK"] = @NO;
+    detail[@"cmsLeafCN"] = [NSNull null];
+    detail[@"cmsIntermediateCN"] = [NSNull null];
+    detail[@"cmsLeafExpiry"] = [NSNull null];
+    detail[@"cmsLeafExpired"] = @NO;
+    detail[@"cmsError"] = [NSNull null];
+    detail[@"hasAltCD"] = @NO;
+    detail[@"altPageHashOK"] = @YES; // 无备用 CD 时无可验，记 YES
+    detail[@"altFirstBadPage"] = [NSNull null];
+    detail[@"specialSlotsOK"] = @NO;
+    detail[@"badSpecialSlot"] = [NSNull null];
 
     NSData *fileData = [NSData dataWithContentsOfFile:path];
     if (fileData == nil) {
@@ -426,18 +1195,19 @@ static BOOL SBVerifyPageHash(const uint8_t *page, size_t pageLen,
         detail[@"error"] = [NSString stringWithFormat:@"签名结构无效：%@", reason ?: @"找不到签名块"];
         return detail;
     }
-    SBCodeDirectoryInfo info;
-    if (!SBParseCodeDirectory(bytes, len, sigOff, sigSize, &info, &reason)) {
+    SBSignatureInfo info;
+    if (!SBParseSignature(bytes, len, sigOff, sigSize, &info, &reason)) {
         detail[@"error"] = [NSString stringWithFormat:@"签名结构无效：%@", reason ?: @"解析 CodeDirectory 失败"];
         return detail;
     }
-    NSString *identifier = SBReadCDString(&info, info.identOffset);
+    detail[@"structureOK"] = @YES;
+    NSString *identifier = SBReadCDString(&info.cd, info.cd.identOffset);
     if (identifier.length > 0) {
         detail[@"identifier"] = identifier;
     } else {
         detail[@"error"] = @"CodeDirectory 没有 identifier";
     }
-    NSString *teamID = SBReadCDString(&info, info.teamOffset);
+    NSString *teamID = SBReadCDString(&info.cd, info.cd.teamOffset);
     if (teamID.length > 0) {
         detail[@"teamID"] = teamID;
     }
@@ -445,33 +1215,99 @@ static BOOL SBVerifyPageHash(const uint8_t *page, size_t pageLen,
     if (!info.hasSignatureSlot) {
         detail[@"error"] = @"superblob 里没有 CMS 签名块";
     }
-    detail[@"pageCount"] = @(info.nCodeSlots);
+    detail[@"pageCount"] = @(info.cd.nCodeSlots);
 
-    // 页哈希逐项验（与 validateSignature 同款循环；CMS 缺失也照验，
+    // 页哈希逐项验（与 validateSignature 同款；CMS 缺失也照验，
     // 各字段独立记，调用方在日志里分得清“CMS 缺失”和“页哈希不过”）。
-    uint32_t pageSize = 1u << info.pageSizeLog2;
-    BOOL pagesOK = YES;
-    for (uint32_t i = 0; i < info.nCodeSlots; i++) {
-        uint64_t pageStart = (uint64_t)i * pageSize;
-        if (pageStart >= info.codeLimit) {
+    uint32_t firstBadPage = 0;
+    BOOL pagesOK = SBVerifyCDPages(bytes, &info.cd, &firstBadPage, &reason);
+    if (!pagesOK) {
+        if (firstBadPage == UINT32_MAX) {
             detail[@"error"] = @"代码页超出 codeLimit";
-            pagesOK = NO;
-            break;
-        }
-        uint64_t remaining = (uint64_t)info.codeLimit - pageStart;
-        size_t pageLen = (size_t)MIN((uint64_t)pageSize, remaining);
-        const uint8_t *expected = info.cd + info.codeHashOffset
-            + (uint64_t)i * info.hashSize;
-        if (!SBVerifyPageHash(bytes + pageStart, pageLen,
-                             info.hashType, info.hashSize, expected)) {
-            detail[@"firstBadPage"] = @(i);
-            detail[@"error"] = [NSString stringWithFormat:@"第 %u 页内容哈希与签名里存的不一致，文件可能被改过", i];
-            pagesOK = NO;
-            break;
+        } else {
+            detail[@"firstBadPage"] = @(firstBadPage);
+            detail[@"error"] = [NSString stringWithFormat:@"第 %u 页内容哈希与签名里存的不一致，文件可能被改过", firstBadPage];
         }
     }
     detail[@"pageHashOK"] = @(pagesOK);
-    if (identifier.length > 0 && info.hasSignatureSlot && pagesOK) {
+
+    // 0.2.12：CMS 逐项（可解析、链完整、叶子未过期、摘要与 CD 对得上）。
+    SBCMSDetail cms;
+    memset(&cms, 0, sizeof(cms));
+    BOOL hasCMSDetail = NO;
+    if (info.hasSignatureSlot) {
+        SBInspectCMS(bytes + sigOff, sigSize, info.cmsOffset, info.cmsBlobLength,
+                     &info.cd, &cms);
+        hasCMSDetail = YES;
+        detail[@"cmsLength"] = @(cms.cmsDERLength);
+        detail[@"cmsCertCount"] = @(cms.certCount);
+        detail[@"cmsHasWWDR"] = @(cms.hasWWDR);
+        detail[@"cmsChainComplete"] = @(cms.chainComplete);
+        detail[@"cmsCDHashOK"] = @(cms.cdHashOK);
+        detail[@"cmsLeafExpired"] = @(cms.leafExpired);
+        if (cms.leafCN[0] != '\0') {
+            detail[@"cmsLeafCN"] = [NSString stringWithUTF8String:cms.leafCN];
+        }
+        if (cms.intermediateCN[0] != '\0') {
+            detail[@"cmsIntermediateCN"] = [NSString stringWithUTF8String:cms.intermediateCN];
+        }
+        if (cms.leafExpiry[0] != '\0') {
+            detail[@"cmsLeafExpiry"] = [NSString stringWithUTF8String:cms.leafExpiry];
+        }
+        if (cms.error[0] != '\0') {
+            detail[@"cmsError"] = [NSString stringWithUTF8String:cms.error];
+            if (detail[@"error"] == [NSNull null]) {
+                detail[@"error"] = detail[@"cmsError"];
+            }
+        } else if (cms.leafExpired) {
+            NSString *expired = [NSString stringWithFormat:@"叶子证书已过期（到期 %@）",
+                                 [NSString stringWithUTF8String:cms.leafExpiry]];
+            detail[@"cmsError"] = expired;
+            if (detail[@"error"] == [NSNull null]) {
+                detail[@"error"] = expired;
+            }
+        } else if (!cms.cdHashOK) {
+            detail[@"cmsError"] = @"CMS 摘要与 CodeDirectory 对不上，签名后文件被改过";
+            if (detail[@"error"] == [NSNull null]) {
+                detail[@"error"] = detail[@"cmsError"];
+            }
+        }
+    }
+
+    // 备用 CodeDirectory（SHA-256，dyld 优先用）页哈希。
+    BOOL altOK = YES;
+    if (info.hasAltCD) {
+        detail[@"hasAltCD"] = @YES;
+        uint32_t altBadPage = 0;
+        altOK = SBVerifyCDPages(bytes, &info.altCD, &altBadPage, &reason);
+        if (!altOK) {
+            if (altBadPage == UINT32_MAX) {
+                detail[@"error"] = @"备用 CodeDirectory 代码页超出 codeLimit";
+            } else {
+                detail[@"altFirstBadPage"] = @(altBadPage);
+                detail[@"error"] = [NSString stringWithFormat:@"备用 CodeDirectory 第 %u 页内容哈希与签名里存的不一致", altBadPage];
+            }
+        }
+    }
+    detail[@"altPageHashOK"] = @(altOK);
+
+    // 特殊槽（entitlements 等）哈希。
+    uint32_t badSlot = 0;
+    BOOL specialOK = SBVerifySpecialSlots(bytes + sigOff, sigSize, &info, &info.cd, &badSlot);
+    if (!specialOK) {
+        detail[@"badSpecialSlot"] = @(badSlot);
+        detail[@"error"] = [NSString stringWithFormat:@"特殊槽 %u 哈希与签名里存的不一致，签名后文件被改过", badSlot];
+    }
+    detail[@"specialSlotsOK"] = @(specialOK);
+
+    BOOL cmsOK = hasCMSDetail
+        && cms.cmsDERLength > 0
+        && cms.parseOK
+        && cms.chainComplete
+        && !cms.leafExpired
+        && cms.cdHashOK
+        && cms.error[0] == '\0';
+    if (identifier.length > 0 && pagesOK && altOK && specialOK && cmsOK) {
         detail[@"valid"] = @YES;
     }
     return detail;
