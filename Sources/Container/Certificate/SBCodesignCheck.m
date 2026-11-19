@@ -550,11 +550,11 @@ static BOOL SBDerReadTLV(const uint8_t *buf, size_t len, size_t off,
 typedef struct {
     SBDerTLV items[SBDerMaxChildren];
     uint32_t count;
-} SBDerChildren;
+} SBDerChildrenList;
 
 static BOOL SBDerChildren(const uint8_t *buf, size_t len,
                           const SBDerTLV *parent,
-                          SBDerChildren *out, NSString **reason, int depth) {
+                          SBDerChildrenList *out, NSString **reason, int depth) {
     size_t start = (size_t)(parent->content - buf);
     size_t end = start + parent->contentLen;
     size_t p = start;
@@ -716,13 +716,13 @@ static BOOL SBParseCert(const SBDerTLV *certTLV,
         if (reason) *reason = @"证书不是 SEQUENCE";
         return NO;
     }
-    SBDerChildren kids;
+    SBDerChildrenList kids;
     if (!SBDerChildren(buf, len, certTLV, &kids, reason, 0)) return NO;
     if (kids.count < 1 || kids.items[0].tag != 0x30) {
         if (reason) *reason = @"证书里没有 TBSCertificate";
         return NO;
     }
-    SBDerChildren tbs;
+    SBDerChildrenList tbs;
     if (!SBDerChildren(buf, len, &kids.items[0], &tbs, reason, 0)) return NO;
     // TBS：[0] 版本（可选）、INTEGER 序列号、SEQ 签名算法、SEQ issuer、
     // SEQ validity、SEQ subject。
@@ -743,7 +743,7 @@ static BOOL SBParseCert(const SBDerTLV *certTLV,
     SBDerTLV issuer = tbs.items[idx + 2];
     SBDerTLV validity = tbs.items[idx + 3];
     SBDerTLV subject = tbs.items[idx + 4];
-    SBDerChildren times;
+    SBDerChildrenList times;
     if (!SBDerChildren(buf, len, &validity, &times, reason, 0)) return NO;
     if (times.count < 2
         || (times.items[0].tag != 0x17 && times.items[0].tag != 0x18)
@@ -815,21 +815,21 @@ static void SBInspectCMS(const uint8_t *sig, uint32_t sigSize,
                  reason.UTF8String ?: "外层不是 SEQUENCE");
         return;
     }
-    SBDerChildren ci;
+    SBDerChildrenList ci;
     if (!SBDerChildren(der, derLen, &top, &ci, &reason, 0)
         || ci.count < 2 || ci.items[0].tag != 0x06 || ci.items[1].tag != 0xA0) {
         snprintf(out->error, sizeof(out->error), "CMS 解析失败：%s",
                  reason.UTF8String ?: "ContentInfo 结构不对");
         return;
     }
-    SBDerChildren sdWrap;
+    SBDerChildrenList sdWrap;
     if (!SBDerChildren(der, derLen, &ci.items[1], &sdWrap, &reason, 0)
         || sdWrap.count < 1 || sdWrap.items[0].tag != 0x30) {
         snprintf(out->error, sizeof(out->error), "CMS 解析失败：%s",
                  reason.UTF8String ?: "没有 SignedData");
         return;
     }
-    SBDerChildren sd;
+    SBDerChildrenList sd;
     if (!SBDerChildren(der, derLen, &sdWrap.items[0], &sd, &reason, 0)
         || sd.count < 3 || sd.items[0].tag != 0x02
         || sd.items[1].tag != 0x31 || sd.items[2].tag != 0x30) {
@@ -843,7 +843,7 @@ static void SBInspectCMS(const uint8_t *sig, uint32_t sigSize,
     const SBDerTLV *signerInfos = NULL;
     for (uint32_t i = 3; i < sd.count; i++) {
         if (sd.items[i].tag == 0xA0 && certCount == 0) {
-            SBDerChildren certKids;
+            SBDerChildrenList certKids;
             if (!SBDerChildren(der, derLen, &sd.items[i], &certKids, &reason, 0)) {
                 snprintf(out->error, sizeof(out->error), "CMS 解析失败：%s",
                          reason.UTF8String ?: "证书集结构不对");
@@ -870,14 +870,14 @@ static void SBInspectCMS(const uint8_t *sig, uint32_t sigSize,
         snprintf(out->error, sizeof(out->error), "CMS 解析失败：没有 SignerInfo");
         return;
     }
-    SBDerChildren siSet;
+    SBDerChildrenList siSet;
     if (!SBDerChildren(der, derLen, signerInfos, &siSet, &reason, 0)
         || siSet.count < 1 || siSet.items[0].tag != 0x30) {
         snprintf(out->error, sizeof(out->error), "CMS 解析失败：%s",
                  reason.UTF8String ?: "SignerInfo 不是 SEQUENCE");
         return;
     }
-    SBDerChildren si;
+    SBDerChildrenList si;
     if (!SBDerChildren(der, derLen, &siSet.items[0], &si, &reason, 0)
         || si.count < 3 || si.items[0].tag != 0x02
         || si.items[1].tag != 0x30 || si.items[2].tag != 0x30) {
@@ -886,7 +886,7 @@ static void SBInspectCMS(const uint8_t *sig, uint32_t sigSize,
         return;
     }
     // 摘要算法 OID（SignerInfo 的 digestAlgorithm SEQ 的首个 OID）。
-    SBDerChildren algSeq;
+    SBDerChildrenList algSeq;
     static const uint8_t kSHA1OID[5] = { 0x2B, 0x0E, 0x03, 0x02, 0x1A };
     static const uint8_t kSHA256OID[9] = { 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01 };
     static const uint8_t kSHA384OID[9] = { 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02 };
@@ -908,7 +908,7 @@ static void SBInspectCMS(const uint8_t *sig, uint32_t sigSize,
     uint32_t msgDigestLen = 0;
     for (uint32_t i = 3; i < si.count; i++) {
         if (si.items[i].tag != 0xA0) continue;
-        SBDerChildren attrs;
+        SBDerChildrenList attrs;
         if (!SBDerChildren(der, derLen, &si.items[i], &attrs, &reason, 0)) {
             snprintf(out->error, sizeof(out->error), "CMS 解析失败：%s",
                      reason.UTF8String ?: "签名属性结构不对");
@@ -916,7 +916,7 @@ static void SBInspectCMS(const uint8_t *sig, uint32_t sigSize,
         }
         for (uint32_t a = 0; a < attrs.count; a++) {
             if (attrs.items[a].tag != 0x30) continue;
-            SBDerChildren attr;
+            SBDerChildrenList attr;
             if (!SBDerChildren(der, derLen, &attrs.items[a], &attr, NULL, 0)
                 || attr.count < 2 || attr.items[0].tag != 0x06
                 || attr.items[0].contentLen != 9
@@ -924,7 +924,7 @@ static void SBInspectCMS(const uint8_t *sig, uint32_t sigSize,
                 || attr.items[1].tag != 0x31) {
                 continue;
             }
-            SBDerChildren vals;
+            SBDerChildrenList vals;
             if (!SBDerChildren(der, derLen, &attr.items[1], &vals, NULL, 0)
                 || vals.count < 1 || vals.items[0].tag != 0x04) {
                 continue;
