@@ -9,6 +9,12 @@
 //   dylib 去重（重复的 LC_LOAD_DYLIB 等改写为无效命令号 0x114515）、
 //   链式修正段数不匹配不再当安装失败（只置 segMismatchOut 标记，继续打补丁与签名，
 //   启动时 dyld 会按原文报错；iOS 27 的绕过 v1 没有，见 MODULE_NOTES）。
+// 0.2.16 新增：去掉 LC_MAIN——LC_MAIN 是主程序入口命令，dylib 带它 dyld
+//   不认（0.2.15 真机：execSeg 修好后 dlopen 仍报 code signature invalid，
+//   errno 从 85 变成 1；同一份日志里客 dylib 带 LC_MAIN=在，宿主自带 dylib
+//   都没有 LC_MAIN 且能正常加载）。入口偏移不丢：调用方在打补丁前用
+//   SBMachOEntryOffset 读出、存进安装记录，加载器跳入客 main 时从记录里取
+//   （读不到时回退到读文件 LC_MAIN，见 SBGuestBootstrap）。
 //
 // 注意：打补丁会使原有代码签名失效，调用方（SBInstaller）打完补丁后必须重签。
 
@@ -35,6 +41,9 @@ extern "C" {
 #define SB_MACHO_PATCH_ERR_NO_SPACE 5
 // 非 arm64 / arm64e 架构（如只有 x86_64 切片的 fat 包）。
 #define SB_MACHO_PATCH_ERR_UNSUPPORTED_ARCH 7
+// 打完校验失败：改完后 filetype 不是 MH_DYLIB、或 LC_ID_DYLIB 缺失、
+// 或 LC_MAIN 还在（0.2.16 新增，见 SBMachOPatchExecutable 注释）。
+#define SB_MACHO_PATCH_ERR_VERIFY 8
 
 // __PAGEZERO 段打补丁后的取值：vmaddr = 0x100000000 - 0x4000，vmsize = 0x4000。
 #define SB_MACHO_PATCH_PAGEZERO_VMADDR 0xFFFFC000ULL
@@ -53,8 +62,19 @@ extern "C" {
 ///   其中加密检测在任何修改前完成，所以加密包原样不动。
 ///   同一路径已注入时不重复注入，直接返回成功。
 ///   只处理小端 arm64 / arm64e；32 位返回 `SB_MACHO_PATCH_ERR_UNSUPPORTED_32BIT`。
+///   0.2.16：打完逐切片校验 filetype=MH_DYLIB、LC_ID_DYLIB 在位（id_name
+///   给了时）、LC_MAIN 已去掉，任一不符返回 `SB_MACHO_PATCH_ERR_VERIFY`，
+///   文件不写回。
 int32_t SBMachOPatchExecutable(const char *path, const char *hooks_dylib_path,
                                int *seg_mismatch_out);
+
+/// 读 Mach-O 的 LC_MAIN entryoff（打补丁前调：打补丁会去掉 LC_MAIN，
+/// 入口偏移须先读出、存进安装记录，供加载器跳入客 main 用）。
+/// fat 包取 arm64e 优先、其次首个 arm64 切片（与 SBGuestEntry 的取片
+/// 偏好一致）；薄包直接读自身。
+/// - Returns: 找到 LC_MAIN 时返回 1 并写 *entryoffOut；否则返回 0
+///   （不是 Mach-O、没有 arm64 切片、没有 LC_MAIN 均返回 0，不报错）。
+int SBMachOEntryOffset(const char *path, uint64_t *entryoffOut);
 
 /// 给单个 Mach-O 文件的 arm64e 切片补 CPU_SUBTYPE_LIB64 标记
 ///（LiveContainer 的 LCPatchMachOFixupARM64eSlice 同款做法，包内 .dylib 与

@@ -46,6 +46,12 @@ struct SBInstalledApp: Codable, Identifiable, Equatable {
     /// 会按原文报错，iOS 27 上大概率起不来）。记在记录里，供详情页 / 诊断参考。
     var segCountMismatch: Bool
 
+    /// 客主程序 LC_MAIN 的 entryoff（0.2.16：打补丁去掉 LC_MAIN 后，入口偏移
+    /// 不再从文件里读，改从这里取——安装/重打补丁时在打补丁前读出存入；
+    /// 旧记录（无此键）解码为 nil，加载时回退到读文件 LC_MAIN）。
+    /// nil 表示未知（本身就是 dylib、无 LC_MAIN，或 0.2.16 之前装的包）。
+    var entryOffset: UInt64?
+
     /// 安装时所用证书的 SHA-256 指纹（SecCertificateCopyData 后取 SHA-256 hex）；
     /// 未签名安装时为 nil。证书更换后靠它判断是否需要重签（设计 §4.7）。
     var signingCertFingerprint: String?
@@ -74,6 +80,7 @@ struct SBInstalledApp: Codable, Identifiable, Equatable {
          signed: Bool,
          needsJIT: Bool = false,
          segCountMismatch: Bool = false,
+         entryOffset: UInt64? = nil,
          lastLaunchResult: SBLaunchResult? = nil,
          signingCertFingerprint: String? = nil,
          needsReimport: Bool = false,
@@ -92,6 +99,7 @@ struct SBInstalledApp: Codable, Identifiable, Equatable {
         self.signed = signed
         self.needsJIT = needsJIT
         self.segCountMismatch = segCountMismatch
+        self.entryOffset = entryOffset
         self.lastLaunchResult = lastLaunchResult
         self.signingCertFingerprint = signingCertFingerprint
         self.needsReimport = needsReimport
@@ -102,7 +110,7 @@ struct SBInstalledApp: Codable, Identifiable, Equatable {
     enum CodingKeys: String, CodingKey {
         case recordID, bundleID, displayName, version, shortVersion
         case executableName, containerUUID, keychainGroup, installedDate
-        case patchRevision, signed, needsJIT, segCountMismatch, lastLaunchResult
+        case patchRevision, signed, needsJIT, segCountMismatch, entryOffset, lastLaunchResult
         case signingCertFingerprint, needsReimport, diskDirectoryName
         case sourceIPAFileName
     }
@@ -123,6 +131,7 @@ struct SBInstalledApp: Codable, Identifiable, Equatable {
         signed = try container.decode(Bool.self, forKey: .signed)
         needsJIT = try container.decode(Bool.self, forKey: .needsJIT)
         segCountMismatch = try container.decodeIfPresent(Bool.self, forKey: .segCountMismatch) ?? false
+        entryOffset = try container.decodeIfPresent(UInt64.self, forKey: .entryOffset)
         lastLaunchResult = try container.decodeIfPresent(SBLaunchResult.self, forKey: .lastLaunchResult)
         signingCertFingerprint = try container.decodeIfPresent(String.self, forKey: .signingCertFingerprint)
         needsReimport = try container.decodeIfPresent(Bool.self, forKey: .needsReimport) ?? false

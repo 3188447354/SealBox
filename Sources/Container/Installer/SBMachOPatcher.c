@@ -193,6 +193,10 @@ static int32_t sb_patch_thin_slice(uint8_t *base, size_t size, const char *hooks
     int has_id_dylib = 0;
     int has_rpath_tweaks = 0;
     int has_rpath_loader = 0;
+    // 0.2.16：LC_MAIN 的位置与大小（第二遍去掉它；只记第一条，多条是
+    // 损坏文件，打完校验会拦）。lc_main_size == 0 表示没有 LC_MAIN。
+    size_t lc_main_off = 0;
+    uint32_t lc_main_size = 0;
     // 加载命令区末尾到第一份文件内容之间的空闲空间上界：
     // 取所有 section offset 与文件内容起点（fileoff >= 加载命令区末尾）的最小值。
     size_t free_end = size;
@@ -263,6 +267,15 @@ static int32_t sb_patch_thin_slice(uint8_t *base, size_t size, const char *hooks
                 has_dylinker = 1;
                 dylinker_off = p;
                 dylinker_size = lc->cmdsize;
+                break;
+            }
+            case LC_MAIN: {
+                // 0.2.16：只记第一条；多条 LC_MAIN 是损坏文件，
+                // 打完校验（LC_MAIN 须已去掉）会拦。
+                if (lc_main_size == 0) {
+                    lc_main_off = p;
+                    lc_main_size = lc->cmdsize;
+                }
                 break;
             }
             case LC_ID_DYLIB: {
@@ -336,6 +349,33 @@ static int32_t sb_patch_thin_slice(uint8_t *base, size_t size, const char *hooks
             if (seg_mismatch_out) {
                 *seg_mismatch_out = 1;
             }
+        }
+    }
+
+    // ---- 去掉 LC_MAIN（0.2.16）：LC_MAIN 是主程序入口命令，dylib 带它
+    // dyld 不认（0.2.15 真机：execSeg 修好后 dlopen 仍报 code signature
+    // invalid，errno 从 85 变成 1；同一份日志里客 dylib 带 LC_MAIN=在，
+    // 宿主自带 dylib 都没有 LC_MAIN 且能正常加载）。后面的命令整体前移，
+    // ncmds/sizeofcmds 跟着减；空出的尾部清零（不留旧命令残影）。
+    // 入口偏移不丢：调用方在打补丁前用 SBMachOEntryOffset 读出、存进安装
+    // 记录，加载器跳入客 main 时从记录里取（见 SBGuestBootstrap）。
+    // dylinker 在 LC_MAIN 之后时它的偏移跟着减（一般在前，防御性处理）；
+    // pagezero_cmd 是指向命令区的指针，第二遍改 __PAGEZERO 时还要用，
+    // LC_MAIN 在它之前时指针要跟着减（实践中 __PAGEZERO 总是第一条段命令、
+    // LC_MAIN 在后，这里是不靠顺序假设的防御）；fixups_cmd 只在上面
+    // 的校验里用、去掉之后不再用，不用调。
+    if (lc_main_size != 0) {
+        size_t tail_off = lc_main_off + lc_main_size;
+        size_t tail_len = cmds_end - tail_off;
+        memmove(base + lc_main_off, base + tail_off, tail_len);
+        memset(base + cmds_end - lc_main_size, 0, lc_main_size);
+        header->ncmds -= 1;
+        header->sizeofcmds -= lc_main_size;
+        if (has_dylinker && dylinker_off > lc_main_off) {
+            dylinker_off -= lc_main_size;
+        }
+        if (pagezero_cmd != NULL && (uint8_t *)pagezero_cmd >= base + lc_main_off) {
+            pagezero_cmd = (struct segment_command_64 *)((uint8_t *)pagezero_cmd - lc_main_size);
         }
     }
 
@@ -506,6 +546,43 @@ static int32_t sb_patch_thin_slice(uint8_t *base, size_t size, const char *hooks
                 q += lc->cmdsize;
             }
             free(seen);
+        }
+    }
+
+    // ---- 打完校验（0.2.16）：filetype 须是 MH_DYLIB、LC_ID_DYLIB 在位
+    // （id_name 给了时）、LC_MAIN 须已去掉。任一不符返回校验错，调用方
+    // 不写回文件（SBMachOPatchExecutable 只在全部切片 OK 时写回）。
+    // 注意：去重步骤把重复的 LC_LOAD_DYLIB 改写成无效命令号 0x114515，
+    // 那不是 LC_ID_DYLIB/LC_MAIN，校验时跳过。
+    {
+        size_t q = sizeof(struct mach_header_64);
+        size_t cmds_end_now = sizeof(struct mach_header_64) + header->sizeofcmds;
+        int saw_id = 0, saw_main = 0;
+        for (uint32_t i = 0; i < header->ncmds; i++) {
+            if (!sb_range_ok(q, sizeof(struct load_command), cmds_end_now)) {
+                return SB_MACHO_PATCH_ERR_VERIFY;
+            }
+            struct load_command *lc = (struct load_command *)(base + q);
+            if (lc->cmdsize < sizeof(struct load_command) ||
+                !sb_range_ok(q, lc->cmdsize, cmds_end_now)) {
+                return SB_MACHO_PATCH_ERR_VERIFY;
+            }
+            if (lc->cmd == LC_ID_DYLIB) {
+                saw_id = 1;
+            }
+            if (lc->cmd == LC_MAIN) {
+                saw_main = 1;
+            }
+            q += lc->cmdsize;
+        }
+        if (header->filetype != MH_DYLIB) {
+            return SB_MACHO_PATCH_ERR_VERIFY;
+        }
+        if (saw_main) {
+            return SB_MACHO_PATCH_ERR_VERIFY;
+        }
+        if (id_name != NULL && id_name[0] != '\0' && !saw_id) {
+            return SB_MACHO_PATCH_ERR_VERIFY;
         }
     }
 
@@ -741,4 +818,101 @@ int SBMachOHasIDDylib(const char *path) {
     }
     free(buffer);
     return result;
+}
+
+/// 一个 thin 切片里 LC_MAIN 的 entryoff（只认 64 位头；越界/无 LC_MAIN 返回 0）。
+/// entry_point_command 布局：cmd(4) cmdsize(4) entryoff(8) stacksize(8)。
+static int sb_slice_entry_offset(const uint8_t *base, size_t size, uint64_t *entryoff_out) {
+    if (size < sizeof(struct mach_header_64)) {
+        return 0;
+    }
+    if (*(const uint32_t *)base != MH_MAGIC_64) {
+        return 0;
+    }
+    const struct mach_header_64 *header = (const struct mach_header_64 *)base;
+    if (header->cputype != CPU_TYPE_ARM64) {
+        return 0;
+    }
+    size_t offset = sizeof(struct mach_header_64);
+    for (uint32_t i = 0; i < header->ncmds; i++) {
+        if (!sb_range_ok(offset, 8, size)) {
+            return 0;
+        }
+        uint32_t cmd = *(const uint32_t *)(base + offset);
+        uint32_t cmdsize = *(const uint32_t *)(base + offset + 4);
+        if (cmdsize < 8 || !sb_range_ok(offset, cmdsize, size)) {
+            return 0;
+        }
+        if (cmd == LC_MAIN) {
+            if (cmdsize < sizeof(struct entry_point_command)) {
+                return 0;
+            }
+            *entryoff_out = *(const uint64_t *)(base + offset + 8);
+            return 1;
+        }
+        offset += cmdsize;
+    }
+    return 0;
+}
+
+int SBMachOEntryOffset(const char *path, uint64_t *entryoffOut) {
+    if (path == NULL || entryoffOut == NULL) {
+        return 0;
+    }
+    *entryoffOut = 0;
+    size_t size = 0;
+    uint8_t *buffer = sb_read_file(path, &size);
+    if (buffer == NULL || size < sizeof(uint32_t)) {
+        free(buffer); // 1–3 字节的文件也到不了 Mach-O，直接返回 0
+        return 0;
+    }
+    int found = 0;
+    uint64_t entryoff = 0;
+    uint32_t magic = *(uint32_t *)buffer;
+    if (magic == FAT_MAGIC || magic == FAT_CIGAM) {
+        // fat 包：取 arm64e 优先、其次首个 arm64 切片（与 SBGuestEntry
+        // 的取片偏好一致——加载器只用这一个切片的 entryoff 跳入口）。
+        if (size >= sizeof(struct fat_header)) {
+            struct fat_header *fat_header = (struct fat_header *)buffer;
+            uint32_t nfat_arch = (uint32_t)OSSwapBigToHostInt32(fat_header->nfat_arch);
+            uint32_t arm64_off = 0, arm64_size = 0;
+            int saw_arm64 = 0;
+            for (uint32_t i = 0; i < nfat_arch; i++) {
+                size_t arch_off = sizeof(struct fat_header) + (size_t)i * sizeof(struct fat_arch);
+                if (!sb_range_ok(arch_off, sizeof(struct fat_arch), size)) {
+                    break;
+                }
+                struct fat_arch *arch = (struct fat_arch *)(buffer + arch_off);
+                cpu_type_t cputype = OSSwapBigToHostInt32(arch->cputype);
+                cpu_subtype_t cpusubtype = OSSwapBigToHostInt32(arch->cpusubtype);
+                uint32_t offset = (uint32_t)OSSwapBigToHostInt32(arch->offset);
+                uint32_t arch_size = (uint32_t)OSSwapBigToHostInt32(arch->size);
+                if (cputype != CPU_TYPE_ARM64 || !sb_range_ok(offset, arch_size, size)) {
+                    continue;
+                }
+                if (((uint32_t)cpusubtype & ~0x80000000u) == (uint32_t)CPU_SUBTYPE_ARM64E) {
+                    arm64_off = offset;
+                    arm64_size = arch_size;
+                    saw_arm64 = 1;
+                    break;
+                }
+                if (!saw_arm64) {
+                    arm64_off = offset;
+                    arm64_size = arch_size;
+                    saw_arm64 = 1;
+                }
+            }
+            if (saw_arm64) {
+                found = sb_slice_entry_offset(buffer + arm64_off, arm64_size, &entryoff);
+            }
+        }
+    } else if (magic == MH_MAGIC_64) {
+        found = sb_slice_entry_offset(buffer, size, &entryoff);
+    }
+    free(buffer);
+    if (found) {
+        *entryoffOut = entryoff;
+        return 1;
+    }
+    return 0;
 }

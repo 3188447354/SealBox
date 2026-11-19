@@ -101,6 +101,14 @@ public enum SBInstaller {
                 throw SBError.patchFailed(reason: "找不到可执行文件 \(parsed.executableName)")
             }
             let hooksDylibPath = "@loader_path/../../Tweaks/\(SBConstants.guestHooksDylibName)"
+            // 0.2.16：打补丁前先读 LC_MAIN 的 entryoff——打补丁会去掉 LC_MAIN，
+            // 入口偏移须先存进安装记录，供加载器跳入客 main 用（见 SBGuestBootstrap）。
+            // 读不到（本身就是 dylib、无 LC_MAIN）时记 nil，加载时回退到读文件 LC_MAIN。
+            var entryOffset: UInt64? = nil
+            var rawEntryOffset: UInt64 = 0
+            if SBMachOEntryOffset(executablePath, &rawEntryOffset) != 0 {
+                entryOffset = rawEntryOffset
+            }
             // 0.2.5：段数不一致不再抛错，置标记记进安装记录（启动时 dyld 会按原文报错）。
             var segMismatch: Int32 = 0
             let patchResult = SBMachOPatchExecutable(executablePath, hooksDylibPath, &segMismatch)
@@ -241,6 +249,7 @@ public enum SBInstaller {
                 signed: signed,
                 needsJIT: false,
                 segCountMismatch: segCountMismatch,
+                entryOffset: entryOffset,
                 lastLaunchResult: nil,
                 signingCertFingerprint: signingCertFingerprint,
                 diskDirectoryName: destinationDir.lastPathComponent,
@@ -347,6 +356,14 @@ public enum SBInstaller {
         var signingCertFingerprint: String? = nil
         do {
             let hooksDylibPath = "@loader_path/../../Tweaks/\(SBConstants.guestHooksDylibName)"
+            // 0.2.16：打补丁前先读 LC_MAIN 的 entryoff（同安装路径）。
+            // 文件已是 0.2.16 打过的（LC_MAIN 已去掉）时读不到，用旧记录
+            // 里存的值，不丢入口。
+            var repatchEntryOffset: UInt64? = nil
+            var rawRepatchEntryOffset: UInt64 = 0
+            if SBMachOEntryOffset(executablePath, &rawRepatchEntryOffset) != 0 {
+                repatchEntryOffset = rawRepatchEntryOffset
+            }
             var segMismatch: Int32 = 0
             let patchResult = SBMachOPatchExecutable(executablePath, hooksDylibPath, &segMismatch)
             guard patchResult == SB_MACHO_PATCH_OK else {
@@ -450,6 +467,7 @@ public enum SBInstaller {
             signed: signed,
             needsJIT: record.needsJIT,
             segCountMismatch: segCountMismatch,
+            entryOffset: repatchEntryOffset ?? record.entryOffset,
             lastLaunchResult: nil,
             signingCertFingerprint: signingCertFingerprint,
             needsReimport: record.needsReimport,
@@ -521,6 +539,10 @@ public enum SBInstaller {
         let fileType = (detail["fileType"] as? NSNumber)?.intValue ?? 0
         let cryptid = (detail["cryptid"] as? NSNumber)?.intValue ?? 0
         let hasLCMain = (detail["hasLCMain"] as? NSNumber)?.boolValue ?? false
+        let lcMainOK = (detail["lcMainOK"] as? NSNumber)?.boolValue ?? false
+        // 0.2.16：结构解析失败时各逐项字段全是缺省值（lcMainOK 缺省 NO），
+        // 不能把“没读到”标成“不相容”误导诊断——只在解析成功时标注。
+        let structureOK = (detail["structureOK"] as? NSNumber)?.boolValue ?? false
         let idDylibName = detail["idDylibName"] as? String ?? ""
         let hasAltCD = (detail["hasAltCD"] as? NSNumber)?.boolValue ?? false
         let altPageHashOK = (detail["altPageHashOK"] as? NSNumber)?.boolValue ?? true
@@ -551,7 +573,7 @@ public enum SBInstaller {
         case 8: fileTypeName = "MH_BUNDLE"
         default: fileTypeName = "0x\(String(fileType, radix: 16))"
         }
-        fields += " CD[ver=0x\(String(cdVersion, radix: 16)) flags=0x\(String(cdFlags, radix: 16)) execSegFlags=0x\(String(cdExecSegFlags, radix: 16))\(cdExecSegOK ? "" : " 不相容") execSegLimit=0x\(String(cdExecSegLimit, radix: 16)) 限=0x\(String(cdCodeLimit, radix: 16)) sha\(cdHashType == 2 ? "256" : "1") 页2^\(cdPageSizeLog2)] 文件=\(fileTypeName) 加密=\(cryptid) LC_MAIN=\(hasLCMain ? "在" : "无") ID=\(idDylibName.isEmpty ? "无" : idDylibName)"
+        fields += " CD[ver=0x\(String(cdVersion, radix: 16)) flags=0x\(String(cdFlags, radix: 16)) execSegFlags=0x\(String(cdExecSegFlags, radix: 16))\(cdExecSegOK ? "" : " 不相容") execSegLimit=0x\(String(cdExecSegLimit, radix: 16)) 限=0x\(String(cdCodeLimit, radix: 16)) sha\(cdHashType == 2 ? "256" : "1") 页2^\(cdPageSizeLog2)] 文件=\(fileTypeName) 加密=\(cryptid) LC_MAIN=\(hasLCMain ? "在" : "无")\((lcMainOK || !structureOK) ? "" : " 不相容") ID=\(idDylibName.isEmpty ? "无" : idDylibName)"
         if !cmsSignatureError.isEmpty {
             fields += " CMS验签原因：\(cmsSignatureError)"
         } else if !cmsAppleAttrsError.isEmpty {
@@ -621,6 +643,14 @@ public enum SBInstaller {
             let ft = (detail["fileType"] as? NSNumber)?.intValue ?? 0
             let ftName = ft == 2 ? "MH_EXECUTE" : ft == 6 ? "MH_DYLIB" : ft == 8 ? "MH_BUNDLE" : "0x\(String(ft, radix: 16))"
             items.append("CD 声明自己是主程序（execSegFlags=0x\(String(flags, radix: 16)) 含 MAIN_BINARY），但文件是 \(ftName)，内核不认这种签名，须重签")
+        }
+        // 0.2.16：LC_MAIN 相容性——不是签名项，是 dylib 可用性：dylib 带
+        // LC_MAIN 时 dyld 无法以 dylib 方式加载，须重打补丁去掉 LC_MAIN
+        // （新打补丁器去掉它；入口偏移打补丁前已存进安装记录）。
+        if !((detail["lcMainOK"] as? NSNumber)?.boolValue ?? false) {
+            let ft = (detail["fileType"] as? NSNumber)?.intValue ?? 0
+            let ftName = ft == 2 ? "MH_EXECUTE" : ft == 6 ? "MH_DYLIB" : ft == 8 ? "MH_BUNDLE" : "0x\(String(ft, radix: 16))"
+            items.append("dylib 带有 LC_MAIN（主程序入口命令），但文件是 \(ftName)，dyld 无法加载，须重打补丁去掉 LC_MAIN")
         }
         if !((detail["pageHashOK"] as? NSNumber)?.boolValue ?? false) {
             if let bad = detail["firstBadPage"] as? NSNumber {
@@ -808,6 +838,8 @@ public enum SBInstaller {
             return .patchFailed(reason: "可执行文件内没有足够空间注入启动组件")
         case SB_MACHO_PATCH_ERR_UNSUPPORTED_ARCH:
             return .patchFailed(reason: "该应用不是 arm64 架构")
+        case SB_MACHO_PATCH_ERR_VERIFY:
+            return .patchFailed(reason: "打补丁后校验失败（文件类型 / LC_ID_DYLIB / LC_MAIN 与预期不符），该应用无法启动")
         default:
             return .patchFailed(reason: "打补丁失败（错误码 \(code)）")
         }

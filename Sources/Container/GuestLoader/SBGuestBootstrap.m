@@ -201,6 +201,62 @@ static void SBDiagLogGuestFail(SBGuestLoaderErrorCode code, NSString *bundleID, 
     SBDiagLogLine([[NSString stringWithFormat:@"客加载失败：[code=%ld] %@ %@ %@", (long)code, bundleID ?: @"", path ?: @"", message ?: @""] UTF8String]);
 }
 
+/// 读安装记录里的 entryOffset（0.2.16：打补丁去掉 LC_MAIN 后，入口偏移
+/// 不再从文件里读，改从记录里取）。记录存在 App Group UserDefaults 的
+/// SBInstalledApps（Swift Codable JSON 数组，键名与 SBInstalledApp 属性
+/// 名一致），按 bundleID + diskDirectoryName 匹配（平行安装同名记录共存；
+/// 目录名对不上时退到只按 bundleID 取首条，与 Swift 侧查记录的回退一致）。
+/// 找不到、或值为 0 时返回 0，调用方回退到读文件 LC_MAIN。
++ (uint64_t)storedEntryOffsetForBundleID:(NSString *)bundleID
+                      diskDirectoryName:(NSString *)diskDirectoryName {
+    if (bundleID.length == 0) {
+        return 0;
+    }
+    NSData *data = [[SBGuestLoader sharedDefaults] objectForKey:@"SBInstalledApps"];
+    if (![data isKindOfClass:[NSData class]] || data.length == 0) {
+        return 0;
+    }
+    id object = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+    if (![object isKindOfClass:[NSArray class]]) {
+        return 0;
+    }
+    NSDictionary *bundleOnlyMatch = nil;
+    for (id item in (NSArray *)object) {
+        if (![item isKindOfClass:[NSDictionary class]]) {
+            continue;
+        }
+        NSDictionary *record = (NSDictionary *)item;
+        NSString *recordBundleID = record[@"bundleID"];
+        if (![recordBundleID isKindOfClass:[NSString class]] ||
+            ![recordBundleID isEqualToString:bundleID]) {
+            continue;
+        }
+        if (bundleOnlyMatch == nil) {
+            bundleOnlyMatch = record;
+        }
+        NSString *recordDir = record[@"diskDirectoryName"];
+        if (diskDirectoryName.length == 0) {
+            continue;
+        }
+        if (![recordDir isKindOfClass:[NSString class]] ||
+            ![recordDir isEqualToString:diskDirectoryName]) {
+            continue;
+        }
+        NSNumber *entryOffset = record[@"entryOffset"];
+        if ([entryOffset isKindOfClass:[NSNumber class]]) {
+            return [entryOffset unsignedLongLongValue];
+        }
+        return 0;
+    }
+    if (bundleOnlyMatch != nil) {
+        NSNumber *entryOffset = bundleOnlyMatch[@"entryOffset"];
+        if ([entryOffset isKindOfClass:[NSNumber class]]) {
+            return [entryOffset unsignedLongLongValue];
+        }
+    }
+    return 0;
+}
+
 + (BOOL)loadGuestWithBundleID:(NSString *)bundleID
                 containerUUID:(NSString *)containerUUID
             diskDirectoryName:(NSString *)diskDirectoryName
@@ -454,7 +510,14 @@ static void SBDiagLogGuestFail(SBGuestLoaderErrorCode code, NSString *bundleID, 
     // —— 8. 取入口并跳入客 main ————————————————————————————————
     uint64_t entryoff = 0;
     NSError *entryError = nil;
-    if (!getAppEntryPoint(guestExecPath, &entryoff, &entryError)) {
+    // 0.2.16：打补丁已去掉 LC_MAIN，入口偏移优先从安装记录里取；旧记录
+    // （entryOffset 为空，文件仍带 LC_MAIN）回退到读文件 LC_MAIN。
+    uint64_t storedEntryoff = [self storedEntryOffsetForBundleID:bundleID
+                                               diskDirectoryName:diskDirectoryName];
+    if (storedEntryoff != 0) {
+        entryoff = storedEntryoff;
+        SBDiagLogLine([[NSString stringWithFormat:@"客入口：entryoff 取自安装记录 0x%llx（打补丁时已去掉 LC_MAIN）", (unsigned long long)entryoff] UTF8String]);
+    } else if (!getAppEntryPoint(guestExecPath, &entryoff, &entryError)) {
         NSInteger entryCode = entryError ? entryError.code : SBGuestLoaderErrorEntryPointNotFound;
         SBDiagLogGuestFail((SBGuestLoaderErrorCode)entryCode, bundleID, guestExecPath,
                            [NSString stringWithFormat:@"取客 App 入口失败：%@", entryError.localizedDescription ?: @"未知原因"]);

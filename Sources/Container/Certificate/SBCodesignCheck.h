@@ -29,24 +29,27 @@ NS_ASSUME_NONNULL_BEGIN
 + (nullable NSString *)teamIdentifierAtPath:(NSString *)path;
 
 /// 结构校验签名（0.2.12 收紧，0.2.14 再加 CMS 签名值密码学验签与
-/// Apple 9.1/9.2 属性比对，0.2.15 再加 CD execSeg 相容性）：superblob 与
-/// CodeDirectory 可解析、identifier 非空、每页内容哈希与 CodeDirectory 存的
-/// 哈希一致、CMS 签名块可解析且证书链完整、叶子未过期、CMS 摘要与 CodeDirectory
-/// 对得上、CMS 签名值验签过、Apple 属性对上、备用 CodeDirectory 页哈希与
-/// 特殊槽哈希全过、CD execSegFlags 与文件类型相容（dylib 的 CD 不能带
-/// MAIN_BINARY，否则签名全过、内核照样拒收）。
+/// Apple 9.1/9.2 属性比对，0.2.15 再加 CD execSeg 相容性，0.2.16 再加
+/// LC_MAIN 相容性）：superblob 与 CodeDirectory 可解析、identifier 非空、
+/// 每页内容哈希与 CodeDirectory 存的哈希一致、CMS 签名块可解析且证书链完整、
+/// 叶子未过期、CMS 摘要与 CodeDirectory 对得上、CMS 签名值验签过、Apple 属性对上、
+/// 备用 CodeDirectory 页哈希与特殊槽哈希全过、CD execSegFlags 与文件类型相容
+/// （dylib 的 CD 不能带 MAIN_BINARY，否则签名全过、内核照样拒收）、
+/// dylib 不能带 LC_MAIN（主程序入口命令，dyld 无法以 dylib 方式加载）。
 /// 失败时 error 的 localizedDescription 带中文原因。
 + (BOOL)validateSignatureAtPath:(NSString *)path error:(NSError **)error;
 
 /// 逐项签名检查（0.2.10 报错日志用，0.2.12 扩到 CMS 全项，0.2.14 再加
 /// CMS 签名值密码学验签 + Apple 9.1/9.2 属性比对 + LC 一致性，0.2.15
-/// 再加 CD execSeg 相容性 + Mach-O 头字段）：不早退，
-/// 各字段独立记；返回字典：
+/// 再加 CD execSeg 相容性 + Mach-O 头字段，0.2.16 再加 LC_MAIN 相容性）：
+/// 不早退，各字段独立记；返回字典：
 ///   valid（BOOL）= identifier 在位 && CMS 逐项全过（可解析、链完整、
 ///     叶子未过期、摘要对上、签名值验签过、Apple 属性对上）&& 页哈希全过
 ///     && 备用 CD 页哈希全过 && 特殊槽全过 && LC 一致
 ///     && CD execSeg 相容（0.2.15：dylib/bundle 的 CD 不能带 MAIN_BINARY，
 ///     否则签名全过、内核照样在 mmap 时拒收；主程序带 MAIN_BINARY 是对的）
+///     && LC_MAIN 相容（0.2.16：dylib/bundle 不能带 LC_MAIN，主程序带是
+///     对的；不相容时修复门走强制重打补丁+重签，新打补丁器去掉 LC_MAIN）
 ///   hasCMS（BOOL）、pageHashOK（BOOL）、firstBadPage（NSNumber/NSNull）
 ///   pageCount（NSNumber）、teamID（NSString/NSNull）
 ///   identifier（NSString/NSNull）、error（NSString/NSNull）
@@ -73,6 +76,8 @@ NS_ASSUME_NONNULL_BEGIN
 ///   cryptid（NSNumber，0.2.15：LC_ENCRYPTION_INFO 的 cryptid，0=未加密）
 ///   hasLCMain（BOOL，0.2.15）、idDylibName（NSString/NSNull，0.2.15：
 ///     LC_ID_DYLIB 的 install name）
+///   lcMainOK（BOOL，0.2.16：LC_MAIN 与文件类型是否相容——dylib/bundle
+///     带 LC_MAIN 即 NO，主程序带是 YES）
 ///   hasAltCD（BOOL）、altPageHashOK（BOOL，无备用 CD 时记 YES）
 ///   altFirstBadPage（NSNumber/NSNull）
 ///   specialSlotsOK（BOOL）、badSpecialSlot（NSNumber/NSNull，槽号）
