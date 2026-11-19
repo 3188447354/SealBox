@@ -126,7 +126,9 @@ enum SBLaunchRouter {
             failed.stageDetail = message
             SBStore.shared.launchReceipt = failed
             SBStore.shared.recordLaunchResult(
-                bundleID: receipt.guestBundleID, success: false, message: message)
+                bundleID: receipt.guestBundleID,
+                diskDirectoryName: receipt.diskDirectoryName,
+                success: false, message: message)
             SBStore.shared.clearGuestSelection()
             return true
         }
@@ -164,18 +166,17 @@ enum SBLaunchRouter {
         let executablePath = record.executableURL.path
         guard FileManager.default.fileExists(atPath: executablePath) else { return .proceed }
         // 先记一行逐项——重启路以前连这行都没有，坏签是放行还是根本没验，
-        // 看日志分不出来（0.2.12 的 hdsh 就是例子）。
+        // 看日志分不出来（0.2.12 的 hdsh 就是例子）。0.2.14：同一行里把
+        // 失败标记的状态也记下来（上次死在 dlopen 签名失败与否 + 原因），
+        // 门是放行还是触发修复、按什么输入决定的，日志里一次看清。
         let detail = SBCodesignCheck.signatureDetail(atPath: executablePath)
-        SBDiagLog.log("启动路由验签：\(record.bundleID) \(executablePath) \(SBInstaller.signatureDetailFields(detail: detail))")
+        let lastLaunchSigFailed = record.lastLaunchSigFailed
+        let missingIDDylib = SBMachOHasIDDylib(executablePath) == 0
+        SBDiagLog.log("启动路由验签：\(record.bundleID) \(executablePath) \(SBInstaller.signatureDetailFields(detail: detail)) 上次签名失败标记=\(lastLaunchSigFailed ? "是" : "否")\(record.lastLaunchResult.map { "（\($0.message.prefix(80))）" } ?? "") 缺LC_ID_DYLIB=\(missingIDDylib ? "是" : "否")")
         // 未签名记录：只记不拦（与点图标门一致——二进制可能无签名走 JIT；
         // 拦的活由 Team 门做，blockReceiptOnTeamMismatch 已跑过）。
         guard record.signed else { return .proceed }
         let detailValid = (detail["valid"] as? NSNumber)?.boolValue ?? false
-        // 与 ensureLaunchableSignature 同款判断：上次启动是不是死在 dlopen
-        // 签名失败（记录里的上次结果由启动路由在加载失败时写回）。
-        let lastLaunchSigFailed = record.lastLaunchResult?.success == false
-            && (record.lastLaunchResult?.message.contains("code signature invalid") ?? false)
-        let missingIDDylib = SBMachOHasIDDylib(executablePath) == 0
         if detailValid && !lastLaunchSigFailed && !missingIDDylib {
             return .proceed
         }
@@ -210,7 +211,9 @@ enum SBLaunchRouter {
                         if let failedReceipt = SBStore.shared.launchReceipt,
                            failedReceipt.stage == "guest-failed" {
                             SBStore.shared.recordLaunchResult(
-                                bundleID: failedReceipt.guestBundleID, success: false,
+                                bundleID: failedReceipt.guestBundleID,
+                                diskDirectoryName: failedReceipt.diskDirectoryName,
+                                success: false,
                                 message: failedReceipt.stageDetail ?? "客 App 加载失败")
                         }
                         SBStore.shared.clearGuestSelection()
@@ -232,7 +235,8 @@ enum SBLaunchRouter {
                     failed.stageDetail = message
                     SBStore.shared.launchReceipt = failed
                     SBStore.shared.recordLaunchResult(
-                        bundleID: bundleID, success: false, message: message)
+                        bundleID: bundleID, diskDirectoryName: record.diskDirectoryName,
+                        success: false, message: message)
                     SBStore.shared.clearGuestSelection()
                     onRepairSettled?()
                 }
@@ -273,7 +277,9 @@ enum SBLaunchRouter {
                 receipt.stageDetail = SBError.restartRequestFailed.errorDescription
                 SBStore.shared.launchReceipt = receipt
                 SBStore.shared.recordLaunchResult(
-                    bundleID: receipt.guestBundleID, success: false,
+                    bundleID: receipt.guestBundleID,
+                    diskDirectoryName: receipt.diskDirectoryName,
+                    success: false,
                     message: receipt.stageDetail ?? "系统没有重启应用，请重试")
             }
             return
@@ -294,7 +300,9 @@ enum SBLaunchRouter {
             if let receipt = SBStore.shared.launchReceipt,
                receipt.stage == "guest-failed" {
                 SBStore.shared.recordLaunchResult(
-                    bundleID: receipt.guestBundleID, success: false,
+                    bundleID: receipt.guestBundleID,
+                    diskDirectoryName: receipt.diskDirectoryName,
+                    success: false,
                     message: receipt.stageDetail ?? "客 App 加载失败")
             }
             SBStore.shared.clearGuestSelection()

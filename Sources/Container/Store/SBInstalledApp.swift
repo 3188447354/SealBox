@@ -32,6 +32,16 @@ struct SBInstalledApp: Codable, Identifiable, Equatable {
     var needsJIT: Bool
     var lastLaunchResult: SBLaunchResult?
 
+    /// 0.2.14：上次启动是不是死在 dlopen 签名失败。判断只认记录里的
+    /// lastLaunchResult（持久化在每包已装记录里，不在收据里；点图标写新
+    /// 收据不许清掉它，只有重签成功才清）。两处门（点图标门、重启门）与
+    /// 日志共用这一处定义，不许各写各的 contains 串——0.2.13 的教训：
+    /// 触发条件散在两处，日志里看不出门到底读到了什么。
+    var lastLaunchSigFailed: Bool {
+        lastLaunchResult?.success == false
+            && (lastLaunchResult?.message.contains("code signature invalid") ?? false)
+    }
+
     /// 链式修正段数与实际段数不一致（0.2.5：不再当安装失败，照装；启动时 dyld
     /// 会按原文报错，iOS 27 上大概率起不来）。记在记录里，供详情页 / 诊断参考。
     var segCountMismatch: Bool

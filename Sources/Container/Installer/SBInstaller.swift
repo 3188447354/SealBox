@@ -482,6 +482,7 @@ public enum SBInstaller {
     /// 0.2.12：逐项字段扩到 CMS 全项（链、摘要、叶子到期、备用 CD、特殊槽）。
     /// 旧版只记“CMS 在位 + 页哈希”，KMusic 在 0.2.10/0.2.11 两份日志里
     /// 都没有任何逐项行——门是放行还是根本没验，无从判断。
+    /// 0.2.14：再加 CMS 签名值密码学验签、Apple 9.1/9.2 属性、LC 一致性。
     static func signatureDetailFields(detail: [AnyHashable: Any]) -> String {
         let valid = (detail["valid"] as? NSNumber)?.boolValue ?? false
         let hasCMS = (detail["hasCMS"] as? NSNumber)?.boolValue ?? false
@@ -500,6 +501,14 @@ public enum SBInstaller {
         let cmsLeafExpiry = detail["cmsLeafExpiry"] as? String ?? "无"
         let cmsLeafExpired = (detail["cmsLeafExpired"] as? NSNumber)?.boolValue ?? false
         let cmsError = detail["cmsError"] as? String ?? ""
+        let cmsSignatureValid = (detail["cmsSignatureValid"] as? NSNumber)?.boolValue ?? false
+        let cmsSignatureError = detail["cmsSignatureError"] as? String ?? ""
+        let cmsAppleAttrsValid = (detail["cmsAppleAttrsValid"] as? NSNumber)?.boolValue ?? false
+        let cmsAppleAttrsError = detail["cmsAppleAttrsError"] as? String ?? ""
+        let lcSignatureOK = (detail["lcSignatureOK"] as? NSNumber)?.boolValue ?? false
+        let lcDataOff = (detail["lcDataOff"] as? NSNumber)?.intValue ?? 0
+        let lcDataSize = (detail["lcDataSize"] as? NSNumber)?.intValue ?? 0
+        let superblobLength = (detail["superblobLength"] as? NSNumber)?.intValue ?? 0
         let hasAltCD = (detail["hasAltCD"] as? NSNumber)?.boolValue ?? false
         let altPageHashOK = (detail["altPageHashOK"] as? NSNumber)?.boolValue ?? true
         let altFirstBadPage = detail["altFirstBadPage"] as? NSNumber
@@ -511,7 +520,7 @@ public enum SBInstaller {
         }
         fields += ") Team=\(teamID) identifier=\(identifier)"
         if hasCMS {
-            fields += " CMS链=\(cmsChainComplete ? "完整" : "不完整")(\(cmsCertCount)张 \(cmsLength)字节) CMS摘要=\(cmsCDHashOK ? "对上" : "不对") 叶子=\(cmsLeafCN)(到期\(cmsLeafExpiry)\(cmsLeafExpired ? " 已过期" : "")) 中间=\(cmsIntermediateCN)"
+            fields += " CMS链=\(cmsChainComplete ? "完整" : "不完整")(\(cmsCertCount)张 \(cmsLength)字节) CMS摘要=\(cmsCDHashOK ? "对上" : "不对") 叶子=\(cmsLeafCN)(到期\(cmsLeafExpiry)\(cmsLeafExpired ? " 已过期" : "")) 中间=\(cmsIntermediateCN) CMS验签=\(cmsSignatureValid ? "通过" : "不过") Apple属性=\(cmsAppleAttrsValid ? "对上" : "不对")"
         }
         fields += hasAltCD ? " 备用CD=\(altPageHashOK ? "全过" : "不过")" : " 备用CD=无"
         if let bad = altFirstBadPage {
@@ -521,7 +530,12 @@ public enum SBInstaller {
         if let slot = badSpecialSlot {
             fields += "(坏槽=\(slot.intValue))"
         }
-        if !cmsError.isEmpty {
+        fields += " LC=\(lcSignatureOK ? "一致" : "不一致")(off=0x\(String(lcDataOff, radix: 16)) size=0x\(String(lcDataSize, radix: 16)) superblob=0x\(String(superblobLength, radix: 16)))"
+        if !cmsSignatureError.isEmpty {
+            fields += " CMS验签原因：\(cmsSignatureError)"
+        } else if !cmsAppleAttrsError.isEmpty {
+            fields += " Apple属性原因：\(cmsAppleAttrsError)"
+        } else if !cmsError.isEmpty {
             fields += " CMS原因：\(cmsError)"
         } else if !error.isEmpty {
             fields += " 原因：\(error)"
@@ -560,6 +574,23 @@ public enum SBInstaller {
            cmsError.isEmpty,
            !((detail["cmsCDHashOK"] as? NSNumber)?.boolValue ?? false) {
             items.append("CMS 摘要与 CodeDirectory 对不上（签名后文件被改过）")
+        }
+        // 0.2.14：CMS 签名值密码学验签与 Apple 属性比对的坏项——逐项全过
+        // 仍被 dyld 拒绝时，这两项是唯一能点名的证据。
+        if (detail["hasCMS"] as? NSNumber)?.boolValue ?? false,
+           ((detail["cmsLength"] as? NSNumber)?.intValue ?? 0) > 0,
+           !((detail["cmsSignatureValid"] as? NSNumber)?.boolValue ?? false) {
+            let reason = detail["cmsSignatureError"] as? String ?? "CMS 签名值验签不过"
+            items.append("CMS 签名值验签不过：\(reason)")
+        }
+        if (detail["hasCMS"] as? NSNumber)?.boolValue ?? false,
+           ((detail["cmsLength"] as? NSNumber)?.intValue ?? 0) > 0,
+           !((detail["cmsAppleAttrsValid"] as? NSNumber)?.boolValue ?? false) {
+            let reason = detail["cmsAppleAttrsError"] as? String ?? "Apple 9.1/9.2 属性与 CodeDirectory 对不上"
+            items.append("Apple 签名属性不对：\(reason)")
+        }
+        if !((detail["lcSignatureOK"] as? NSNumber)?.boolValue ?? false) {
+            items.append("LC_CODE_SIGNATURE 与 superblob 长度对不上，或 CMS 槽超出 superblob")
         }
         if !((detail["pageHashOK"] as? NSNumber)?.boolValue ?? false) {
             if let bad = detail["firstBadPage"] as? NSNumber {
@@ -665,14 +696,14 @@ public enum SBInstaller {
     static func ensureLaunchableSignature(_ record: SBInstalledApp) async throws -> SBInstalledApp {
         let executablePath = record.executableURL.path
         let gateDetail = SBCodesignCheck.signatureDetail(atPath: executablePath)
-        SBDiagLog.log("签名修复门验签：\(record.bundleID) \(executablePath) \(signatureDetailFields(detail: gateDetail))")
+        // 0.2.14：同一行里把失败标记的状态也记下来（与重启门同款），
+        // 门是放行还是触发修复、按什么输入决定的，日志里一次看清。
+        // 上次启动死在 dlopen 签名失败的判断见 SBInstalledApp
+        // .lastLaunchSigFailed（记录里的上次结果由启动路由在加载失败时
+        // 写回，持久化在每包已装记录里，点图标不许清掉它）。
+        let lastLaunchSigFailed = record.lastLaunchSigFailed
+        SBDiagLog.log("签名修复门验签：\(record.bundleID) \(executablePath) \(signatureDetailFields(detail: gateDetail)) 上次签名失败标记=\(lastLaunchSigFailed ? "是" : "否")\(record.lastLaunchResult.map { "（\($0.message.prefix(80))）" } ?? "")")
         let detailValid = (gateDetail["valid"] as? NSNumber)?.boolValue ?? false
-        // 上次启动是不是死在 dlopen 签名失败：记录里的上次结果由启动路由
-        // 在加载失败时写回（SBStore.recordLaunchResult），失败原因里带
-        // dyld 原文 "code signature invalid"。逐项全过也拦不住这一项——
-        // CMS 密码学验签不过时逐项查不出来，只有 dyld 报得出来。
-        let lastLaunchSigFailed = record.lastLaunchResult?.success == false
-            && (record.lastLaunchResult?.message.contains("code signature invalid") ?? false)
         if SBMachOHasIDDylib(executablePath) == 0 {
             // 0.2.11：无证书修不了，直接报缺 ID 的原因——不调 repatch，
             // 不然 repatch 的“没有导入证书”会盖掉真正的原因。
@@ -809,6 +840,8 @@ public enum SBInstaller {
     }
 
     /// 调 ObjC++ 包装 `SBSigner` 对整个 .app 重签；失败抛 `SBError.signFailed`。
+    /// 0.2.14：重签前先验私钥与叶子证书匹配——安装、重打补丁、appex 再签
+    /// 都走这里，一处拦住全部；不匹配直接报，不许用错 key 签出坏 CMS。
     private static func signApp(
         appPath: String,
         bundleID: String,
@@ -816,6 +849,10 @@ public enum SBInstaller {
         password: String,
         progress: Progress
     ) async throws {
+        if SBCertificate.privateKeyMatchesCertificate(data: certData, password: password) == false {
+            SBDiagLog.log("重签失败：\(bundleID) \(appPath) 证书与私钥不匹配，请重新导入")
+            throw SBError.signFailed(reason: "证书与私钥不匹配，请重新导入")
+        }
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             SBSigner.signApp(
                 atPath: appPath,

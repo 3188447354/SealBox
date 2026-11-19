@@ -26,13 +26,18 @@
 //   自签单证书也算完整）、叶子未过期、SignerInfo 的 messageDigest 与文件里
 //   的 CodeDirectory 对得上；备用 CodeDirectory（槽 0x1000，SHA-256，dyld
 //   优先用）页哈希、特殊槽（entitlements 等）哈希也都验。
-//   仍不做的事（能力边界）：CMS 签名本身的密码学验签（RSA/ECDSA 验签、
-//   证书链的系统信任评估）——那是 dyld 的事；这里能做的极限是“链的每张
-//   证书都在 CMS 里、没过期、摘要对得上”。逐项全过仍被 dyld 拒绝时，
-//   调用方靠“上次启动死在 dlopen 签名失败”触发强制重签（见 SBInstaller）。
+//   0.2.14：补上 0.2.12 明确写在能力边界之外的两项——CMS 签名值本身的
+//   密码学验签（叶子公钥 + SecKeyVerifySignature，验 SignerInfo 签名属性
+//   的 RSA/ECDSA 签名值；0.2.12 称“做不了”是错的：自研 DER 解析器 + 公开
+//   Security API 就能做，不依赖 macOS-only 的 SecStaticCode），以及 Apple
+//   签名属性 9.1（cdhashes plist）/ 9.2（各 CD 的完整哈希）与主/备用 CD
+//   的比对。逐项全过仍被 dyld 拒绝时，这两项是唯一能把它与“签名本身坏
+//   了”区分开的证据；调用方仍靠“上次启动死在 dlopen 签名失败”触发强制
+//   重签（见 SBInstaller）。
 #import "SBCodesignCheck.h"
 
 #import <CommonCrypto/CommonCrypto.h>
+#import <Security/Security.h>
 #import <mach-o/fat.h>
 #import <mach-o/loader.h>
 
@@ -76,6 +81,7 @@ typedef struct {
     BOOL hasSignatureSlot;
     uint32_t cmsOffset; // CMS blob 在签名区内的偏移（0 = 无）
     uint32_t cmsBlobLength; // CMS blob 长度字段（含 8 字节头），0 = 无
+    uint32_t superblobLength; // superblob 自身的 length 字段（0.2.14：LC 一致性用）
     uint32_t slotTypes[16]; // superblob 索引（特殊槽哈希用）
     uint32_t slotOffsets[16];
     uint32_t slotCount;
@@ -273,6 +279,7 @@ static BOOL SBParseSignature(const uint8_t *data, size_t len,
         return NO;
     }
     memset(out, 0, sizeof(*out));
+    out->superblobLength = blobLength;
     BOOL foundCD = NO;
     for (uint32_t i = 0; i < count; i++) {
         if ((uint64_t)12 + (uint64_t)(i + 1) * 8 > sigSize) {
@@ -698,6 +705,8 @@ typedef struct {
     uint32_t issuerTLVLen;
     const uint8_t *subjectTLV;
     uint32_t subjectTLVLen;
+    const uint8_t *spkiTLV; // subjectPublicKeyInfo 完整 TLV（0.2.14：CMS 验签用叶子公钥）
+    uint32_t spkiTLVLen;
     char cn[128];
     char issuerCN[128];
     int64_t notAfter; // INT64_MIN = 解析失败
@@ -764,6 +773,13 @@ static BOOL SBParseCert(const SBDerTLV *certTLV,
     out->issuerTLVLen = issuer.totalLen;
     out->subjectTLV = subjectStart;
     out->subjectTLVLen = subject.totalLen;
+    // TBS 第 6 个字段是 subjectPublicKeyInfo（0.2.14：CMS 签名验签用叶子公钥）。
+    // 没有它时解析仍成功（链检查不需要公钥），验签步骤再报缺失。
+    if (idx + 5 < tbs.count && tbs.items[idx + 5].tag == 0x30) {
+        const SBDerTLV *spki = &tbs.items[idx + 5];
+        out->spkiTLV = spki->content - (spki->totalLen - spki->contentLen);
+        out->spkiTLVLen = spki->totalLen;
+    }
     SBDerNameCN(subjectStart, subject.totalLen, out->cn, sizeof(out->cn));
     SBDerNameCN(issuerStart, issuer.totalLen, out->issuerCN, sizeof(out->issuerCN));
     out->notAfter = notAfter;
@@ -771,6 +787,304 @@ static BOOL SBParseCert(const SBDerTLV *certTLV,
         ? times.items[1].contentLen : sizeof(out->notAfterRaw) - 1;
     memcpy(out->notAfterRaw, times.items[1].content, rawLen);
     out->notAfterRaw[rawLen] = '\0';
+    return YES;
+}
+
+/// 按 hashType 算摘要（1=SHA-1，2=SHA-256，3=SHA-256，4=SHA-384）。
+/// 返回摘要长度（0 = 类型不认）。
+static size_t SBHashBytes(uint8_t hashType, const uint8_t *data, size_t len,
+                          uint8_t *out) {
+    switch (hashType) {
+        case 1:
+            CC_SHA1(data, (CC_LONG)len, out);
+            return CC_SHA1_DIGEST_LENGTH;
+        case 2:
+        case 3:
+            CC_SHA256(data, (CC_LONG)len, out);
+            return CC_SHA256_DIGEST_LENGTH;
+        case 4:
+            CC_SHA384(data, (CC_LONG)len, out);
+            return CC_SHA384_DIGEST_LENGTH;
+        default:
+            return 0;
+    }
+}
+
+/// 把一段内容包成 SET OF 的 DER（0x31 + 定长长度 + 内容）。CMS 的签名
+/// 属性在 SignerInfo 里是 [0] 隐式标签（0xA0），验签时要按 SET OF（0x31）
+/// 重新编码再算摘要——内容字节不变，只换标签与长度编码（不定长也一并
+/// 转定长）。返回 malloc 的缓冲（调用方 free），失败返回 NULL。
+static uint8_t *SBBuildSetOfDER(const uint8_t *content, uint32_t contentLen,
+                                uint32_t *outLen) {
+    uint8_t lenBytes[5];
+    size_t lenLen = 0;
+    if (contentLen < 128) {
+        lenBytes[0] = (uint8_t)contentLen;
+        lenLen = 1;
+    } else if (contentLen < 256) {
+        lenBytes[0] = 0x81;
+        lenBytes[1] = (uint8_t)contentLen;
+        lenLen = 2;
+    } else if (contentLen < 65536) {
+        lenBytes[0] = 0x82;
+        lenBytes[1] = (uint8_t)(contentLen >> 8);
+        lenBytes[2] = (uint8_t)contentLen;
+        lenLen = 3;
+    } else {
+        return NULL;
+    }
+    uint32_t total = (uint32_t)(1 + lenLen + contentLen);
+    uint8_t *buf = (uint8_t *)malloc(total);
+    if (!buf) return NULL;
+    buf[0] = 0x31;
+    memcpy(buf + 1, lenBytes, lenLen);
+    memcpy(buf + 1 + lenLen, content, contentLen);
+    if (outLen) *outLen = total;
+    return buf;
+}
+
+/// 从 SPKI 里取公钥算法 OID（rsaEncryption / id-ecPublicKey），
+/// 返回 YES 表示认出 RSA（*isRSA=YES）或 EC（*isRSA=NO）。
+static BOOL SBSPKIKeyType(const uint8_t *spkiTLV, uint32_t spkiTLVLen,
+                          const uint8_t *der, size_t derLen, BOOL *isRSA) {
+    static const uint8_t kRSAOID[9] = { 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01 };
+    static const uint8_t kECOID[7] = { 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01 };
+    SBDerTLV spki;
+    size_t off = (size_t)(spkiTLV - der);
+    if (spkiTLVLen == 0 || off + spkiTLVLen > derLen) {
+        return NO;
+    }
+    if (!SBDerReadTLV(der, derLen, off, &spki, NULL, 0) || spki.tag != 0x30) {
+        return NO;
+    }
+    SBDerChildrenList kids;
+    if (!SBDerChildren(der, derLen, &spki, &kids, NULL, 0)
+        || kids.count < 1 || kids.items[0].tag != 0x30) {
+        return NO;
+    }
+    SBDerChildrenList alg;
+    if (!SBDerChildren(der, derLen, &kids.items[0], &alg, NULL, 0)
+        || alg.count < 1 || alg.items[0].tag != 0x06) {
+        return NO;
+    }
+    const SBDerTLV *oid = &alg.items[0];
+    if (oid->contentLen == 9 && memcmp(oid->content, kRSAOID, 9) == 0) {
+        *isRSA = YES;
+        return YES;
+    }
+    if (oid->contentLen == 7 && memcmp(oid->content, kECOID, 7) == 0) {
+        *isRSA = NO;
+        return YES;
+    }
+    return NO;
+}
+
+/// 0.2.14：CMS 签名值本身的密码学验签。
+/// 输入：签名属性 TLV（[0] 项，没有则为 NULL——此时签的是内容本身，
+/// 即主 CD 字节）、签名值、SignerInfo 的摘要算法、叶子证书的 SPKI。
+/// 做法：摘要 = hash(SET OF 编码的签名属性)（或无属性时 hash(CD)），
+/// 再用叶子公钥 + SecKeyVerifySignature 验 RSA/ECDSA 签名值。
+/// 成功返回 YES；失败把原因写进 error（256 字节缓冲）。
+static BOOL SBVerifyCMSSignature(const SBDerTLV *signedAttrs,
+                                 const uint8_t *signature, uint32_t signatureLen,
+                                 uint8_t hashType,
+                                 const uint8_t *leafSPKI, uint32_t leafSPKILen,
+                                 const uint8_t *der, size_t derLen,
+                                 const SBCodeDirectoryInfo *cdInfo,
+                                 char *error, size_t errorSize) {
+    if (hashType == 0) {
+        snprintf(error, errorSize, "CMS 签名摘要算法不认");
+        return NO;
+    }
+    if (signature == NULL || signatureLen == 0) {
+        snprintf(error, errorSize, "CMS 里没有签名值");
+        return NO;
+    }
+    if (leafSPKI == NULL || leafSPKILen == 0) {
+        snprintf(error, errorSize, "叶子证书里没有公钥，无法验签");
+        return NO;
+    }
+    // 待验摘要：有签名属性时 hash(SET OF 编码的属性)，否则 hash(CD)。
+    uint8_t digest[CC_SHA384_DIGEST_LENGTH];
+    size_t digestLen = 0;
+    uint8_t *setDER = NULL;
+    uint32_t setDERLen = 0;
+    if (signedAttrs != NULL) {
+        setDER = SBBuildSetOfDER(signedAttrs->content, signedAttrs->contentLen, &setDERLen);
+        if (!setDER) {
+            snprintf(error, errorSize, "签名属性重编码失败");
+            return NO;
+        }
+        digestLen = SBHashBytes(hashType, setDER, setDERLen, digest);
+        free(setDER);
+    } else {
+        digestLen = SBHashBytes(hashType, cdInfo->cd, cdInfo->cdLength, digest);
+    }
+    if (digestLen == 0) {
+        snprintf(error, errorSize, "CMS 签名摘要算法不支持（hashType=%u）", hashType);
+        return NO;
+    }
+    BOOL isRSA = YES;
+    if (!SBSPKIKeyType(leafSPKI, leafSPKILen, der, derLen, &isRSA)) {
+        snprintf(error, errorSize, "叶子证书公钥算法不认（不是 RSA/ECDSA）");
+        return NO;
+    }
+    CFDataRef keyData = CFDataCreate(NULL, leafSPKI, (CFIndex)leafSPKILen);
+    if (!keyData) {
+        snprintf(error, errorSize, "叶子公钥数据构造失败");
+        return NO;
+    }
+    NSDictionary *attrs = @{
+        (__bridge id)kSecAttrKeyType: isRSA ? (__bridge id)kSecAttrKeyTypeRSA : (__bridge id)kSecAttrKeyTypeECSECPrimeRandom,
+        (__bridge id)kSecAttrKeyClass: (__bridge id)kSecAttrKeyClassPublic,
+    };
+    CFErrorRef cfError = NULL;
+    SecKeyRef key = SecKeyCreateWithData(keyData, (__bridge CFDictionaryRef)attrs, &cfError);
+    CFRelease(keyData);
+    if (!key) {
+        if (cfError) CFRelease(cfError);
+        snprintf(error, errorSize, "叶子公钥加载失败（SPKI 不是合法的 %@ 公钥）", isRSA ? @"RSA" : @"EC");
+        return NO;
+    }
+    SecKeyAlgorithm algorithm = NULL;
+    if (isRSA) {
+        if (hashType == 1) algorithm = kSecKeyAlgorithmRSASignatureDigestPKCS1v15SHA1;
+        else if (hashType == 2 || hashType == 3) algorithm = kSecKeyAlgorithmRSASignatureDigestPKCS1v15SHA256;
+        else if (hashType == 4) algorithm = kSecKeyAlgorithmRSASignatureDigestPKCS1v15SHA384;
+    } else {
+        if (hashType == 1) algorithm = kSecKeyAlgorithmECDSASignatureDigestX962SHA1;
+        else if (hashType == 2 || hashType == 3) algorithm = kSecKeyAlgorithmECDSASignatureDigestX962SHA256;
+        else if (hashType == 4) algorithm = kSecKeyAlgorithmECDSASignatureDigestX962SHA384;
+    }
+    if (algorithm == NULL) {
+        CFRelease(key);
+        snprintf(error, errorSize, "不支持的签名算法组合（%@ + hashType=%u）",
+                 isRSA ? @"RSA" : @"EC", hashType);
+        return NO;
+    }
+    CFDataRef digestData = CFDataCreate(NULL, digest, (CFIndex)digestLen);
+    CFDataRef sigData = CFDataCreate(NULL, signature, (CFIndex)signatureLen);
+    if (!digestData || !sigData) {
+        if (digestData) CFRelease(digestData);
+        if (sigData) CFRelease(sigData);
+        CFRelease(key);
+        snprintf(error, errorSize, "验签数据构造失败");
+        return NO;
+    }
+    cfError = NULL;
+    BOOL ok = SecKeyVerifySignature(key, algorithm, digestData, sigData, &cfError);
+    if (!ok) {
+        NSString *desc = cfError ? (__bridge_transfer NSString *)CFErrorCopyDescription(cfError) : nil;
+        snprintf(error, errorSize, "CMS 签名值验签不过（叶子公钥验签名属性失败%s%s）",
+                 desc ? "：" : "", desc ? desc.UTF8String : "");
+        if (cfError) CFRelease(cfError);
+    }
+    CFRelease(digestData);
+    CFRelease(sigData);
+    CFRelease(key);
+    return ok;
+}
+
+/// 0.2.14：Apple 签名属性 9.1 / 9.2 与主/备用 CD 的比对。
+/// 9.1（cdhashes plist）：每项是对应 CD 的哈希截断到 20 字节——这是
+/// Apple 自己的格式（Via 实测：cdhashes[1] 是 SHA256(备用 CD) 的前 20
+/// 字节；codesign 单 CD 时只有 1 项，是 SHA256(主 CD) 的前 20 字节），
+/// ZSign 同款写法不是缺陷；比的是值对不对、项数对不对。
+/// 9.2：每项 SEQ{摘要算法 OID, 完整哈希}，必须与对应 CD 的完整哈希
+/// 相等；有备用 CD 时必须有一项 sha256 对上备用 CD。
+/// 成功返回 YES；失败把原因写进 error。
+static BOOL SBVerifyCMSAppleAttrs(const uint8_t *plistData, uint32_t plistLen,
+                                  const uint8_t *nine2TLVs[8], const uint32_t nine2Lens[8],
+                                  uint32_t nine2Count,
+                                  const SBCodeDirectoryInfo *cdInfo,
+                                  const SBCodeDirectoryInfo *altCDInfo,
+                                  char *error, size_t errorSize) {
+    if (plistData == NULL || plistLen == 0) {
+        snprintf(error, errorSize, "CMS 里没有 Apple 9.1（cdhashes）属性");
+        return NO;
+    }
+    NSData *plistNSData = [NSData dataWithBytes:plistData length:plistLen];
+    NSError *plistError = nil;
+    id plistObj = [NSPropertyListSerialization propertyListWithData:plistNSData
+                                                            options:0
+                                                             format:NULL
+                                                              error:&plistError];
+    if (![plistObj isKindOfClass:[NSDictionary class]]) {
+        snprintf(error, errorSize, "Apple 9.1 属性不是合法 plist（%s）",
+                 plistError.localizedDescription.UTF8String ?: "解析失败");
+        return NO;
+    }
+    NSArray *hashes = ((NSDictionary *)plistObj)[@"cdhashes"];
+    if (![hashes isKindOfClass:[NSArray class]]) {
+        snprintf(error, errorSize, "Apple 9.1 plist 里没有 cdhashes 数组");
+        return NO;
+    }
+    uint32_t expectedCount = altCDInfo != NULL ? 2 : 1;
+    if (hashes.count != expectedCount) {
+        snprintf(error, errorSize, "Apple 9.1 cdhashes 有 %lu 项，应为 %u 项",
+                 (unsigned long)hashes.count, expectedCount);
+        return NO;
+    }
+    const SBCodeDirectoryInfo *cds[2] = { cdInfo, altCDInfo };
+    for (uint32_t i = 0; i < expectedCount; i++) {
+        NSData *entry = hashes[i];
+        if (![entry isKindOfClass:[NSData class]] || entry.length != 20) {
+            snprintf(error, errorSize, "Apple 9.1 cdhashes[%u] 不是 20 字节", i);
+            return NO;
+        }
+        uint8_t digest[CC_SHA384_DIGEST_LENGTH];
+        size_t digestLen = SBHashBytes(cds[i]->hashType, cds[i]->cd, cds[i]->cdLength, digest);
+        if (digestLen == 0 || memcmp(entry.bytes, digest, 20) != 0) {
+            snprintf(error, errorSize, "Apple 9.1 cdhashes[%u] 与 CodeDirectory 哈希对不上", i);
+            return NO;
+        }
+    }
+    // 9.2：逐项比完整哈希。
+    BOOL seenAlt256 = NO;
+    for (uint32_t n = 0; n < nine2Count; n++) {
+        SBDerTLV seq;
+        if (!SBDerReadTLV(nine2TLVs[n], nine2Lens[n], 0, &seq, NULL, 0)
+            || seq.tag != 0x30) {
+            snprintf(error, errorSize, "Apple 9.2 第 %u 项不是 SEQUENCE", n);
+            return NO;
+        }
+        SBDerChildrenList kids;
+        if (!SBDerChildren(nine2TLVs[n], nine2Lens[n], &seq, &kids, NULL, 0)
+            || kids.count < 2 || kids.items[0].tag != 0x06 || kids.items[1].tag != 0x04) {
+            snprintf(error, errorSize, "Apple 9.2 第 %u 项结构不对", n);
+            return NO;
+        }
+        static const uint8_t kSHA1OID[5] = { 0x2B, 0x0E, 0x03, 0x02, 0x1A };
+        static const uint8_t kSHA256OID[9] = { 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01 };
+        const SBDerTLV *oid = &kids.items[0];
+        const SBDerTLV *hashVal = &kids.items[1];
+        const SBCodeDirectoryInfo *target = NULL;
+        uint8_t wantType = 0;
+        if (oid->contentLen == 5 && memcmp(oid->content, kSHA1OID, 5) == 0) {
+            target = cdInfo;
+            wantType = 1;
+        } else if (oid->contentLen == 9 && memcmp(oid->content, kSHA256OID, 9) == 0) {
+            target = altCDInfo != NULL ? altCDInfo : cdInfo;
+            wantType = 2;
+        } else {
+            snprintf(error, errorSize, "Apple 9.2 第 %u 项摘要算法不认", n);
+            return NO;
+        }
+        uint8_t digest[CC_SHA384_DIGEST_LENGTH];
+        size_t digestLen = SBHashBytes(wantType, target->cd, target->cdLength, digest);
+        if (digestLen == 0 || hashVal->contentLen != digestLen
+            || memcmp(hashVal->content, digest, digestLen) != 0) {
+            snprintf(error, errorSize, "Apple 9.2 第 %u 项哈希与 CodeDirectory 对不上", n);
+            return NO;
+        }
+        if (altCDInfo != NULL && target == altCDInfo && wantType == 2) {
+            seenAlt256 = YES;
+        }
+    }
+    if (altCDInfo != NULL && !seenAlt256) {
+        snprintf(error, errorSize, "Apple 9.2 里没有备用 CodeDirectory 的 SHA-256 哈希");
+        return NO;
+    }
     return YES;
 }
 
@@ -782,18 +1096,24 @@ typedef struct {
     BOOL hasWWDR;
     BOOL leafExpired;
     BOOL cdHashOK;
+    BOOL signatureValid; // 0.2.14：CMS 签名值密码学验签
+    BOOL appleAttrsValid; // 0.2.14：Apple 9.1/9.2 属性与 CD 比对
     char leafCN[128];
     char intermediateCN[128];
     char leafExpiry[32];
     char error[256];
+    char signatureError[256]; // 0.2.14：验签失败原因
+    char appleAttrsError[256]; // 0.2.14：9.1/9.2 比对失败原因
 } SBCMSDetail;
 
 /// 验 CMS 签名块：可解析、链完整、叶子未过期、messageDigest 与 CD 对得上。
 /// sig 是签名区起点；cmsOffset/cmsBlobLength 来自 superblob 索引；
-/// cdInfo 是主 CodeDirectory（摘要对它算）。
+/// cdInfo 是主 CodeDirectory（摘要对它算）；altCDInfo 是备用 CodeDirectory，
+/// 没有时传 NULL（0.2.14：Apple 9.1/9.2 属性要对备用 CD 算哈希）。
 static void SBInspectCMS(const uint8_t *sig, uint32_t sigSize,
                          uint32_t cmsOffset, uint32_t cmsBlobLength,
                          const SBCodeDirectoryInfo *cdInfo,
+                         const SBCodeDirectoryInfo *altCDInfo,
                          SBCMSDetail *out) {
     memset(out, 0, sizeof(*out));
     if (cmsBlobLength < 8) {
@@ -902,12 +1222,36 @@ static void SBInspectCMS(const uint8_t *sig, uint32_t sigSize,
         snprintf(out->error, sizeof(out->error), "CMS 解析失败：摘要算法 OID 不认");
         return;
     }
-    // messageDigest 属性（OID 1.2.840.113549.1.9.4）。
+    // 签名属性：messageDigest（OID 1.2.840.113549.1.9.4）、Apple 9.1
+    //（1.2.840.113635.100.9.1，cdhashes plist）、Apple 9.2
+    //（1.2.840.113635.100.9.2，各 CD 的完整哈希）。三者都在签名属性集里，
+    // 0.2.14 一并取出来（验签与属性比对用）；签名值是 SignerInfo 的末字段。
     static const uint8_t kMessageDigestOID[9] = { 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x04 };
+    static const uint8_t kAppleCDHashesOID[9] = { 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x63, 0x64, 0x09, 0x01 };
+    static const uint8_t kAppleCDHashOID[9] = { 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x63, 0x64, 0x09, 0x02 };
     const uint8_t *msgDigest = NULL;
     uint32_t msgDigestLen = 0;
+    SBDerTLV signedAttrsTLV;
+    BOOL hasSignedAttrs = NO; // SignerInfo 的 [0] 签名属性集
+    const uint8_t *applePlist = NULL;
+    uint32_t applePlistLen = 0;
+    const uint8_t *nine2TLVs[8];
+    uint32_t nine2Lens[8];
+    uint32_t nine2Count = 0;
+    const uint8_t *cmsSignature = NULL;
+    uint32_t cmsSignatureLen = 0;
     for (uint32_t i = 3; i < si.count; i++) {
+        if (si.items[i].tag == 0x04 && cmsSignature == NULL) {
+            // SignerInfo 末字段：签名值 OCTET STRING。
+            cmsSignature = si.items[i].content;
+            cmsSignatureLen = si.items[i].contentLen;
+            continue;
+        }
         if (si.items[i].tag != 0xA0) continue;
+        if (!hasSignedAttrs) {
+            signedAttrsTLV = si.items[i];
+            hasSignedAttrs = YES;
+        }
         SBDerChildrenList attrs;
         if (!SBDerChildren(der, derLen, &si.items[i], &attrs, &reason, 0)) {
             snprintf(out->error, sizeof(out->error), "CMS 解析失败：%s",
@@ -920,17 +1264,36 @@ static void SBInspectCMS(const uint8_t *sig, uint32_t sigSize,
             if (!SBDerChildren(der, derLen, &attrs.items[a], &attr, NULL, 0)
                 || attr.count < 2 || attr.items[0].tag != 0x06
                 || attr.items[0].contentLen != 9
-                || memcmp(attr.items[0].content, kMessageDigestOID, 9) != 0
                 || attr.items[1].tag != 0x31) {
                 continue;
             }
+            const uint8_t *oidBytes = attr.items[0].content;
+            BOOL isDigest = memcmp(oidBytes, kMessageDigestOID, 9) == 0;
+            BOOL is91 = memcmp(oidBytes, kAppleCDHashesOID, 9) == 0;
+            BOOL is92 = memcmp(oidBytes, kAppleCDHashOID, 9) == 0;
+            if (!isDigest && !is91 && !is92) continue;
             SBDerChildrenList vals;
             if (!SBDerChildren(der, derLen, &attr.items[1], &vals, NULL, 0)
-                || vals.count < 1 || vals.items[0].tag != 0x04) {
+                || vals.count < 1) {
                 continue;
             }
-            msgDigest = vals.items[0].content;
-            msgDigestLen = vals.items[0].contentLen;
+            if (isDigest) {
+                if (vals.items[0].tag != 0x04) continue;
+                msgDigest = vals.items[0].content;
+                msgDigestLen = vals.items[0].contentLen;
+            } else if (is91) {
+                if (vals.items[0].tag != 0x04) continue;
+                applePlist = vals.items[0].content;
+                applePlistLen = vals.items[0].contentLen;
+            } else {
+                for (uint32_t v = 0; v < vals.count && nine2Count < 8; v++) {
+                    if (vals.items[v].tag != 0x30) continue;
+                    const SBDerTLV *seq = &vals.items[v];
+                    nine2TLVs[nine2Count] = seq->content - (seq->totalLen - seq->contentLen);
+                    nine2Lens[nine2Count] = seq->totalLen;
+                    nine2Count++;
+                }
+            }
         }
     }
     if (msgDigest == NULL) {
@@ -1036,6 +1399,17 @@ static void SBInspectCMS(const uint8_t *sig, uint32_t sigSize,
     }
     out->cdHashOK = (digestLen > 0 && msgDigestLen == digestLen
                      && memcmp(digest, msgDigest, digestLen) == 0);
+    // 0.2.14：CMS 签名值密码学验签 + Apple 9.1/9.2 属性比对。
+    // 链完整是前提（要叶子证书的公钥）；验签失败不抹掉已算出的逐项，
+    // 调用方按 signatureValid / appleAttrsValid 各自点名。
+    out->signatureValid = SBVerifyCMSSignature(
+        hasSignedAttrs ? &signedAttrsTLV : NULL,
+        cmsSignature, cmsSignatureLen, hashType,
+        leaf->spkiTLV, leaf->spkiTLVLen,
+        der, derLen, cdInfo, out->signatureError, sizeof(out->signatureError));
+    out->appleAttrsValid = SBVerifyCMSAppleAttrs(
+        applePlist, applePlistLen, nine2TLVs, nine2Lens, nine2Count,
+        cdInfo, altCDInfo, out->appleAttrsError, sizeof(out->appleAttrsError));
 }
 
 @implementation SBCodesignCheck
@@ -1112,10 +1486,12 @@ static void SBInspectCMS(const uint8_t *sig, uint32_t sigSize,
     // 0.2.12：CMS 逐项——可解析、链完整、叶子未过期、摘要与 CD 对得上。
     // 旧版只查“CMS 槽在不在”，截断/空 CMS、缺中间证书、过期叶子、签名后
     // 改 CD 都能混过去，dyld 才在 dlopen 时报 code signature invalid。
+    // 0.2.14：再加 CMS 签名值密码学验签 + Apple 9.1/9.2 属性比对。
     SBCMSDetail cms;
     SBInspectCMS(bytes + sigOff, sigSize, info.cmsOffset, info.cmsBlobLength,
-                 &info.cd, &cms);
-    if (!cms.parseOK || !cms.chainComplete || cms.leafExpired || !cms.cdHashOK) {
+                 &info.cd, info.hasAltCD ? &info.altCD : NULL, &cms);
+    if (!cms.parseOK || !cms.chainComplete || cms.leafExpired || !cms.cdHashOK
+        || !cms.signatureValid || !cms.appleAttrsValid) {
         if (error) {
             if (cms.error[0] != '\0') {
                 *error = SBCodeSignError([NSString stringWithFormat:@"签名校验失败：%@", [NSString stringWithUTF8String:cms.error]]);
@@ -1123,6 +1499,10 @@ static void SBInspectCMS(const uint8_t *sig, uint32_t sigSize,
                 *error = SBCodeSignError([NSString stringWithFormat:@"签名校验失败：叶子证书已过期（到期 %@）", [NSString stringWithUTF8String:cms.leafExpiry]]);
             } else if (!cms.cdHashOK) {
                 *error = SBCodeSignError(@"签名校验失败：CMS 摘要与 CodeDirectory 对不上，签名后文件被改过");
+            } else if (!cms.signatureValid) {
+                *error = SBCodeSignError([NSString stringWithFormat:@"签名校验失败：%@", [NSString stringWithUTF8String:cms.signatureError]]);
+            } else if (!cms.appleAttrsValid) {
+                *error = SBCodeSignError([NSString stringWithFormat:@"签名校验失败：%@", [NSString stringWithUTF8String:cms.appleAttrsError]]);
             } else {
                 *error = SBCodeSignError(@"签名校验失败：CMS 证书链不完整");
             }
@@ -1181,6 +1561,15 @@ static void SBInspectCMS(const uint8_t *sig, uint32_t sigSize,
     detail[@"altFirstBadPage"] = [NSNull null];
     detail[@"specialSlotsOK"] = @NO;
     detail[@"badSpecialSlot"] = [NSNull null];
+    // 0.2.14 新增字段（缺省 = 未验出好结果，调用方按“坏”处理）。
+    detail[@"cmsSignatureValid"] = @NO;
+    detail[@"cmsSignatureError"] = [NSNull null];
+    detail[@"cmsAppleAttrsValid"] = @NO;
+    detail[@"cmsAppleAttrsError"] = [NSNull null];
+    detail[@"lcSignatureOK"] = @NO;
+    detail[@"lcDataOff"] = @0;
+    detail[@"lcDataSize"] = @0;
+    detail[@"superblobLength"] = @0;
 
     NSData *fileData = [NSData dataWithContentsOfFile:path];
     if (fileData == nil) {
@@ -1201,6 +1590,23 @@ static void SBInspectCMS(const uint8_t *sig, uint32_t sigSize,
         return detail;
     }
     detail[@"structureOK"] = @YES;
+    // 0.2.14：LC 一致性——检查器与 dyld 都读 LC_CODE_SIGNATURE（见
+    // SBFindSignature），没有“第二份读法”可核对；能核对的是 LC 给出的
+    // 范围与 superblob 自身长度、CMS 槽是否落在 superblob 内。注意
+    // superblob 长度小于 LC datasize 是正常的（Apple 与 codesign 的签名
+    // 区尾部都有填充/空闲，0.2.14 原型实测：宿主 0x48e5 < 0x88d0、
+    // Via 0x18058 < 0x1b580），不相等不是坏项。
+    detail[@"lcDataOff"] = @(sigOff);
+    detail[@"lcDataSize"] = @(sigSize);
+    detail[@"superblobLength"] = @(info.superblobLength);
+    BOOL lcOK = info.superblobLength > 0
+        && info.superblobLength <= sigSize
+        && (!info.hasSignatureSlot
+            || (uint64_t)info.cmsOffset + 8 + (info.cmsBlobLength > 8 ? info.cmsBlobLength - 8 : 0) <= info.superblobLength);
+    detail[@"lcSignatureOK"] = @(lcOK);
+    if (!lcOK) {
+        detail[@"error"] = @"LC_CODE_SIGNATURE 与 superblob 长度对不上，或 CMS 槽超出 superblob";
+    }
     NSString *identifier = SBReadCDString(&info.cd, info.cd.identOffset);
     if (identifier.length > 0) {
         detail[@"identifier"] = identifier;
@@ -1232,12 +1638,13 @@ static void SBInspectCMS(const uint8_t *sig, uint32_t sigSize,
     detail[@"pageHashOK"] = @(pagesOK);
 
     // 0.2.12：CMS 逐项（可解析、链完整、叶子未过期、摘要与 CD 对得上）。
+    // 0.2.14：再加 CMS 签名值密码学验签 + Apple 9.1/9.2 属性比对。
     SBCMSDetail cms;
     memset(&cms, 0, sizeof(cms));
     BOOL hasCMSDetail = NO;
     if (info.hasSignatureSlot) {
         SBInspectCMS(bytes + sigOff, sigSize, info.cmsOffset, info.cmsBlobLength,
-                     &info.cd, &cms);
+                     &info.cd, info.hasAltCD ? &info.altCD : NULL, &cms);
         hasCMSDetail = YES;
         detail[@"cmsLength"] = @(cms.cmsDERLength);
         detail[@"cmsCertCount"] = @(cms.certCount);
@@ -1245,6 +1652,14 @@ static void SBInspectCMS(const uint8_t *sig, uint32_t sigSize,
         detail[@"cmsChainComplete"] = @(cms.chainComplete);
         detail[@"cmsCDHashOK"] = @(cms.cdHashOK);
         detail[@"cmsLeafExpired"] = @(cms.leafExpired);
+        detail[@"cmsSignatureValid"] = @(cms.signatureValid);
+        detail[@"cmsAppleAttrsValid"] = @(cms.appleAttrsValid);
+        if (cms.signatureError[0] != '\0') {
+            detail[@"cmsSignatureError"] = [NSString stringWithUTF8String:cms.signatureError];
+        }
+        if (cms.appleAttrsError[0] != '\0') {
+            detail[@"cmsAppleAttrsError"] = [NSString stringWithUTF8String:cms.appleAttrsError];
+        }
         if (cms.leafCN[0] != '\0') {
             detail[@"cmsLeafCN"] = [NSString stringWithUTF8String:cms.leafCN];
         }
@@ -1268,6 +1683,16 @@ static void SBInspectCMS(const uint8_t *sig, uint32_t sigSize,
             }
         } else if (!cms.cdHashOK) {
             detail[@"cmsError"] = @"CMS 摘要与 CodeDirectory 对不上，签名后文件被改过";
+            if (detail[@"error"] == [NSNull null]) {
+                detail[@"error"] = detail[@"cmsError"];
+            }
+        } else if (!cms.signatureValid) {
+            detail[@"cmsError"] = [NSString stringWithUTF8String:cms.signatureError];
+            if (detail[@"error"] == [NSNull null]) {
+                detail[@"error"] = detail[@"cmsError"];
+            }
+        } else if (!cms.appleAttrsValid) {
+            detail[@"cmsError"] = [NSString stringWithUTF8String:cms.appleAttrsError];
             if (detail[@"error"] == [NSNull null]) {
                 detail[@"error"] = detail[@"cmsError"];
             }
@@ -1306,8 +1731,10 @@ static void SBInspectCMS(const uint8_t *sig, uint32_t sigSize,
         && cms.chainComplete
         && !cms.leafExpired
         && cms.cdHashOK
+        && cms.signatureValid
+        && cms.appleAttrsValid
         && cms.error[0] == '\0';
-    if (identifier.length > 0 && pagesOK && altOK && specialOK && cmsOK) {
+    if (identifier.length > 0 && pagesOK && altOK && specialOK && cmsOK && lcOK) {
         detail[@"valid"] = @YES;
     }
     return detail;

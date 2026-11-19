@@ -238,6 +238,11 @@ public enum SBCertificate {
         do {
             let password = try await askPassword(presenter: presenter)
             let expiration = try await checkCertificate(data: data, password: password)
+            // 0.2.14：导入时验私钥与叶子证书匹配；不匹配直接报，不许把
+            // 错 key 的证书存下来、以后签出 dyld 不认的坏 CMS。
+            if privateKeyMatchesCertificate(data: data, password: password) == false {
+                throw SBError.certificateInvalid(reason: "证书与私钥不匹配，请重新导入")
+            }
             guard SBKeychain.save(password: password) else {
                 throw SBError.generic(stage: "导入证书", message: "证书密码保存失败，请重试")
             }
@@ -565,6 +570,41 @@ public enum SBCertificate {
         }
         let reason = result.error ?? "证书校验未通过（状态码 \(result.status)）"
         throw SBError.certificateInvalid(reason: reason)
+    }
+
+    /// 0.2.14：验证 p12 里的私钥与叶子证书公钥匹配。
+    /// 做法：SecPKCS12Import 取身份，证书公钥与私钥导出的公钥逐字节比对。
+    /// 返回 true=匹配、false=不匹配、nil=取不到密钥没法定论（不拦）。
+    /// 不匹配时导入/重签必须停下来报“证书与私钥不匹配，请重新导入”，
+    /// 不许用错 key 签出坏 CMS（ZSign 的 InitSimple 虽然也会在配对不上时
+    /// 失败，但它的报错是含糊的“Maybe wrong password?”，用户分不清是
+    /// 密码错还是证书私钥不配对）。
+    static func privateKeyMatchesCertificate(data: Data, password: String) -> Bool? {
+        let options: [String: Any] = [kSecImportExportPassphrase as String: password]
+        var items: CFArray?
+        guard SecPKCS12Import(data as CFData, options as CFDictionary, &items) == errSecSuccess,
+              let array = items as? [[String: Any]],
+              let first = array.first,
+              let identityValue = first[kSecImportItemIdentity as String] else {
+            return nil
+        }
+        let identity = identityValue as! SecIdentity
+        var cert: SecCertificate?
+        guard SecIdentityCopyCertificate(identity, &cert) == errSecSuccess, let cert = cert else {
+            return nil
+        }
+        var privateKey: SecKey?
+        guard SecIdentityCopyPrivateKey(identity, &privateKey) == errSecSuccess,
+              let privateKey = privateKey else {
+            return nil
+        }
+        guard let certKey = SecCertificateCopyKey(cert),
+              let certPub = SecKeyCopyExternalRepresentation(certKey, nil) as Data?,
+              let privPubKey = SecKeyCopyPublicKey(privateKey),
+              let privPub = SecKeyCopyExternalRepresentation(privPubKey, nil) as Data? else {
+            return nil
+        }
+        return certPub == privPub
     }
 
     // MARK: - 私有：Security 框架解析

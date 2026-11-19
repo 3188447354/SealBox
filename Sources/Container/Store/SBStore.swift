@@ -127,9 +127,23 @@ final class SBStore: ObservableObject {
         }
     }
 
-    func recordLaunchResult(bundleID: String, success: Bool, message: String) {
+    /// 0.2.14：失败标记按 bundleID + diskDirectoryName 写到对应的那条
+    /// 记录（平行安装的两条同名记录必须分开记；只按 bundleID 找首条时，
+    /// 标记可能写到另一条平行安装的记录上，门读的那条永远读不到——
+    /// 0.2.13 的 hdsh 触发器没生效的候选根因之一）。diskDirectoryName
+    /// 为空时退到只按 bundleID 找首条（旧收据没有目录名时的兜底）。
+    func recordLaunchResult(bundleID: String, diskDirectoryName: String? = nil,
+                           success: Bool, message: String) {
         onMain {
-            guard var app = app(with: bundleID) else { return }
+            let app: SBInstalledApp?
+            if let dir = diskDirectoryName, !dir.isEmpty {
+                app = installedApps.first {
+                    $0.bundleID == bundleID && $0.diskDirectoryName == dir
+                } ?? self.app(with: bundleID)
+            } else {
+                app = self.app(with: bundleID)
+            }
+            guard var app = app else { return }
             app.lastLaunchResult = SBLaunchResult(
                 success: success, date: Date(), message: message)
             upsertApp(app)
