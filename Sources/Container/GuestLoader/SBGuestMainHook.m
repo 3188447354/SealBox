@@ -4,14 +4,27 @@
 #import <dlfcn.h>
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
-#import <mach-o/nlist.h>
-#import <stdio.h>
-#import <stdlib.h>
 #import <string.h>
 
-#import "litehook.h"
+#import "SBChainedFixupRebind.h"
 #import "SBGuestLoader.h"
 #import "SBDiagLog.h"
+
+// Swift 覆盖层 UIApplicationMain 的替身（SBSwiftUIEmbed.swift，@_cdecl 导出）。
+// 它的参数是 Swift 覆盖层签名的 ABI（Int32，argv 指针，String?，String?）；
+// 此签名的 Swift 调用约定与 C 一致（Int32→w0，指针→x1，16 字节 String?→x2:x3
+// 与 x4:x5，返回 Int32→w0），ObjC 侧只取地址写进客 __got 槽，不直接调它，
+// 故声明成 void 函数取地址。
+extern void SBHookedSwiftUIApplicationMain(void);
+
+/// C 符号：ObjC main.m 直接调 UIApplicationMain。
+static const char * const SBUIApplicationMainCSymbol = "_UIApplicationMain";
+/// Swift 覆盖层符号：Swift @main / @UIApplicationMain 生成的 main 调
+/// UIKit.UIApplicationMain（mangled 全名；签名自 Swift 5 起未变）。
+/// 原型 0230（OmoFun Runner 实测）：链式 import 序号 41，__DATA_CONST 槽
+/// 0x8150，指针格式 6（无 PAC）。
+static const char * const SBUIApplicationMainSwiftSymbol =
+    "_$s5UIKit17UIApplicationMainys5Int32VAD_SpySpys4Int8VGGSgSSSgAJtF";
 
 typedef int (*SBUIApplicationMainFn)(int argc, char *argv[],
                                       NSString *principalClassName,
@@ -60,17 +73,26 @@ int SBHookedUIApplicationMain(int argc, char *argv[],
             g_orig_UIApplicationMain = (SBUIApplicationMainFn)dlsym(RTLD_DEFAULT, "UIApplicationMain");
         }
         if (g_orig_UIApplicationMain) {
+            SBDiagLogLine([[NSString stringWithFormat:
+                            @"拦截 UIApplicationMain：新鲜进程第一遍（调用方 %@），原样转发",
+                            SBHookCallerImageName()] UTF8String]);
             return g_orig_UIApplicationMain(argc, argv, principalClassName, delegateClassName);
         }
         SBDiagLogLine(@"拦截 UIApplicationMain：新鲜进程但找不到原函数，返回 0");
         return 0;
     }
     // 进程内：第二遍 UIApplicationMain——宿主 UIKit 已在跑，绝不能重初始化
-    //（nread 0.2.24 就是死在这：Dispatch queue already set）。拦截。
+    //（nread 0.2.24 与 0.2.29 就是死在这：Dispatch queue already set）。拦截。
+    if (g_hookDidActivate) {
+        // 多镜像重绑时同一替身可能被调两次（主镜像＋Framework 各一个槽）：
+        // 第一次已激活，第二次直接返回 0，不重复激活（0.2.30）。
+        SBDiagLogLine(@"拦截 UIApplicationMain：已激活过，直接返回 0（重复触发）");
+        return 0;
+    }
     NSString *callerImage = SBHookCallerImageName();
     NSString *bundleID = g_hookContext.bundleID ?: @"未知客";
     SBDiagLogLine([[NSString stringWithFormat:
-                    @"拦截 UIApplicationMain：%@ 调用方 %@，principal=%@ delegate=%@（进程内，不调原函数）",
+                    @"拦截 UIApplicationMain：%@ 调用方 %@，principal=%@ delegate=%@（进程内第二遍，不调原函数）",
                     bundleID, callerImage,
                     principalClassName ?: @"(nil)", delegateClassName ?: @"(nil)"] UTF8String]);
     NSError *error = nil;
@@ -80,6 +102,8 @@ int SBHookedUIApplicationMain(int argc, char *argv[],
                                                                        error:&error];
     if (ok) {
         g_hookDidActivate = YES;
+        SBDiagLogLine([[NSString stringWithFormat:@"拦截 UIApplicationMain：%@ 会话激活成功（进程内第二遍已拦截）",
+                        bundleID] UTF8String]);
         return 0;
     }
     g_hookActivationError = error;
@@ -115,164 +139,113 @@ static const struct mach_header *SBGuestImageHeaderForExecPath(NSString *execPat
     return NULL;
 }
 
-void SBGuestMainHookInstallForGuestImage(const struct mach_header *guestHeader,
-                                         SBGuestMainHookContext *context) {
+/// 客包 Frameworks 目录下各 Framework 的可执行文件路径
+///（<Name>.framework/<Name>）。只列磁盘上存在的文件；加载与否由调用方按
+/// dyld 镜像头判定。
+static NSArray<NSString *> *SBGuestFrameworkExecutablePaths(NSString *guestAppPath) {
+    if (guestAppPath.length == 0) {
+        return @[];
+    }
+    NSString *frameworksDir = [guestAppPath stringByAppendingPathComponent:@"Frameworks"];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSError *listError = nil;
+    NSArray<NSString *> *entries = [fm contentsOfDirectoryAtPath:frameworksDir error:&listError];
+    if (!entries) {
+        return @[];
+    }
+    NSMutableArray<NSString *> *paths = [NSMutableArray array];
+    for (NSString *entry in entries) {
+        if (![entry hasSuffix:@".framework"]) {
+            continue;
+        }
+        NSString *name = [entry stringByDeletingPathExtension];
+        NSString *execPath = [[frameworksDir stringByAppendingPathComponent:entry]
+                              stringByAppendingPathComponent:name];
+        if ([fm fileExistsAtPath:execPath]) {
+            [paths addObject:execPath];
+        }
+    }
+    return paths;
+}
+
+/// 在一个镜像里试两种符号（C 符号在前、Swift 覆盖层符号在后），任一装上
+/// 即记一行并返回 YES。重绑函数自带逐槽诊断（序号/槽地址/失败原因），这里
+/// 只记“试了哪个镜像、哪个符号、结果”。
+static BOOL SBGuestTryRebindInImage(const struct mach_header *header,
+                                    NSString *execPath,
+                                    NSString *bundleID) {
+    BOOL installed = NO;
+    if (SBRebindGuestSymbolForImage(header, execPath, SBUIApplicationMainCSymbol,
+                                    (void *)SBHookedUIApplicationMain)) {
+        SBDiagLogLine([[NSString stringWithFormat:@"拦截 UIApplicationMain：%@ C 符号已在 %@ 重绑",
+                        bundleID, execPath.lastPathComponent] UTF8String]);
+        installed = YES;
+    } else {
+        SBDiagLogLine([[NSString stringWithFormat:@"拦截 UIApplicationMain：%@ %@ 无 C 符号槽（见上文链式重绑诊断）",
+                        bundleID, execPath.lastPathComponent] UTF8String]);
+    }
+    if (SBRebindGuestSymbolForImage(header, execPath, SBUIApplicationMainSwiftSymbol,
+                                    (void *)SBHookedSwiftUIApplicationMain)) {
+        SBDiagLogLine([[NSString stringWithFormat:@"拦截 UIApplicationMain：%@ Swift 覆盖层符号已在 %@ 重绑",
+                        bundleID, execPath.lastPathComponent] UTF8String]);
+        installed = YES;
+    } else {
+        SBDiagLogLine([[NSString stringWithFormat:@"拦截 UIApplicationMain：%@ %@ 无 Swift 覆盖层符号槽（见上文链式重绑诊断）",
+                        bundleID, execPath.lastPathComponent] UTF8String]);
+    }
+    return installed;
+}
+
+BOOL SBGuestMainHookInstallForGuestImage(const struct mach_header *guestHeader,
+                                         SBGuestMainHookContext *context,
+                                         SBGuestUIType uiType) {
     g_hookContext = context;
     SBGuestMainHookResetActivationState();
+    NSString *bundleID = context.bundleID ?: @"未知客";
+    NSString *typeString = SBGuestUITypeToString(uiType);
     if (!guestHeader) {
         guestHeader = SBGuestImageHeaderForExecPath(context.guestExecPath);
     }
     if (!guestHeader) {
-        SBDiagLogLine([[NSString stringWithFormat:@"拦截 UIApplicationMain：%@ 找不到客镜像头，不装拦截",
-                        context.bundleID] UTF8String]);
-        return;
-    }
-    // SwiftUI 客判定：镜像不直接引用 UIApplicationMain 时 rebind 够不着。
-    if (!SBGuestImageFileReferencesUIApplicationMain(context.guestExecPath)) {
-        SBDiagLogLine([[NSString stringWithFormat:
-                        @"拦截 UIApplicationMain：%@ 镜像未直接引用 UIApplicationMain（疑似 SwiftUI 客，调用在 SwiftUICore 缓存里），rebind 未装上；若客闪退于第二遍 UIApplicationMain，即为此因（X2）",
-                        context.bundleID] UTF8String]);
-        return;
-    }
-    if (!g_orig_UIApplicationMain) {
-        g_orig_UIApplicationMain = (SBUIApplicationMainFn)dlsym(RTLD_DEFAULT, "UIApplicationMain");
-    }
-    if (!g_orig_UIApplicationMain) {
-        SBDiagLogLine([[NSString stringWithFormat:@"拦截 UIApplicationMain：%@ dlsym 找不到原函数，不装拦截",
-                        context.bundleID] UTF8String]);
-        return;
-    }
-    litehook_rebind_symbol(guestHeader, (void *)g_orig_UIApplicationMain,
-                           (void *)SBHookedUIApplicationMain, NULL);
-    SBDiagLogLine([[NSString stringWithFormat:@"拦截 UIApplicationMain：%@ 已在客镜像重绑（0.2.25 函数指针传法）",
-                    context.bundleID] UTF8String]);
-}
-
-#pragma mark - 文件符号表判定（SwiftUI 客识别）
-
-/// 读磁盘 Mach-O 的 LC_SYMTAB + LC_DYSYMTAB：未定义符号表里有没有 _UIApplicationMain。
-/// 只读，不改动；符号表被剥掉/解析失败时返回 NO（按够不着处理，记警告不拦加载）。
-BOOL SBGuestImageFileReferencesUIApplicationMain(NSString *guestExecPath) {
-    FILE *file = fopen([guestExecPath UTF8String], "rb");
-    if (!file) {
+        SBDiagLogLine([[NSString stringWithFormat:@"拦截 UIApplicationMain：%@ 找不到客镜像头，不装拦截（客类型 %@）",
+                        bundleID, typeString] UTF8String]);
         return NO;
     }
-    uint32_t magic = 0;
-    if (fread(&magic, sizeof(magic), 1, file) != 1) {
-        fclose(file);
-        return NO;
-    }
-    // fat 二进制：取 arm64 切片。
-    uint64_t baseOffset = 0;
-    if (magic == 0xCAFEBABE || magic == 0xBEBAFECA) {
-        uint32_t nfat = 0;
-        BOOL swapped = (magic == 0xBEBAFECA);
-        fseek(file, 4, SEEK_SET);
-        if (fread(&nfat, sizeof(nfat), 1, file) != 1) {
-            fclose(file);
-            return NO;
-        }
-        if (swapped) {
-            nfat = __builtin_bswap32(nfat);
-        }
-        BOOL found = NO;
-        for (uint32_t i = 0; i < nfat; i++) {
-            uint32_t cputype = 0, offset = 0;
-            fseek(file, 8 + i * 20, SEEK_SET);
-            if (fread(&cputype, sizeof(cputype), 1, file) != 1) {
-                break;
+    SBDiagLogLine([[NSString stringWithFormat:@"拦截 UIApplicationMain：%@ 开始装拦截（客类型 %@，主镜像 %@）",
+                    bundleID, typeString, context.guestExecPath.lastPathComponent] UTF8String]);
+    // ① 主镜像：调用点只可能在入口镜像里（客 main 在此）；两种符号各试一次。
+    BOOL installed = SBGuestTryRebindInImage(guestHeader, context.guestExecPath, bundleID);
+    // ② 主镜像没装上时扫客 Frameworks：调用若在 Framework 里，拦截点跟过去
+    //（实测 Flutter 的调用在主镜像，这里是兜底；只扫已加载的镜像——链式路
+    // 要内存头算 slide，未加载的记一行跳过，不强行 dlopen）。
+    NSUInteger frameworkCount = 0;
+    if (!installed) {
+        NSArray<NSString *> *frameworkPaths =
+            SBGuestFrameworkExecutablePaths(context.guestAppPath);
+        frameworkCount = frameworkPaths.count;
+        SBDiagLogLine([[NSString stringWithFormat:@"拦截 UIApplicationMain：%@ 主镜像未装上，扫客 Frameworks（%lu 个）",
+                        bundleID, (unsigned long)frameworkCount] UTF8String]);
+        for (NSString *fwExecPath in frameworkPaths) {
+            const struct mach_header *fwHeader =
+                SBGuestImageHeaderForExecPath(fwExecPath);
+            if (!fwHeader) {
+                SBDiagLogLine([[NSString stringWithFormat:@"拦截 UIApplicationMain：%@ Framework %@ 未加载，跳过",
+                                bundleID, fwExecPath.lastPathComponent] UTF8String]);
+                continue;
             }
-            if (swapped) {
-                cputype = __builtin_bswap32(cputype);
-            }
-            fseek(file, 8 + i * 20 + 8, SEEK_SET);
-            if (fread(&offset, sizeof(offset), 1, file) != 1) {
-                break;
-            }
-            if (swapped) {
-                offset = __builtin_bswap32(offset);
-            }
-            if (cputype == 0x0100000C) { // CPU_TYPE_ARM64
-                baseOffset = offset;
-                found = YES;
-                break;
+            if (SBGuestTryRebindInImage(fwHeader, fwExecPath, bundleID)) {
+                installed = YES;
             }
         }
-        if (!found) {
-            fclose(file);
-            return NO;
-        }
-        fseek(file, (long)baseOffset, SEEK_SET);
-        if (fread(&magic, sizeof(magic), 1, file) != 1) {
-            fclose(file);
-            return NO;
-        }
     }
-    BOOL is64 = (magic == 0xFEEDFACF);
-    if (!is64 && magic != 0xFEEDFACE) {
-        fclose(file);
-        return NO;
+    if (installed) {
+        SBDiagLogLine([[NSString stringWithFormat:@"拦截 UIApplicationMain：%@ 安装成功（客类型 %@）",
+                        bundleID, typeString] UTF8String]);
+    } else {
+        // 失败原因写真实查找结果：客类型、扫了哪些镜像、两种符号都没槽——
+        // 绝不再把 Flutter/UIKit 客标成“疑似 SwiftUI 客”（0.2.29 的误标）。
+        SBDiagLogLine([[NSString stringWithFormat:@"拦截 UIApplicationMain：%@ 安装失败（客类型 %@，主镜像＋%lu 个 Framework 均无 C/Swift 符号槽，见上文链式重绑诊断；护栏将干净失败，不跳 main）",
+                        bundleID, typeString, (unsigned long)frameworkCount] UTF8String]);
     }
-    uint32_t ncmds = 0;
-    fseek(file, (long)(baseOffset + 16), SEEK_SET);
-    if (fread(&ncmds, sizeof(ncmds), 1, file) != 1) {
-        fclose(file);
-        return NO;
-    }
-    uint64_t cursor = baseOffset + (is64 ? 32 : 28);
-    uint32_t symoff = 0, nsyms = 0, stroff = 0;
-    uint32_t iundefsym = 0, nundefsym = 0;
-    for (uint32_t i = 0; i < ncmds; i++) {
-        uint32_t cmd = 0, cmdsize = 0;
-        fseek(file, (long)cursor, SEEK_SET);
-        if (fread(&cmd, sizeof(cmd), 1, file) != 1 ||
-            fread(&cmdsize, sizeof(cmdsize), 1, file) != 1) {
-            fclose(file);
-            return NO;
-        }
-        if (cmd == 0x2) { // LC_SYMTAB
-            fseek(file, (long)(cursor + 8), SEEK_SET);
-            if (fread(&symoff, sizeof(symoff), 1, file) != 1 ||
-                fread(&nsyms, sizeof(nsyms), 1, file) != 1 ||
-                fread(&stroff, sizeof(stroff), 1, file) != 1) {
-                fclose(file);
-                return NO;
-            }
-        } else if (cmd == 0xB) { // LC_DYSYMTAB
-            uint32_t fields[6] = {0};
-            fseek(file, (long)(cursor + 8), SEEK_SET);
-            if (fread(fields, sizeof(uint32_t), 6, file) != 6) {
-                fclose(file);
-                return NO;
-            }
-            iundefsym = fields[4];
-            nundefsym = fields[5];
-        }
-        if (cmdsize == 0) {
-            break;
-        }
-        cursor += cmdsize;
-    }
-    if (symoff == 0 || stroff == 0 || nundefsym == 0) {
-        fclose(file);
-        return NO;
-    }
-    size_t entrySize = is64 ? 16 : 12;
-    BOOL found = NO;
-    for (uint32_t i = iundefsym; i < iundefsym + nundefsym && i < nsyms; i++) {
-        uint32_t strx = 0;
-        fseek(file, (long)(baseOffset + symoff + i * entrySize), SEEK_SET);
-        if (fread(&strx, sizeof(strx), 1, file) != 1) {
-            break;
-        }
-        fseek(file, (long)(baseOffset + stroff + strx), SEEK_SET);
-        char name[64] = {0};
-        size_t got = fread(name, 1, sizeof(name) - 1, file);
-        if (got > 0 && strcmp(name, "_UIApplicationMain") == 0) {
-            found = YES;
-            break;
-        }
-    }
-    fclose(file);
-    return found;
+    return installed;
 }

@@ -108,3 +108,28 @@ public func SBSwiftUIEmbedApp(_ metadata: UnsafeRawPointer,
         return false
     }
 }
+
+/// Swift 覆盖层 UIApplicationMain 的替身（0.2.30）。
+///
+/// Flutter/Swift-main 客的 main 调的不是 C UIApplicationMain，而是 UIKit 的
+/// Swift 覆盖层函数 `UIKit.UIApplicationMain(_:_:_:_:)`（mangled
+/// _$s5UIKit17UIApplicationMainys5Int32VAD_SpySpys4Int8VGGSgSSSgAJtF，
+/// 原型 0230：OmoFun Runner 链式 import 序号 41，__DATA_CONST 槽 0x8150，
+/// 指针格式 6）。C 符号重绑够不着它，须按 Swift ABI 接：参数与覆盖层签名逐字
+/// 相同（Int32，argv，String?，String?），@_cdecl 导出，ObjC 侧只取地址写进
+/// 客 __got 槽。体内 String? 直传 ObjC 替身 SBHookedUIApplicationMain
+///（调用边界桥接成 NSString?，同一判别器：新鲜进程第一遍转发、进程内第二遍
+/// 拦截激活）；覆盖层本身只是 String?→NSString? 的薄转发，第一遍转发直接调
+/// C UIApplicationMain 与之一致。
+/// ABI 说明：此签名的 Swift 调用约定与 C 一致（Int32→w0，指针→x1，
+/// 16 字节 String?→x2:x3 与 x4:x5，返回 Int32→w0），@_cdecl 函数可直接接。
+@_cdecl("SBHookedSwiftUIApplicationMain")
+public func SBHookedSwiftUIApplicationMain(
+    _ argc: Int32,
+    _ argv: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?,
+    _ principalClassName: String?,
+    _ delegateClassName: String?
+) -> Int32 {
+    SBDiagLog.log("拦截 Swift UIApplicationMain：principal=\(principalClassName ?? "(nil)") delegate=\(delegateClassName ?? "(nil)")（走 ObjC 替身判别：第一遍转发／第二遍拦截）")
+    return SBHookedUIApplicationMain(argc, argv, principalClassName, delegateClassName)
+}

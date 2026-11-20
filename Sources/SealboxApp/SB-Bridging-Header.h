@@ -6,6 +6,7 @@
 //
 
 #import "SBGuestLoader.h"
+#import "SBGuestMainHook.h"
 #import "SBGuestSessionManager.h"
 #import "SBGuestUIClassifier.h"
 #import "SBSigner.h"

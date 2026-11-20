@@ -493,6 +493,9 @@ static void SBDiagLogGuestFail(SBGuestLoaderErrorCode code, NSString *bundleID, 
     // 失败后浮层仍在，弹窗按钮点不了）。窗口级透传（SBHomeBarOverlay.m）
     // 是第一道防线，这里是第二道。
     SBCallHomeBarOverlaySetHidden(YES);
+    // 0.2.30（MJ 00:07 立规：客加载每一步都要写日志，不许有静默步骤）：
+    // 还原本身记一行——失败路径与客退出都走这里，崩在还原之后也能定位。
+    SBDiagLogLine(@"客加载：已恢复宿主环境（主 Bundle/可执行路径/进程身份/环境已还原，浮层已藏）");
 }
 
 /// 失败 + 还原：先还原已应用的客上下文，再按 failWithError 造错返回 NO。
@@ -719,8 +722,10 @@ static void SBDiagLogGuestFail(SBGuestLoaderErrorCode code, NSString *bundleID, 
 
     // 0.2.28：进程内加载——dlopen 后、跳 main 前按客 UI 类型装拦截。
     // SwiftUI 客装 App.main 重绑（跳原入口必崩，改嵌 App 场景）；装不上
-    // 直接干净失败，不跳 main。UIKit/Flutter 客走 0.2.27 的
-    // UIApplicationMain 拦截，不动。
+    // 直接干净失败，不跳 main。UIKit/Flutter 客装 UIApplicationMain 拦截
+    //（0.2.30：统一走 SBChainedFixupRebind，C 符号＋Swift 覆盖层符号都试，
+    // 主镜像不成再扫 Frameworks；装不上同样干净失败，不跳 main——0.2.29 前
+    // 这里忽略安装返回值直接跳 main，第二遍 UIApplicationMain 断言崩）。
     BOOL isSwiftUIGuest = NO;
     if (inProcess) {
         SBGuestMainHookContext *hookContext = [[SBGuestMainHookContext alloc] init];
@@ -751,7 +756,21 @@ static void SBDiagLogGuestFail(SBGuestLoaderErrorCode code, NSString *bundleID, 
                 return NO;
             }
         } else {
-            SBGuestMainHookInstallForGuestImage(NULL, hookContext);
+            if (!SBGuestMainHookInstallForGuestImage(NULL, hookContext, uiType)) {
+                // 护栏：拦截装不上 → 干净失败，记日志＋弹错，绝不跳 main
+                //（0.2.30：与 SwiftUI 护栏一致；0.2.29 前这里忽略返回值直接
+                // 跳 main，第二遍 UIApplicationMain “Dispatch queue already
+                // set” 断言崩，见 SealBox-2026-11-21-000419.ips）。
+                [self restoreHostContext];
+                if (error) {
+                    *error = SBGuestLoaderErrorMake(SBGuestLoaderErrorGuestLoadFailed, @"加载客 App",
+                                                    @"该应用的启动拦截未装上，暂不支持进程内启动",
+                                                    @"该应用暂不支持在虚拟机内打开，请等待后续版本");
+                }
+                SBDiagLogLine([[NSString stringWithFormat:@"客加载失败：%@ UIKit/Flutter 应用，UIApplicationMain 拦截未装上（护栏干净失败）",
+                                bundleID] UTF8String]);
+                return NO;
+            }
         }
     }
 

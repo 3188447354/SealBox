@@ -13,6 +13,11 @@
 // （原型 0228 第 2/3 组实证：宿主二进制未定义符号里确有此串。）
 static const char * const SBAppMainSymbol = "_$s7SwiftUI3AppPAAE4mainyyFZ";
 static const char * const SBUIApplicationMainSymbol = "_UIApplicationMain";
+// Swift 覆盖层 UIApplicationMain（0.2.30）：Swift @main / @UIApplicationMain
+// 生成的 main 调 UIKit.UIApplicationMain，不是 C UIApplicationMain——
+// 原型 0230：OmoFun Runner 未定义符号里有它（C 符号没有），链式 import 序号 41。
+static const char * const SBSwiftUIApplicationMainSymbol =
+    "_$s5UIKit17UIApplicationMainys5Int32VAD_SpySpys4Int8VGGSgSSSgAJtF";
 
 SBGuestUIType SBGuestUITypeForGuestExecutable(NSString *execPath) {
     if (execPath.length == 0) {
@@ -143,10 +148,14 @@ SBGuestUIType SBGuestUITypeForGuestExecutable(NSString *execPath) {
         cursor += cmdsize;
     }
     (void)hasDyldInfo;
-    // 未定义符号里找两个目标符号。
+    // 未定义符号里找三个目标符号（0.2.30：C 符号之外再加 Swift 覆盖层符号——
+    // Swift-main 客只有覆盖层符号，没有 C 符号；只查 C 符号会把 Flutter/
+    // Swift UIKit 客漏成未知，拦截门也跟着瞎）。
     BOOL hasUIApplicationMain = NO;
+    BOOL hasSwiftUIApplicationMain = NO;
     BOOL hasAppMain = NO;
-    if (symoff != 0 && stroff != 0 && strsize != 0 && nundefsym != 0) {
+    BOOL hasSymtab = (symoff != 0 && stroff != 0 && strsize != 0 && nundefsym != 0);
+    if (hasSymtab) {
         size_t entrySize = is64 ? 16 : 12;
         for (uint32_t i = iundefsym; i < iundefsym + nundefsym && i < nsyms; i++) {
             uint32_t strx = 0;
@@ -165,10 +174,12 @@ SBGuestUIType SBGuestUITypeForGuestExecutable(NSString *execPath) {
             }
             if (strcmp(name, SBUIApplicationMainSymbol) == 0) {
                 hasUIApplicationMain = YES;
+            } else if (strcmp(name, SBSwiftUIApplicationMainSymbol) == 0) {
+                hasSwiftUIApplicationMain = YES;
             } else if (strcmp(name, SBAppMainSymbol) == 0) {
                 hasAppMain = YES;
             }
-            if (hasUIApplicationMain && hasAppMain) {
+            if (hasUIApplicationMain && hasSwiftUIApplicationMain && hasAppMain) {
                 break;
             }
         }
@@ -176,19 +187,22 @@ SBGuestUIType SBGuestUITypeForGuestExecutable(NSString *execPath) {
     fclose(file);
     SBGuestUIType type = SBGuestUITypeUnknown;
     if (linksFlutter) {
-        // Flutter 优先：Runner 也直接调 UIApplicationMain，单看符号会误判 UIKit。
+        // Flutter 优先：Runner 调的是 Swift 覆盖层 UIApplicationMain，
+        // 单看 C 符号会漏判（0.2.29 的“_UIApplicationMain=否”即此盲区）。
         type = SBGuestUITypeFlutter;
-    } else if (hasUIApplicationMain) {
+    } else if (hasUIApplicationMain || hasSwiftUIApplicationMain) {
         type = SBGuestUITypeUIKit;
     } else if (hasAppMain) {
         type = SBGuestUITypeSwiftUI;
     }
-    SBDiagLogLine([[NSString stringWithFormat:@"客分型：%@ → %@（链 Flutter=%@，_UIApplicationMain=%@，App.main=%@，链式修正=%@）",
+    SBDiagLogLine([[NSString stringWithFormat:@"客分型：%@ → %@（链 Flutter=%@，C _UIApplicationMain=%@，Swift UIApplicationMain=%@，App.main=%@，链式修正=%@，符号表=%@）",
                     execPath.lastPathComponent, SBGuestUITypeToString(type),
                     linksFlutter ? @"是" : @"否",
                     hasUIApplicationMain ? @"是" : @"否",
+                    hasSwiftUIApplicationMain ? @"是" : @"否",
                     hasAppMain ? @"是" : @"否",
-                    hasChainedFixups ? @"是" : @"否"] UTF8String]);
+                    hasChainedFixups ? @"是" : @"否",
+                    hasSymtab ? @"有" : @"无（符号被剥，符号结果不可信）"] UTF8String]);
     return type;
 }
 
