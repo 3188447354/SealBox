@@ -3,6 +3,12 @@
 // 做法：先用 dlsym 记下原函数，再用 litehook_rebind_symbol 把客可执行镜像里
 // 对 SecItem* 的调用重定向到替身；替身改写 access group 后调原函数。
 // 局限：只改写客镜像自己的调用；系统框架替客 App 调的 SecItem 不经过这里。
+// 0.2.25：litehook_rebind_symbol 的 replacee 参数是原函数指针（头文件签名
+// void litehook_rebind_symbol(const mach_header_u *, void *replacee, void *,
+// bool (*)(const mach_header_u *))；LC 的 SecItem.m:145-151 传 SecItemAdd 本体）。
+// 0.2.24 之前传的是 "_SecItemAdd" 字符串字面量——litehook 按 replacee 的地址
+// 比 GOT 表项，字符串地址永远比不上真实函数地址，4 处重绑全是静默 no-op，
+// 钥匙串隔离根本没装上；本版改传 dlsym 到的 g_orig_* 指针。
 #import <Foundation/Foundation.h>
 #import <Security/Security.h>
 #import <dlfcn.h>
@@ -106,16 +112,17 @@ void SBSecItemHookInstall(void) {
         g_orig_SecItemUpdate = (OSStatus (*)(CFDictionaryRef, CFDictionaryRef))dlsym(RTLD_DEFAULT, "SecItemUpdate");
         g_orig_SecItemDelete = (OSStatus (*)(CFDictionaryRef))dlsym(RTLD_DEFAULT, "SecItemDelete");
         if (g_orig_SecItemAdd) {
-            litehook_rebind_symbol(guestHeader, "_SecItemAdd", (void *)SBHooked_SecItemAdd, NULL);
+            litehook_rebind_symbol(guestHeader, (void *)g_orig_SecItemAdd, (void *)SBHooked_SecItemAdd, NULL);
         }
         if (g_orig_SecItemCopyMatching) {
-            litehook_rebind_symbol(guestHeader, "_SecItemCopyMatching", (void *)SBHooked_SecItemCopyMatching, NULL);
+            litehook_rebind_symbol(guestHeader, (void *)g_orig_SecItemCopyMatching, (void *)SBHooked_SecItemCopyMatching, NULL);
         }
         if (g_orig_SecItemUpdate) {
-            litehook_rebind_symbol(guestHeader, "_SecItemUpdate", (void *)SBHooked_SecItemUpdate, NULL);
+            litehook_rebind_symbol(guestHeader, (void *)g_orig_SecItemUpdate, (void *)SBHooked_SecItemUpdate, NULL);
         }
         if (g_orig_SecItemDelete) {
-            litehook_rebind_symbol(guestHeader, "_SecItemDelete", (void *)SBHooked_SecItemDelete, NULL);
+            litehook_rebind_symbol(guestHeader, (void *)g_orig_SecItemDelete, (void *)SBHooked_SecItemDelete, NULL);
         }
+        NSLog(@"[Sealbox] SecItem Hook 已安装：重绑 SecItemAdd/CopyMatching/Update/Delete（0.2.25 函数指针传法）");
     });
 }

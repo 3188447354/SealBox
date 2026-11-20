@@ -4,17 +4,12 @@ import LocalAuthentication
 // PhoneVM home-screen shell (0.1.4): full-function build.
 // Navigation: home icons open apps full-screen (slide from right);
 // swipe up from the bottom bar returns home; in-app pages use NavigationStack.
-@main
+// 0.2.25：@main 已移走，入口在同目录的 main.m——客 App 必须在干净进程里跑
+// 第一遍 UIApplicationMain（LC 同款做法，见 main.m 文件头），所以 main.m
+// 要先判断有无客启动收据；无收据时调下面的 SBHostAppMain() 跑宿主 SwiftUI。
 struct SealboxApp: App {
     @StateObject private var vm = VMState()
     @StateObject private var coordinator = SBAppCoordinator()
-
-    init() {
-        // 启动诊断日志（0.2.4）：进程启动最先做轮转 + 写第一行；
-        // 崩了下次启动能看到死在哪一步。
-        SBDiagLog.beginRun()
-        SBDiagLog.log("进程启动 \(VMDevice.appVersionString)")
-    }
 
     var body: some Scene {
         WindowGroup {
@@ -23,6 +18,14 @@ struct SealboxApp: App {
                 .environmentObject(coordinator)
         }
     }
+}
+
+/// 宿主 UI 入口（供 ObjC main.m 调用）。`SealboxApp.main()` 即 SwiftUI 的
+/// App 入口（内部调第一遍 UIApplicationMain），只能在确认本次进程不跑客
+/// App 时调——main.m 已先分流。
+@_cdecl("SBHostAppMain")
+public func SBHostAppMain() {
+    SealboxApp.main()
 }
 
 struct VMRootView: View {

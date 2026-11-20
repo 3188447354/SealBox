@@ -216,6 +216,9 @@ enum SBLaunchRouter {
     /// 线程加载客 App（客 main 是 UIKit，必须主线程）。修不好时写
     /// guest-failed 收据、记上次启动结果，onRepairSettled 回主线程让调用
     /// 方按收据弹错——不许静默失败。
+    /// 0.2.25：修完不再进程内加载——宿主 UIKit 已初始化，客再调
+    /// UIApplicationMain 必崩（nread 0.2.24 崩溃：Dispatch queue already
+    /// set）。修完重新请求重启，让新进程在 UIKit 启动前走 main 前置路加载。
     private static func repairAndLaunchGuest(onRepairSettled: (@MainActor @Sendable () -> Void)?) {
         Task {
             guard let receipt = SBStore.shared.launchReceipt else { return }
@@ -228,25 +231,35 @@ enum SBLaunchRouter {
             do {
                 SBDiagLog.log("启动路由：\(bundleID) 重启路签名逐项不合格或上次死在 dlopen 签名失败，异步强制重打补丁+重签")
                 _ = try await SBInstaller.ensureLaunchableSignature(record)
-                SBDiagLog.log("启动路由：\(bundleID) 重启路重签完成，开始加载客 App")
-                let loaded = await MainActor.run {
-                    SBGuestLoader.shared().launchGuestIfRequested()
-                }
+                SBDiagLog.log("启动路由：\(bundleID) 重启路重签完成，重新请求重启（新进程走 main 前置路）")
                 await MainActor.run {
-                    if !loaded {
-                        // 客加载失败：SBGuestLoader 已写收据（guest-failed）；
-                        // 清掉选中标记，回桌面。
-                        if let failedReceipt = SBStore.shared.launchReceipt,
-                           failedReceipt.stage == "guest-failed" {
+                    SBGuestLoader.shared().requestGuestLaunch(
+                        withBundleID: bundleID,
+                        containerUUID: record.containerUUID,
+                        diskDirectoryName: record.diskDirectoryName,
+                        keychainGroup: record.keychainGroup
+                    ) { error in
+                        if let error {
+                            // 重启请求失败：按原有失败路径处理（guest-failed 收据 + 弹错）。
+                            let message = error.localizedDescription
+                            SBDiagLog.log("启动路由：\(bundleID) 修完重起请求失败（[code=\((error as NSError).code)] \(message)），不加载")
+                            var failed = SBStore.shared.launchReceipt ?? SBLaunchReceipt.requested(
+                                guestBundleID: bundleID,
+                                containerUUID: record.containerUUID,
+                                diskDirectoryName: record.diskDirectoryName,
+                                keychainGroup: record.keychainGroup)
+                            failed.stage = "guest-failed"
+                            failed.stageDetail = message
+                            SBStore.shared.launchReceipt = failed
                             SBStore.shared.recordLaunchResult(
-                                bundleID: failedReceipt.guestBundleID,
-                                diskDirectoryName: failedReceipt.diskDirectoryName,
-                                success: false,
-                                message: failedReceipt.stageDetail ?? "客 App 加载失败")
+                                bundleID: bundleID, diskDirectoryName: record.diskDirectoryName,
+                                success: false, message: message)
+                            SBStore.shared.clearGuestSelection()
+                        } else {
+                            SBDiagLog.log("启动路由：\(bundleID) 修完重起请求已发出，0.6 秒后退出进程")
                         }
-                        SBStore.shared.clearGuestSelection()
+                        onRepairSettled?()
                     }
-                    onRepairSettled?()
                 }
             } catch {
                 // 修不好：ensureLaunchableSignature 的错误文案已写明 exact
@@ -270,6 +283,39 @@ enum SBLaunchRouter {
                 }
             }
         }
+    }
+
+    /// 0.2.25：main.m 在 UIKit 启动前调用的预检（见 SBGuestLaunchPreflight）。
+    /// 收据就绪且逐项全过时返回 1——main.m 直接在 main 里加载客 App；
+    /// 需要修复时返回 2——main.m 进宿主 UI 走异步修复（修完再重起一次）；
+    /// 其余情况返回 0——进宿主 UI，沿用原有路由。
+    /// 注意：这里跑的门与 routeOnLaunchIfNeeded 里的同一套（注入件同步、
+    /// 对账、过期收据、Team 门、签名逐项门），顺序一致；幂等，多跑一遍无害。
+    static func preflightForMainEntry() -> Int {
+        guard SBGuestLoader.isGuestLaunchRequested() else { return 0 }
+        ensureGuestHooksDylib()
+        reconcileInstalledAppsWithDisk()
+        clearStaleReceiptIfPackageMissing()
+        if blockReceiptOnTeamMismatch() { return 0 }
+        switch receiptSignatureGate() {
+        case .proceed: return 1
+        case .needsRepair: return 2
+        }
+    }
+
+    /// 0.2.25：main 前置路加载失败时补记一次上次启动结果（与
+    /// routeOnLaunchIfNeeded 的 `!loaded` 分支同款），否则“上次签名失败”
+    /// 标记永远不更新，下一轮门看不到上次是死在签名上。
+    /// 只在收据已是 guest-failed 时记；其余情况不做事。
+    static func noteGuestLoadFailedIfNeeded() {
+        guard let receipt = SBStore.shared.launchReceipt,
+              receipt.stage == "guest-failed" else { return }
+        SBStore.shared.recordLaunchResult(
+            bundleID: receipt.guestBundleID,
+            diskDirectoryName: receipt.diskDirectoryName,
+            success: false,
+            message: receipt.stageDetail ?? "客 App 加载失败")
+        SBStore.shared.clearGuestSelection()
     }
 
     /// App 启动时调用一次。若本次是“重起进客 App”，尝试加载客 App；
@@ -321,6 +367,9 @@ enum SBLaunchRouter {
             repairAndLaunchGuest(onRepairSettled: onRepairSettled)
             return
         }
+        // 0.2.25：同步路是 main 前置路的兜底——正常情况下就绪的收据已被 main.m
+        // 消费掉（预检通过直接加载、需修复走异步修复再重起），到这里说明前置路
+        // 被绕过；仍按原有逻辑进程内加载一次，不静默丢掉这次启动。
         let loaded = SBGuestLoader.shared().launchGuestIfRequested()
         if !loaded {
             // 客加载失败：SBGuestLoader 已写收据（guest-failed）与上次启动结果；
@@ -335,5 +384,21 @@ enum SBLaunchRouter {
             }
             SBStore.shared.clearGuestSelection()
         }
+    }
+}
+
+/// 0.2.25：main.m 的 ObjC 可见桥——main.m 在 UIKit 启动前调 preflight()
+/// 分流（见 SBLaunchRouter.preflightForMainEntry），加载失败时调
+/// noteGuestLoadFailedIfNeeded() 补记上次启动结果。
+@objc final class SBGuestLaunchPreflight: NSObject {
+    /// - Returns: 0 = 无客启动请求或预检不通过（进宿主 UI）；
+    ///   1 = 可直接在 main 里加载客 App；2 = 需要修复（进宿主 UI 走异步修复）。
+    @objc static func preflight() -> Int {
+        SBLaunchRouter.preflightForMainEntry()
+    }
+
+    /// main 前置路加载失败时补记一次上次启动结果（只在收据已是 guest-failed 时记）。
+    @objc static func noteGuestLoadFailedIfNeeded() {
+        SBLaunchRouter.noteGuestLoadFailedIfNeeded()
     }
 }

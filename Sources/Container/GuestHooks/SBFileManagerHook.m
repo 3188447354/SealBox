@@ -4,6 +4,9 @@
 //      原样返回会拿到宿主的 App Group，读错位置）；
 //   ② 客镜像里对 NSHomeDirectory() 的调用重定向到客容器（HOME 环境变量
 //      已被宿主改过，这里是给直接调该函数的客代码再兜一层底）。
+// 0.2.25：litehook_rebind_symbol 的 replacee 参数是原函数指针，不是符号名
+// 字符串（见 SBSecItemHook.m 文件头同款说明）——0.2.24 之前传 "_NSHomeDirectory"
+// 字符串是静默 no-op；本版改传 dlsym 到的 g_orig_NSHomeDirectory。
 // 其余目录（Documents/Caches 等）靠宿主改写 HOME 自然落进客容器，不另 Hook。
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
@@ -60,7 +63,8 @@ void SBFileManagerHookInstall(void) {
         }
         g_orig_NSHomeDirectory = (NSString *(*)(void))dlsym(RTLD_DEFAULT, "NSHomeDirectory");
         if (g_orig_NSHomeDirectory) {
-            litehook_rebind_symbol(guestHeader, "_NSHomeDirectory", (void *)SBHookedNSHomeDirectory, NULL);
+            litehook_rebind_symbol(guestHeader, (void *)g_orig_NSHomeDirectory, (void *)SBHookedNSHomeDirectory, NULL);
+            NSLog(@"[Sealbox] NSHomeDirectory Hook 已安装（0.2.25 函数指针传法）");
         }
     });
 }
