@@ -390,7 +390,10 @@ final class SBAppCoordinator: ObservableObject {
         if #available(iOS 26, *) {
             let metalANGLE = app.bundleURL.appendingPathComponent("Frameworks/MetalANGLE.framework/MetalANGLE")
             if FileManager.default.fileExists(atPath: metalANGLE.path) {
-                let preloadPath = FileManager.default.homeDirectoryForCurrentUser
+                // homeDirectoryForCurrentUser 是 macOS 专属，iOS 上不可用；
+                // documentsURL 即 $HOME/Documents，回推一级就是 HOME。
+                let preloadPath = SBConstants.documentsURL
+                    .deletingLastPathComponent()
                     .appendingPathComponent("Library/preloadLibraries.txt")
                 try? metalANGLE.path.write(toFile: preloadPath.path, atomically: true, encoding: .utf8)
                 SBDiagLog.log("预加载：客带 MetalANGLE，写 preloadLibraries.txt")
