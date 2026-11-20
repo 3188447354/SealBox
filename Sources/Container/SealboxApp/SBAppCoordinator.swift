@@ -300,14 +300,16 @@ final class SBAppCoordinator: ObservableObject {
         // didFinishLaunching），不走签名门（首次加载时已验过，二进制未变）。
         // 恢复失败（上下文重上失败）弹错并停住；返回 false（无会话）时落到首次加载。
         if SBGuestSessionManager.shared().session(forBundleID: app.bundleID) != nil {
-            do {
-                if try SBGuestSessionManager.shared().resumeGuest(withBundleID: app.bundleID) != nil {
-                    SBDiagLog.log("点图标：\(app.bundleID) 已在后台，恢复进入（未重加载）")
-                    return
-                }
-            } catch {
-                SBDiagLog.log("启动失败：\(app.bundleID) 恢复后台会话失败（\(error.localizedDescription)）")
-                self.activeAlert = CoordinatorAlert(title: "启动失败", message: error.localizedDescription)
+            // 0.2.27 fixup 4：resumeGuest 不带 NSError**（见头文件注释），
+            // Swift 侧得可选会话：非空=已恢复；空+lastResumeError 非空=恢复失败弹错；
+            // 空+lastResumeError 为空=无会话，落到首次加载。
+            if SBGuestSessionManager.shared().resumeGuest(withBundleID: app.bundleID) != nil {
+                SBDiagLog.log("点图标：\(app.bundleID) 已在后台，恢复进入（未重加载）")
+                return
+            }
+            if let resumeError = SBGuestSessionManager.shared().lastResumeError {
+                SBDiagLog.log("启动失败：\(app.bundleID) 恢复后台会话失败（\(resumeError.localizedDescription)）")
+                self.activeAlert = CoordinatorAlert(title: "启动失败", message: resumeError.localizedDescription)
                 return
             }
         }

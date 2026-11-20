@@ -69,11 +69,16 @@ extern NSString * const SBGuestActivationFailedMessageKey;
 
 /// 已加载过则恢复：不 dlopen、不跑 main、不重调 didFinishLaunching；
 // 只换回该客的 delegate、激活它的 scene、它的窗口重新成为 key。
-// 成功返回该会话；无会话返回 nil 且 error 为空（调用方走首次加载）；
-// 上下文重上失败返回 nil 且 error 置中文原因。
-// 返回会话而非 BOOL：BOOL + NSError** 在 Swift 侧桥接成 throws + Void，
-// 调用方拿不到“无会话落首次加载”这一档（见 0.2.27 fixup 1）。
-- (nullable SBGuestSession *)resumeGuestWithBundleID:(NSString *)bundleID error:(NSError **)error;
+// 成功返回该会话；无会话返回 nil（调用方走首次加载）。
+// 上下文重上失败返回 nil，同时置 lastResumeError（调用方弹错）。
+// 不带 NSError**：带 error 的方法在 Swift 侧桥接成 throws + 非可选返回，
+// nil+无错那档会被 Swift 当成抛错，调用方拿不到“无会话落首次加载”
+//（0.2.27 fixup 4，run 44731885036 的 Swift 警告实证：
+// “comparing non-optional value of type 'SBGuestSession' to 'nil'”）。
+- (nullable SBGuestSession *)resumeGuestWithBundleID:(NSString *)bundleID;
+
+/// 最近一次恢复失败的原因（上下文重上失败时置；成功或无会话时为 nil）。
+@property (nonatomic, strong, nullable) NSError *lastResumeError;
 
 /// 当前前台客回后台：藏客窗、换出客 delegate、恢复宿主 delegate/窗口/环境；
 // 会话保留在注册表里，收据/selected 不清除。无前台客时空操作。
