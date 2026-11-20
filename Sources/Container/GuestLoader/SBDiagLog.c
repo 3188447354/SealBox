@@ -34,6 +34,7 @@ static char g_dir[PATH_MAX + 64];
 static char g_currentPath[PATH_MAX + 64];
 static char g_previousPath[PATH_MAX + 64];
 static char g_crashedPath[PATH_MAX + 64];
+static char g_dlopenMarkerPath[PATH_MAX + 64];
 
 /// 读整个文件（上限 SB_DIAG_READ_CAP），NUL 结尾；失败返回 NULL。
 static char *SBDiagReadFile(const char *path, size_t *lenOut) {
@@ -161,6 +162,11 @@ void SBDiagLogBeginRun(void) {
         pthread_mutex_unlock(&g_lock);
         return;
     }
+    rc = snprintf(g_dlopenMarkerPath, sizeof(g_dlopenMarkerPath), "%s/SBStartupLog-dlopen-marker.txt", g_dir);
+    if (rc < 0 || (size_t)rc >= sizeof(g_dlopenMarkerPath)) {
+        pthread_mutex_unlock(&g_lock);
+        return;
+    }
     // 上一级 Documents 不一定存在（如测试沙盒）：先建它再建 DiagLogs。
     // 设备上容器目录本就存在，两次 mkdir 都是空操作。
     {
@@ -186,10 +192,42 @@ void SBDiagLogBeginRun(void) {
     } else {
         free(prev);
     }
+    // 0.2.24：dlopen 标记还在 = 上次启动死在 dlopen 里（0.2.23 闪退就是
+    // 死在这里，日志断在“进程身份已改写为客应用”）。先读出客 bundle ID、
+    // 删掉标记（只报一次），再开新日志文件，行写在“进程启动”之后。
+    char staleDlopenGuest[256] = {0};
+    int hasStaleDlopenMarker = 0;
+    if (g_dlopenMarkerPath[0] != '\0') {
+        size_t markerLen = 0;
+        char *marker = SBDiagReadFile(g_dlopenMarkerPath, &markerLen);
+        if (marker && markerLen > 0) {
+            hasStaleDlopenMarker = 1;
+            size_t copyLen = markerLen < sizeof(staleDlopenGuest) - 1
+                ? markerLen : sizeof(staleDlopenGuest) - 1;
+            memcpy(staleDlopenGuest, marker, copyLen);
+            staleDlopenGuest[copyLen] = '\0';
+            // 去掉行尾换行，只留 bundle ID。
+            char *nl = strchr(staleDlopenGuest, '\n');
+            if (nl) {
+                *nl = '\0';
+            }
+        }
+        free(marker);
+        (void)unlink(g_dlopenMarkerPath);
+    }
     g_fd = open(g_currentPath, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND, 0644);
     g_bytesWritten = 0;
     pthread_mutex_unlock(&g_lock);
     SBDiagLogLine("进程启动");
+    if (hasStaleDlopenMarker) {
+        char line[512];
+        int n = snprintf(line, sizeof(line),
+                         "上次启动死在 dlopen 里（标记文件仍在，客=%s）",
+                         staleDlopenGuest[0] != '\0' ? staleDlopenGuest : "（未知）");
+        if (n > 0) {
+            SBDiagLogLine(line);
+        }
+    }
 }
 
 void SBDiagLogLine(const char *step) {
@@ -232,6 +270,47 @@ void SBDiagLogLine(const char *step) {
 
 void SBDiagLogMarkStartupComplete(void) {
     SBDiagLogLine(SB_DIAG_MARKER);
+}
+
+void SBDiagLogMarkDlopenEntry(const char *guestBundleID) {
+    pthread_mutex_lock(&g_lock);
+    if (!g_begun || g_dlopenMarkerPath[0] == '\0') {
+        pthread_mutex_unlock(&g_lock);
+        return;
+    }
+    char path[PATH_MAX + 64];
+    size_t pathLen = strlen(g_dlopenMarkerPath);
+    if (pathLen >= sizeof(path)) {
+        pthread_mutex_unlock(&g_lock);
+        return;
+    }
+    memcpy(path, g_dlopenMarkerPath, pathLen + 1);
+    pthread_mutex_unlock(&g_lock);
+    // 锁外写文件：写标记本身绝不能阻塞日志锁；内容只有客 bundle ID 一行。
+    char content[512];
+    int n = snprintf(content, sizeof(content), "%s\n",
+                     (guestBundleID && guestBundleID[0] != '\0') ? guestBundleID : "（未知）");
+    if (n <= 0) {
+        return;
+    }
+    SBDiagWriteFile(path, content, (size_t)n);
+}
+
+void SBDiagLogClearDlopenEntry(void) {
+    pthread_mutex_lock(&g_lock);
+    if (!g_begun || g_dlopenMarkerPath[0] == '\0') {
+        pthread_mutex_unlock(&g_lock);
+        return;
+    }
+    char path[PATH_MAX + 64];
+    size_t pathLen = strlen(g_dlopenMarkerPath);
+    if (pathLen >= sizeof(path)) {
+        pthread_mutex_unlock(&g_lock);
+        return;
+    }
+    memcpy(path, g_dlopenMarkerPath, pathLen + 1);
+    pthread_mutex_unlock(&g_lock);
+    (void)unlink(path);
 }
 
 char *SBDiagLogLatestText(void) {

@@ -27,6 +27,14 @@ void SBDiagLogLine(const char *step);
 /// 正常启动完成时调用：写完成标记。下次启动看到标记即认作上次正常。
 void SBDiagLogMarkStartupComplete(void);
 
+/// dlopen 前调用：在 DiagLogs 里留一个标记文件（内容为客 bundle ID），
+//  写完 fsync；dlopen 正常返回（成功或失败）后调 SBDiagLogClearDlopenEntry
+/// 清掉。若进程死在 dlopen 里（0.2.23 闪退就是死在这里），标记文件留下来，
+/// 下次启动 SBDiagLogBeginRun 会认出来并记一行，不用靠猜。
+/// 任何失败都静默丢弃，绝不成为新的崩点。
+void SBDiagLogMarkDlopenEntry(const char *guestBundleID);
+void SBDiagLogClearDlopenEntry(void);
+
 /// 最近一次启动日志全文：崩过的那份（crashed）优先，其次上次的
 /// （previous），再其次本次的（current）；都没有返回 NULL。
 /// 返回的是 malloc 出来的 UTF-8 字符串，调用方用完 free。

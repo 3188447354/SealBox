@@ -10,6 +10,9 @@ BOOL overwriteMainNSBundle(NSBundle *guestBundle, NSError **error);
 
 /// 扫描 CFBundleGetMainBundle 的实现，找到 __mainBundle 槽位并换成客 Bundle。
 /// iOS 27 上按 research 描述优先找第一个 tbz 指令所在的分支。
+/// 0.2.24：槽位里写的是客 Bundle 底下的 __CFBundle 指针（[guestBundle _cfBundle]），
+/// 不是 NSBundle 对象指针——写错指针类型会在 CFBundleGetIdentifier 里触发 PAC 陷阱；
+/// 写完活验一次 CFBundleGetIdentifier，对不上客 bundleIdentifier 就恢复并失败。
 BOOL overwriteMainCFBundle(NSBundle *guestBundle, NSError **error);
 
 /// 把槽位恢复成原来的主 Bundle（客 App 退出时调用；找不到已保存的槽位时什么都不做）。

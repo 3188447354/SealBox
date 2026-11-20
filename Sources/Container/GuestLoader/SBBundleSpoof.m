@@ -7,6 +7,23 @@
 //   两个候选都试，现值校验说了算）；iOS 27 的 CFBundleGetMainBundle 优先找
 //   第一个 tbz 指令所在的分支。
 // 安全原则：只读代码页、只写校验过的 __DATA 槽位；任何一步对不上都返回 NO 带中文原因，绝不猜着写。
+//
+// 0.2.24 PAC 教训（真机 0.2.23 闪退定性）：NSBundle 与 CFBundle 是两个指针——
+//   NSBundle 对象只是包着一个 _cfBundle ivar 的 ObjC 壳，底下另有一个
+//   __CFBundle 结构体（LC 的 FoundationPrivate.h 声明 - (id)_cfBundle，
+//   LC 的 NSBundle+FixCydiaSubstrate.m 直接读写 _cfBundle ivar；
+//   LC 的 overwriteMainCFBundle 写的是 NSBundle.mainBundle._cfBundle）。
+//   CF 的 __mainBundle 槽位里必须放 __CFBundle 指针。0.2.23 之前这里写的是
+//   NSBundle 对象指针——CFBundleGetIdentifier 拿到它当 __CFBundle 解，
+//   在 _infoDict 偏移上读到错指针，__CFCheckCFInfoPACSignature 直接
+//   EXC_BREAKPOINT（SIGTRAP，pointer authentication trap IA），死点：
+//   SBGuestHooksInit → SBUserDefaultsHookInstall → SBGuestDefaults →
+//   -[NSUserDefaults _initWithSuiteName:container:] → CFBundleGetIdentifier
+//   → CFBundleGetInfoDictionary → __CFCheckCFInfoPACSignature+44
+//   （崩溃文件 SealBox-2026-11-20-173444.ips）。
+//   所以 CF 槽位只写 [guestBundle _cfBundle]，NS 槽位才写 NSBundle 对象；
+//   写完再活验一次 CFBundleGetIdentifier（正是 trap 那一调），对不上客
+//   bundleIdentifier 就恢复槽位、干净失败，绝不在 dlopen 里崩。
 #import "SBBundleSpoof.h"
 
 #import <dlfcn.h>
@@ -14,6 +31,7 @@
 #import <objc/runtime.h>
 #import <string.h>
 
+#import "SBDiagLog.h"
 #import "SBGuestLoader.h"
 
 // 扫描上限：getter 只有几十条指令，1024 字节足够；超了就认失败，不继续往未知代码里扫。
@@ -24,6 +42,13 @@ static void *g_nsBundleSlot = NULL;
 static void *g_originalNSBundle = NULL;
 static void *g_cfBundleSlot = NULL;
 static void *g_originalCFBundle = NULL;
+
+// NSBundle 的私有取法（LC 的 FoundationPrivate.h 同款声明）：返回底下的
+// __CFBundle 结构体指针，与 NSBundle 对象指针不是同一个地址；CF 的
+// __mainBundle 槽位里必须放这个，见文件头 0.2.24 PAC 教训。
+@interface NSBundle (SBPrivateCFBundle)
+- (CFBundleRef)_cfBundle;
+@end
 
 #pragma mark - ARM64 指令解码（只读扫描）
 
@@ -308,10 +333,19 @@ BOOL overwriteMainCFBundle(NSBundle *guestBundle, NSError **error) {
         }
         return NO;
     }
+    // 0.2.24：CF 槽位里放客 Bundle 底下的 __CFBundle 指针，绝不是 NSBundle
+    // 对象指针（见文件头 PAC 教训）。_cfBundle 为空时不写、不猜，直接失败。
+    CFBundleRef guestCFBundle = [guestBundle _cfBundle];
+    if (guestCFBundle == NULL) {
+        if (error) {
+            *error = SBSpoofError(@"改写主 Bundle 失败：客 Bundle 没有底下的 CFBundle（_cfBundle 为空）");
+        }
+        return NO;
+    }
     g_cfBundleSlot = slot;
     g_originalCFBundle = expectedValue;
-    *(void **)slot = (__bridge void *)guestBundle;
-    if ((void *)CFBundleGetMainBundle() != (__bridge void *)guestBundle) {
+    *(void **)slot = (void *)guestCFBundle;
+    if ((void *)CFBundleGetMainBundle() != (void *)guestCFBundle) {
         *(void **)slot = expectedValue;
         g_cfBundleSlot = NULL;
         g_originalCFBundle = NULL;
@@ -320,6 +354,26 @@ BOOL overwriteMainCFBundle(NSBundle *guestBundle, NSError **error) {
         }
         return NO;
     }
+    // PAC 活验：这正是 0.2.23 trap 的那一调（CFBundleGetIdentifier →
+    // CFBundleGetInfoDictionary → __CFCheckCFInfoPACSignature）。先记一行
+    // 再调——万一理论错了、这里仍 trap，日志里最后一步就是这一行，定位不丢。
+    // 返回的 identifier 必须等于客 Bundle 自己的 identifier，否则恢复槽位、
+    // 干净失败，不进 dlopen。
+    NSString *expectedIdentifier = [guestBundle bundleIdentifier];
+    SBDiagLogLine("客加载：主 Bundle 伪装：正在活验 CFBundleGetIdentifier（PAC）");
+    CFStringRef liveIdentifier = CFBundleGetIdentifier(CFBundleGetMainBundle());
+    NSString *liveIdentifierString = liveIdentifier ? (__bridge NSString *)liveIdentifier : nil;
+    if (expectedIdentifier.length == 0 || liveIdentifierString.length == 0 ||
+        ![liveIdentifierString isEqualToString:expectedIdentifier]) {
+        *(void **)slot = expectedValue;
+        g_cfBundleSlot = NULL;
+        g_originalCFBundle = NULL;
+        if (error) {
+            *error = SBSpoofError([NSString stringWithFormat:@"改写主 Bundle 失败：CFBundleGetIdentifier 活验不一致（期望 %@，读回 %@）", expectedIdentifier ?: @"（空）", liveIdentifierString ?: @"（空）"]);
+        }
+        return NO;
+    }
+    SBDiagLogLine([[NSString stringWithFormat:@"客加载：主 Bundle 伪装：CFBundleGetIdentifier 活验通过（%@）", liveIdentifierString] UTF8String]);
     return YES;
 }
 

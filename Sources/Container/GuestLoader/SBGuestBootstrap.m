@@ -477,8 +477,14 @@ static void SBDiagLogGuestFail(SBGuestLoaderErrorCode code, NSString *bundleID, 
     // 上下文里装 Hook；客加载失败时 Hook 件根本不进宿主进程。
 
     // —— 7. dlopen 客可执行 ——————————————————————————————————————
+    // 0.2.24：进 dlopen 前先落一个标记文件（带客 bundle ID，写完 fsync）；
+    // dlopen 一返回立刻清掉。进程若死在 dlopen 里（0.2.23 闪退），标记留
+    // 下来，下次启动 SBDiagLogBeginRun 会认出来并记“上次启动死在 dlopen 里”。
+    SBDiagLogLine([[NSString stringWithFormat:@"客加载：进入 dlopen：%@", guestExecPath] UTF8String]);
+    SBDiagLogMarkDlopenEntry([bundleID UTF8String]);
     NSError *dlopenError = nil;
     void *guestHandle = dlopenGuest(guestExecPath, &dlopenError);
+    SBDiagLogClearDlopenEntry();
     if (!guestHandle) {
         SBDiagLogGuestFail(SBGuestLoaderErrorGuestLoadFailed, bundleID, guestExecPath,
                            [NSString stringWithFormat:@"dlopen 失败：%@", dlopenError.localizedDescription ?: @"未知错误"]);
