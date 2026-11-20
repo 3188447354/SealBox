@@ -141,7 +141,8 @@ BOOL SBSwiftUIAppMainHookInstallForGuestImage(const struct mach_header *guestHea
                                           SBAppMainSymbol,
                                           (void *)SBHookedAppMain);
     if (!ok) {
-        SBDiagLogLine([[NSString stringWithFormat:@"拦截 App.main：%@ 重绑未装上（符号不在客镜像里或指针格式不支持），走护栏",
+        // 具体原因见上文链式重绑诊断（符号不在 import 表里 / 无槽 / 改写失败）。
+        SBDiagLogLine([[NSString stringWithFormat:@"拦截 App.main：%@ 重绑未装上（见上文链式重绑诊断），走护栏",
                         context.bundleID] UTF8String]);
         return NO;
     }

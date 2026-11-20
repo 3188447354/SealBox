@@ -222,6 +222,23 @@ static void SBCallGuestHooksInstallForGuest(void) {
     }
 }
 
+/// 经 dlsym 调注入件的 SBHomeBarOverlaySetHidden（0.2.29）：restoreHostContext
+/// 里藏起回桌面浮层（各失败路径与客退出时都走它，此时无客在前台）。
+/// dlsym 软依赖——注入件未加载（dlopen 前失败）或旧版无此符号时静默跳过
+///（浮层本就没装上）；找到一次后缓存。注意不用 dispatch_once：首次调可能
+/// 在 dlopen 前（dlsym 失败），之后 dlopen 成功还得再找。
+static void SBCallHomeBarOverlaySetHidden(BOOL hidden) {
+    typedef void (*SBHomeBarOverlaySetHiddenFn)(BOOL);
+    static SBHomeBarOverlaySetHiddenFn hideFn = NULL;
+    if (!hideFn) {
+        hideFn = (SBHomeBarOverlaySetHiddenFn)dlsym(RTLD_DEFAULT, "SBHomeBarOverlaySetHidden");
+        if (!hideFn) {
+            return;
+        }
+    }
+    hideFn(hidden);
+}
+
 @implementation SBGuestBootstrap
 
 + (NSString *)documentsDirectory {
@@ -470,6 +487,12 @@ static void SBDiagLogGuestFail(SBGuestLoaderErrorCode code, NSString *bundleID, 
     restoreExecutablePath();
     SBRestoreProcessIdentity();
     SBRestoreGuestEnvironment();
+    // 0.2.29：无客激活时藏起回桌面浮层——各失败路径与客退出时都走这里；
+    // 此时无客在前台（失败=客没起来，退出=客已走），藏起安全；浮层窗口
+    // windowLevel 高，不藏会盖在宿主弹窗上吞点击（0.2.28 真机：重绑护栏
+    // 失败后浮层仍在，弹窗按钮点不了）。窗口级透传（SBHomeBarOverlay.m）
+    // 是第一道防线，这里是第二道。
+    SBCallHomeBarOverlaySetHidden(YES);
 }
 
 /// 失败 + 还原：先还原已应用的客上下文，再按 failWithError 造错返回 NO。

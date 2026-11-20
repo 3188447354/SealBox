@@ -36,6 +36,7 @@ static const CGFloat SBHomeBarLeftEdgeFastSwipeVelocity = 300.0; // 右滑快滑
 static NSString * const SBGuestReturnToHostRequestedNotification = @"SBGuestReturnToHostRequested";
 static NSString * const SBGuestDidEnterBackgroundNotification = @"SBGuestDidEnterBackground";
 static NSString * const SBGuestDidEnterForegroundNotification = @"SBGuestDidEnterForeground";
+static NSString * const SBGuestActivationFailedNotification = @"SBGuestActivationFailed";
 
 static UIWindow *g_overlayWindow = nil;
 static UILabel *g_toastLabel = nil;
@@ -69,6 +70,31 @@ static BOOL g_overlayInstalled = NO;
 @end
 
 #pragma mark - Toast
+
+/// 只在横杠条与左边缘区接手势的浮层窗口（0.2.29）。
+/// 根因（0.2.28 真机）：浮层窗口 windowLevel = StatusBar+100，盖在宿主
+/// 弹窗之上；SBHomeBarPassthroughView 的 hitTest 只拦容器一层——UIWindow
+/// 默认 hitTest 在无子视图认领触摸时返回窗口自身，于是浮层吞掉全屏一切
+/// 触摸，宿主弹窗（.alert）的按钮点不了。窗口级 hitTest 只认领横杠条/
+/// 左边缘区内的触摸，其余一律返回 nil，触摸落到下面一层的窗口
+///（宿主弹窗、客 App）。容器视图的 hitTest 保留作第二道防线。
+@interface SBHomeBarPassthroughWindow : UIWindow
+@property (nonatomic, weak, nullable) UIView *containerView;
+@end
+
+@implementation SBHomeBarPassthroughWindow
+
+- (nullable UIView *)hitTest:(CGPoint)point withEvent:(nullable UIEvent *)event {
+    UIView *hit = [super hitTest:point withEvent:event];
+    // 只有横杠条/左边缘区内的子视图能认领触摸；窗口自身与全屏容器
+    // 认领到的触摸一律放过（返回 nil），落到下一层窗口。
+    if (hit == self || hit == self.containerView) {
+        return nil;
+    }
+    return hit;
+}
+
+@end
 
 static void SBHomeBarShowToast(NSString *text) {
     if (!g_overlayWindow) {
@@ -131,6 +157,14 @@ static void SBHomeBarSetOverlayHidden(BOOL hidden) {
     if (g_overlayWindow) {
         g_overlayWindow.hidden = hidden;
     }
+}
+
+/// 供宿主经 dlsym 调：无客激活时藏起浮层（0.2.29）。
+/// restoreHostContext 里调——各失败路径与客退出时都走它；此时无客在前台，
+/// 藏起是安全的（多客：另一客在前台时 restoreHostContext 不跑）。
+__attribute__((visibility("default")))
+void SBHomeBarOverlaySetHidden(BOOL hidden) {
+    SBHomeBarSetOverlayHidden(hidden);
 }
 
 #pragma mark - 手势处理
@@ -241,7 +275,9 @@ static void SBHomeBarEnsureOverlay(void) {
         return;
     }
     UIScreen *screen = [UIScreen mainScreen];
-    UIWindow *window = [[UIWindow alloc] initWithFrame:screen.bounds];
+    // 0.2.29：透传窗口（见 SBHomeBarPassthroughWindow）——横杠/左边缘区
+    // 之外不认领触摸，宿主弹窗按钮可达。
+    SBHomeBarPassthroughWindow *window = [[SBHomeBarPassthroughWindow alloc] initWithFrame:screen.bounds];
     window.windowLevel = UIWindowLevelStatusBar + 100.0;
     window.backgroundColor = [UIColor clearColor];
     // 与客窗同 scene 才能叠在客窗上面（客窗在共享的宿主 scene 里）。
@@ -307,6 +343,7 @@ static void SBHomeBarEnsureOverlay(void) {
     container.leftEdgeZone = leftEdgeZone;
     [container addSubview:barView];
     [container addSubview:leftEdgeZone];
+    window.containerView = container;
 
     UIViewController *rootViewController = [[UIViewController alloc] init];
     rootViewController.view = container;
@@ -343,5 +380,13 @@ void SBHomeBarOverlayInstall(void) {
                                                        queue:[NSOperationQueue mainQueue]
                                                   usingBlock:^(NSNotification * _Nonnull note) {
         SBHomeBarSetOverlayHidden(NO);
+    }];
+    // 0.2.29：异步激活失败时藏起——失败后宿主弹错，浮层不得盖在弹窗上
+    //（0.2.28 真机）。同步护栏失败由宿主 restoreHostContext 藏浮层。
+    [[NSNotificationCenter defaultCenter] addObserverForName:SBGuestActivationFailedNotification
+                                                      object:nil
+                                                       queue:[NSOperationQueue mainQueue]
+                                                  usingBlock:^(NSNotification * _Nonnull note) {
+        SBHomeBarSetOverlayHidden(YES);
     }];
 }

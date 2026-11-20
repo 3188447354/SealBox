@@ -5,7 +5,16 @@
 //     （11 位，单位 8 字节）；bind 时 bits 0-15 = import 序号、bits 16-23 = addend；
 //     rebase 时 bits 0-51 = 目标偏移。
 //   import 项：DYLD_CHAINED_IMPORT 为 4 字节，ADDEND/ADDEND64 为 8 字节；
-//     byte0 = lib 序号，bytes1-2 的 u16 = 符号池内字节偏移 × 2。
+//     byte0 = lib 序号，bits 8-31（24 位）= 符号池内字节偏移 × 2。
+//     0.2.29 根因修（Husk 3.4 实测）：0.2.28 这里写的是
+//     ((v >> 8) & 0xFFFF) / 2——只取了 bits 8-23，把 24 位符号偏移的高
+//     字节截掉了。符号池字节偏移 ≥32768 的符号（Husk 的 App.main 在
+//     54364，池共 121168 字节）算出来是池内另一处碎片，名永远对不上，
+//     targetOrdinal 恒 -1，报“链式修正路未找到槽”。宿主二进制池小
+//     （App.main 偏移 <32768），掩码是空操作，原型验证才没抓到。
+//     修正后 (v >> 8) / 2：Husk 3260 个 import 全解出干净名，
+//     App.main 序号 1820，链里恰好 1 个 bind 槽（__DATA_CONST 0x64ced0）；
+//     宿主二进制 App.main 序号仍是 711，不变，无回归。
 //
 // 关键：链式修正的原始链项只在磁盘文件里——dlopen 后 dyld 已把 __got 槽
 // 写成解析后的函数地址，编码（bind/next/序号）被覆盖，内存里走不了链。
@@ -51,7 +60,7 @@ static BOOL SBIsChainedFixupsCommand(uint32_t rawCmd) {
     return (rawCmd & 0x7FFFFFFF) == (LC_DYLD_CHAINED_FIXUPS & 0x7FFFFFFF);
 }
 
-#define SB_MAX_SEGMENTS 16
+#define SB_MAX_SEGMENTS 32 // 0.2.29：16→32，超大镜像兜底（Husk 5 段，用不上；超限记日志）
 #define SB_MAX_CHAIN_STEPS 100000
 
 typedef struct {
@@ -115,6 +124,7 @@ static BOOL SBParseImageLayout(const struct mach_header *header,
         (const struct load_command *)((const uint8_t *)header + sizeof(*header64));
     uintptr_t firstSegVmaddr = 0;
     BOOL haveFirstSeg = NO;
+    BOOL segmentOverflowLogged = NO; // 0.2.29：段数超上限时记一行（静默丢段会误判）
     for (uint32_t i = 0; i < header64->ncmds; i++) {
         uint32_t baseCmd = lc->cmd & 0x7FFFFFFF; // 去 LC_REQ_DYLD 位
         if (baseCmd == LC_SEGMENT_64) {
@@ -131,6 +141,10 @@ static BOOL SBParseImageLayout(const struct mach_header *header,
                 info->vmaddr = seg->vmaddr;
                 info->fileoff = seg->fileoff;
                 info->filesize = seg->filesize;
+            } else if (!segmentOverflowLogged) {
+                segmentOverflowLogged = YES;
+                SBDiagLogLine([[NSString stringWithFormat:@"重绑：镜像段数超过上限 %u（%s 及之后段被丢弃，文件偏移换算可能不准）",
+                                SB_MAX_SEGMENTS, seg->segname] UTF8String]);
             }
             if (strncmp(seg->segname, "__LINKEDIT", 16) == 0) {
                 layout->linkeditVmaddr = seg->vmaddr;
@@ -257,16 +271,20 @@ static uint32_t SBRebindChained(SBImageLayout *layout,
                                 void *replacement) {
     FILE *file = fopen([execPath UTF8String], "rb");
     if (!file) {
+        SBDiagLogLine([[NSString stringWithFormat:@"链式重绑：打不开可执行文件 %@",
+                        execPath] UTF8String]);
         return 0;
     }
     uint64_t baseOffset = 0;
     if (!SBArm64SliceOffset(file, &baseOffset)) {
+        SBDiagLogLine(@"链式重绑：取 arm64 切片偏移失败");
         fclose(file);
         return 0;
     }
     uint32_t magic = 0;
     fseek(file, (long)baseOffset, SEEK_SET);
     if (fread(&magic, sizeof(magic), 1, file) != 1 || magic != 0xFEEDFACF) {
+        SBDiagLogLine(@"链式重绑：切片头不是 64 位 Mach-O");
         fclose(file);
         return 0;
     }
@@ -302,17 +320,20 @@ static uint32_t SBRebindChained(SBImageLayout *layout,
         cursor += cmdsize;
     }
     if (chainedDataoff == 0 || chainedDatasize < 28) {
+        SBDiagLogLine(@"链式重绑：找不到 LC_DYLD_CHAINED_FIXUPS 数据");
         fclose(file);
         return 0;
     }
     // 把整段 fixup 数据读进内存（通常 < 100KB）。
     uint8_t *fixups = (uint8_t *)malloc(chainedDatasize);
     if (!fixups) {
+        SBDiagLogLine(@"链式重绑：fixup 数据分配内存失败");
         fclose(file);
         return 0;
     }
     fseek(file, (long)(baseOffset + chainedDataoff), SEEK_SET);
     if (fread(fixups, 1, chainedDatasize, file) != chainedDatasize) {
+        SBDiagLogLine(@"链式重绑：读 fixup 数据失败");
         free(fixups);
         fclose(file);
         return 0;
@@ -325,6 +346,8 @@ static uint32_t SBRebindChained(SBImageLayout *layout,
     uint32_t importsFormat = *(const uint32_t *)(fixups + 20);
     uint32_t symbolsFormat = *(const uint32_t *)(fixups + 24);
     uint32_t rewrote = 0;
+    uint32_t examinedBindSlots = 0; // 0.2.29：诊断——走链时见到的 bind 槽总数
+    uint32_t matchedSlots = 0;      // 0.2.29：诊断——序号对上的槽数
     do {
         if (symbolsFormat != 0) {
             SBDiagLogLine(@"链式重绑：符号池是压缩格式，不支持");
@@ -342,16 +365,22 @@ static uint32_t SBRebindChained(SBImageLayout *layout,
         }
         if (importsOff + importsCount * importEntrySize > chainedDatasize ||
             symbolsOff >= chainedDatasize) {
+            SBDiagLogLine(@"链式重绑：fixup 头越界（import 表或符号池超出数据段）");
             break;
         }
         const uint8_t *imports = fixups + importsOff;
         const uint8_t *pool = fixups + symbolsOff;
         size_t poolSize = chainedDatasize - symbolsOff;
+        SBDiagLogLine([[NSString stringWithFormat:@"链式重绑：%@ imports=%u（格式 %u，符号池格式 %u，池 %zu 字节）",
+                        [NSString stringWithUTF8String:symbolName],
+                        importsCount, importsFormat, symbolsFormat, poolSize] UTF8String]);
         // 找目标符号的 import 序号（名逐字相等才认）。
         int32_t targetOrdinal = -1;
         for (uint32_t i = 0; i < importsCount; i++) {
             uint32_t v = *(const uint32_t *)(imports + i * importEntrySize);
-            uint32_t nameByteOff = ((v >> 8) & 0xFFFF) / 2;
+            // 0.2.29：符号偏移是 bits 8-31 的 24 位值（= 字节偏移 × 2），
+            // 不掩 0xFFFF——掩了会截掉高字节（Husk App.main 偏移 54364 被截成 21596）。
+            uint32_t nameByteOff = (v >> 8) / 2;
             if (nameByteOff >= poolSize) {
                 continue;
             }
@@ -366,8 +395,13 @@ static uint32_t SBRebindChained(SBImageLayout *layout,
             }
         }
         if (targetOrdinal < 0) {
+            // 情形①：符号根本不在 import 表里（入口调的是镜像内特化/别处符号）。
+            SBDiagLogLine([[NSString stringWithFormat:@"链式重绑：%@ 不在 import 表里（共 %u 个 import）",
+                            [NSString stringWithUTF8String:symbolName], importsCount] UTF8String]);
             break;
         }
+        SBDiagLogLine([[NSString stringWithFormat:@"链式重绑：%@ import 序号 %d",
+                        [NSString stringWithUTF8String:symbolName], targetOrdinal] UTF8String]);
         // 走链：dyld_chained_starts_in_image。
         if (startsOff + 4 > chainedDatasize) {
             break;
@@ -389,10 +423,16 @@ static uint32_t SBRebindChained(SBImageLayout *layout,
             uint16_t ptrFormat = *(const uint16_t *)(segStarts + 6);
             uint64_t segOff = *(const uint64_t *)(segStarts + 8);
             uint16_t pageCount = *(const uint16_t *)(segStarts + 20);
+            // 0.2.29：每段都记指针格式与页数（不论支不支持），下次真机日志能钉死
+            // 是哪一段的格式问题；段名按段序取（starts 表与加载命令同序）。
+            const char *segName = (si < layout->segmentCount)
+                ? layout->segments[si].segname : "?";
+            SBDiagLogLine([[NSString stringWithFormat:@"链式重绑：段 %u（%s）指针格式 %u，%u 页",
+                            si, segName, ptrFormat, pageCount] UTF8String]);
             // 指针格式：1/7 是 arm64e（PAC 签名指针，改写会坏）；只接受 2/6（64 位无 PAC）。
             if (ptrFormat != 2 && ptrFormat != 6) {
-                SBDiagLogLine([[NSString stringWithFormat:@"链式重绑：指针格式 %u 不支持（须 DYLD_CHAINED_PTR_64/64_OFFSET）",
-                                ptrFormat] UTF8String]);
+                SBDiagLogLine([[NSString stringWithFormat:@"链式重绑：段 %u 指针格式 %u 不支持（须 DYLD_CHAINED_PTR_64/64_OFFSET），跳过",
+                                si, ptrFormat] UTF8String]);
                 continue;
             }
             if (pageSize == 0) {
@@ -418,14 +458,27 @@ static uint32_t SBRebindChained(SBImageLayout *layout,
                     BOOL isBind = (raw >> 63) & 1;
                     uint32_t next = (uint32_t)((raw >> 52) & 0x7FF);
                     if (isBind) {
+                        examinedBindSlots++;
                         uint32_t ordinal = (uint32_t)(raw & 0xFFFF);
                         if ((int32_t)ordinal == targetOrdinal) {
+                            matchedSlots++;
                             uintptr_t slotAddr =
                                 SBFileOffsetToRuntimeAddress(layout, pos);
-                            if (slotAddr != 0 &&
-                                SBRewriteSlot(slotAddr, replacement)) {
+                            if (slotAddr == 0) {
+                                // 情形③a：槽在文件里找到了，但换算不到运行时地址
+                                //（段表对不上，如段数超上限被丢）。
+                                SBDiagLogLine([[NSString stringWithFormat:@"链式重绑：%@ 槽文件偏移 0x%llx 换算不到运行时地址",
+                                                [NSString stringWithUTF8String:symbolName],
+                                                (unsigned long long)pos] UTF8String]);
+                            } else if (SBRewriteSlot(slotAddr, replacement)) {
                                 rewrote++;
                                 SBDiagLogLine([[NSString stringWithFormat:@"链式重绑：%@ 槽已改写（文件偏移 0x%llx，运行时地址 0x%lx）",
+                                                [NSString stringWithUTF8String:symbolName],
+                                                (unsigned long long)pos,
+                                                (unsigned long)slotAddr] UTF8String]);
+                            } else {
+                                // 情形③b：槽找到了，改写失败（vm_protect/TPRO）。
+                                SBDiagLogLine([[NSString stringWithFormat:@"链式重绑：%@ 槽改写失败（文件偏移 0x%llx，运行时地址 0x%lx）",
                                                 [NSString stringWithUTF8String:symbolName],
                                                 (unsigned long long)pos,
                                                 (unsigned long)slotAddr] UTF8String]);
@@ -438,6 +491,12 @@ static uint32_t SBRebindChained(SBImageLayout *layout,
                     pos += (uint64_t)next * 8;
                 }
             }
+        }
+        if (rewrote == 0) {
+            // 情形②：序号找到了，但链里没有引用它的 bind 槽（或改写全失败）。
+            SBDiagLogLine([[NSString stringWithFormat:@"链式重绑：%@ 序号 %d，检查了 %u 个 bind 槽、%u 个匹配、改写 %u 个",
+                            [NSString stringWithUTF8String:symbolName],
+                            targetOrdinal, examinedBindSlots, matchedSlots, rewrote] UTF8String]);
         }
     } while (0);
     free(fixups);
@@ -553,7 +612,9 @@ BOOL SBRebindGuestSymbolForImage(const struct mach_header *header,
         }
         rewrote = SBRebindChained(&layout, execPath, symbolName, replacement);
         if (rewrote == 0) {
-            SBDiagLogLine([[NSString stringWithFormat:@"重绑：%@ 链式修正路未找到槽",
+            // 具体原因（符号不在 import 表里 / 无引用它的槽 / 改写失败 /
+            // 解析失败）已由 SBRebindChained 在上文逐条记下，这里只汇总。
+            SBDiagLogLine([[NSString stringWithFormat:@"重绑：%@ 链式修正路未找到槽（见上文链式重绑诊断）",
                             [NSString stringWithUTF8String:symbolName]] UTF8String]);
         }
     } else {
