@@ -21,6 +21,9 @@ NS_ASSUME_NONNULL_BEGIN
 /// 至少改写一个槽返回 YES；符号不在该镜像里、或指针格式不支持（arm64e PAC、
 // 32 位、压缩符号池）、或镜像头非法，返回 NO。
 /// 只改该镜像的槽，不动其他镜像。
+/// 0.2.31：写前校验（链式路）——槽原值须与 dlsym 解析的目标地址一致，
+/// 对不上不写、返回 NO（防 0.2.30 Husk 2.0 的写错地址：换算偏一页，钩子
+/// 永不触发）；写后回读，不一致也返回 NO。slide 取自 dyld API。
 /// execPath：链式修正路须读磁盘文件找原始链项（dlopen 后内存里的槽已被 dyld
 /// 写成解析地址，编码被覆盖，走不了链）；传统路不读文件，可传 nil。
 BOOL SBRebindGuestSymbolForImage(const struct mach_header *header,

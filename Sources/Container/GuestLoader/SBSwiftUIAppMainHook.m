@@ -59,8 +59,13 @@ static const void *SBSwiftUIMetadataFromArgs(const void *arg0,
 }
 
 void SBHookedAppMain(const void *arg0, const void *arg1) {
+    // 0.2.31：入口第一行——钩子一旦触发必有此行（0.2.30 Husk 真机日志到
+    // “跳入客 main”就断、无拦截行，无法区分“钩子没触发”与“日志丢了”。
+    // 现在文件夹＋写穿保证此行若触发必落盘；无此行即钩子没触发）。
+    SBDiagLogLine("拦截 App.main：钩子已触发");
     if (!g_swiftUIHookContext) {
         // 安装时 context 恒非空；走到这里是接线错，置错并直接返回（不跳原入口）。
+        SBDiagLogLine("拦截 App.main：钩子 context 为空（接线错），不嵌入、不跳原入口");
         g_swiftUIHookActivationError = SBGuestLoaderErrorMake(
             SBGuestLoaderErrorGuestLoadFailed, @"加载客 App",
             @"该应用是 SwiftUI 应用，暂不支持进程内启动",

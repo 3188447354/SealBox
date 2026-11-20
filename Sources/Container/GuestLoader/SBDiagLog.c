@@ -4,11 +4,24 @@
 // 从此每次启动的每一步都实时写盘刷盘，崩了最后一步还在；
 // 下次启动认得出上次崩了，把那份日志留下来，设置页能看到、能分享。
 //
+// 0.2.31（MJ 01:04 立规：诊断日志做进文件夹、不许断）：每次启动一份日志
+// 文件，放 Documents/Logs 文件夹（SBStartupLog-<启动时间>-<pid>.txt）；
+// 保留上限 20 个文件 / 总计 2MB，最旧先删、永不删当前文件；旧 DiagLogs
+// 目录的日志一次性迁移过来（无完成标记的加 -crashed）；设置页查看页改成
+// 文件列表（崩溃徽章＋大小）→ 点进看全文。
+//
+// 写穿：每行 write + fsync（SBDiagWriteAll）。write 是同步系统调用——
+// 数据进内核页缓存后进程再怎么死（abort、SIGKILL、EXC_BREAKPOINT、
+// 断言崩）都丢不掉；fsync 再把页缓存刷到闪存，连掉电都不丢。
+// 崩溃杀的是进程不是内核，所以“写完即落盘”：原型 diaglog0231-verify.c
+// 在 Linux 上实测写行后直接 abort，读回文件行数齐全（见 build log）。
+//
 // 安全：本文件所有函数永不崩、不抛错、不弹框——任何失败都静默丢弃。
 // 路径在 BeginRun 时一次算好并缓存（之后客 App 启动会改 HOME 环境变量，
 // 缓存的路径不受影响）。写操作一把互斥锁串行化，每行 write + fsync。
 #include "SBDiagLog.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -23,17 +36,21 @@
 #include <unistd.h>
 
 #define SB_DIAG_MARKER "=== STARTUP COMPLETE ==="
-#define SB_DIAG_MAX_BYTES (256 * 1024)
+#define SB_DIAG_MAX_BYTES (1024 * 1024)
 #define SB_DIAG_READ_CAP (SB_DIAG_MAX_BYTES + 1024)
+#define SB_DIAG_FILE_PREFIX "SBStartupLog"
+#define SB_DIAG_DLOPEN_MARKER_NAME "SBStartupLog-dlopen-marker.txt"
+#define SB_DIAG_MAX_FILES 20
+#define SB_DIAG_MAX_TOTAL_BYTES (2 * 1024 * 1024)
 
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_begun = 0;
 static int g_fd = -1;
 static long g_bytesWritten = 0;
+static int g_capLogged = 0;
 static char g_dir[PATH_MAX + 64];
 static char g_currentPath[PATH_MAX + 64];
-static char g_previousPath[PATH_MAX + 64];
-static char g_crashedPath[PATH_MAX + 64];
+static char g_currentName[256];
 static char g_dlopenMarkerPath[PATH_MAX + 64];
 
 /// 读整个文件（上限 SB_DIAG_READ_CAP），NUL 结尾；失败返回 NULL。
@@ -130,6 +147,281 @@ static void SBDiagWriteAll(int fd, const char *buf, size_t len) {
     (void)fsync(fd);
 }
 
+/// 文件尾部（最后 4KB，完成标记写在末尾一行）是否含完成标记。
+// 只读尾部：文件再大也不用全读，标记在末尾才有意义。
+static int SBDiagFileHasMarker(const char *path) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        return 0;
+    }
+    off_t size = lseek(fd, 0, SEEK_END);
+    if (size < 0) {
+        close(fd);
+        return 0;
+    }
+    off_t start = size > 4096 ? size - 4096 : 0;
+    if (lseek(fd, start, SEEK_SET) < 0) {
+        close(fd);
+        return 0;
+    }
+    char buf[4096 + 1];
+    size_t got = 0;
+    for (;;) {
+        ssize_t n = read(fd, buf + got, sizeof(buf) - 1 - got);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            break;
+        }
+        if (n == 0) {
+            break;
+        }
+        got += (size_t)n;
+        if (got >= sizeof(buf) - 1) {
+            break;
+        }
+    }
+    close(fd);
+    if (got == 0) {
+        return 0;
+    }
+    buf[got] = '\0';
+    return strstr(buf, SB_DIAG_MARKER) != NULL;
+}
+
+/// 是否日志文件名（SBStartupLog- 开头、.txt 结尾，dlopen 标记文件除外）。
+static int SBDiagIsLogFileName(const char *name) {
+    if (strncmp(name, SB_DIAG_FILE_PREFIX "-", 13) != 0) { // "SBStartupLog-"
+        return 0;
+    }
+    size_t len = strlen(name);
+    if (len < 5 || strcmp(name + len - 4, ".txt") != 0) {
+        return 0;
+    }
+    if (strcmp(name, SB_DIAG_DLOPEN_MARKER_NAME) == 0) {
+        return 0;
+    }
+    return 1;
+}
+
+typedef struct {
+    char name[256];
+    int crashed; // 名字含 "-crashed"
+    long bytes;
+} SBDiagFileEntry;
+
+static int SBDiagFileEntryCompare(const void *a, const void *b) {
+    return strcmp(((const SBDiagFileEntry *)a)->name,
+                  ((const SBDiagFileEntry *)b)->name);
+}
+
+/// 列出日志文件夹里全部日志文件（不含 dlopen 标记文件），按文件名升序
+/// （= 时间升序，因文件名含 YYYY-MM-DD-HHMMSS）。返回 malloc 的数组，
+/// countOut 写个数；失败返回 NULL。假定调用方已持锁。
+static SBDiagFileEntry *SBDiagListFiles(size_t *countOut) {
+    if (countOut) {
+        *countOut = 0;
+    }
+    if (g_dir[0] == '\0') {
+        return NULL;
+    }
+    DIR *dir = opendir(g_dir);
+    if (!dir) {
+        return NULL;
+    }
+    size_t cap = 16, count = 0;
+    SBDiagFileEntry *files = (SBDiagFileEntry *)malloc(cap * sizeof(*files));
+    if (!files) {
+        closedir(dir);
+        return NULL;
+    }
+    struct dirent *ent;
+    while ((ent = readdir(dir)) != NULL) {
+        const char *name = ent->d_name;
+        if (!SBDiagIsLogFileName(name)) {
+            continue;
+        }
+        char path[PATH_MAX + 64];
+        if (snprintf(path, sizeof(path), "%s/%s", g_dir, name) >= (int)sizeof(path)) {
+            continue;
+        }
+        struct stat st;
+        if (stat(path, &st) != 0) {
+            continue;
+        }
+        if (count == cap) {
+            size_t newCap = cap * 2;
+            SBDiagFileEntry *grown = (SBDiagFileEntry *)realloc(files, newCap * sizeof(*files));
+            if (!grown) {
+                break;
+            }
+            files = grown;
+            cap = newCap;
+        }
+        (void)snprintf(files[count].name, sizeof(files[count].name), "%s", name);
+        files[count].crashed = strstr(name, "-crashed") != NULL;
+        files[count].bytes = (long)st.st_size;
+        count++;
+    }
+    closedir(dir);
+    if (count > 1) {
+        qsort(files, count, sizeof(*files), SBDiagFileEntryCompare);
+    }
+    if (countOut) {
+        *countOut = count;
+    }
+    return files;
+}
+
+/// 生成本次启动的文件名：SBStartupLog-<YYYY-MM-DD-HHMMSS>-<pid>.txt。
+static void SBDiagMakeRunName(char *out, size_t outSize, time_t t, pid_t pid) {
+    struct tm tmv;
+    char datePart[24] = "0000-00-00-000000";
+    if (localtime_r(&t, &tmv) != NULL) {
+        (void)strftime(datePart, sizeof(datePart), "%Y-%m-%d-%H%M%S", &tmv);
+    }
+    (void)snprintf(out, outSize, "%s-%s-%d.txt", SB_DIAG_FILE_PREFIX, datePart, (int)pid);
+}
+
+/// 0.2.31 一次性迁移：把旧 DiagLogs 目录（0.2.4–0.2.30）的日志搬到新
+// Logs 目录。旧 current/previous/crashed 按 mtime 改名；旧 current 内容里
+// 无完成标记的加 -crashed（它就是上次崩的日志）；dlopen 标记文件原名搬过来。
+// 任何失败都静默跳过（目标已存在时不覆盖）。搬完旧目录只剩空壳时 rmdir
+// 删掉（删不掉也不管）。假定调用方已持锁。
+static void SBDiagMigrateOldLogs(const char *home) {
+    char oldDir[PATH_MAX + 64];
+    int rc = snprintf(oldDir, sizeof(oldDir), "%s/Documents/DiagLogs", home);
+    if (rc < 0 || (size_t)rc >= sizeof(oldDir)) {
+        return;
+    }
+    if (access(oldDir, F_OK) != 0) {
+        return; // 没有旧目录，无事可做
+    }
+    static const char *oldNames[3] = {
+        "SBStartupLog-current.txt",
+        "SBStartupLog-previous.txt",
+        "SBStartupLog-crashed.txt",
+    };
+    static const char *roleSuffix[3] = {
+        "-migrated", "-migrated-previous", "-migrated-crashed",
+    };
+    for (int i = 0; i < 3; i++) {
+        char oldPath[PATH_MAX + 64];
+        if (snprintf(oldPath, sizeof(oldPath), "%s/%s", oldDir, oldNames[i]) >= (int)sizeof(oldPath)) {
+            continue;
+        }
+        struct stat st;
+        if (stat(oldPath, &st) != 0) {
+            continue;
+        }
+        char datePart[24] = "0000-00-00-000000";
+        struct tm tmv;
+        if (localtime_r(&st.st_mtime, &tmv) != NULL) {
+            (void)strftime(datePart, sizeof(datePart), "%Y-%m-%d-%H%M%S", &tmv);
+        }
+        char newName[256];
+        if (i == 0 && !SBDiagFileHasMarker(oldPath)) {
+            // 旧 current 无完成标记：它就是上次崩的日志，加 -crashed。
+            if (snprintf(newName, sizeof(newName), "%s-%s-migrated-crashed.txt",
+                         SB_DIAG_FILE_PREFIX, datePart) >= (int)sizeof(newName)) {
+                continue;
+            }
+        } else {
+            if (snprintf(newName, sizeof(newName), "%s-%s%s.txt",
+                         SB_DIAG_FILE_PREFIX, datePart, roleSuffix[i]) >= (int)sizeof(newName)) {
+                continue;
+            }
+        }
+        char newPath[PATH_MAX + 64];
+        if (snprintf(newPath, sizeof(newPath), "%s/%s", g_dir, newName) >= (int)sizeof(newPath)) {
+            continue;
+        }
+        if (access(newPath, F_OK) == 0) {
+            continue; // 已搬过，不覆盖
+        }
+        (void)rename(oldPath, newPath);
+    }
+    // dlopen 标记文件原名搬过来（下次启动仍能认出上次死在 dlopen 里）。
+    {
+        char oldMarker[PATH_MAX + 64], newMarker[PATH_MAX + 64];
+        if (snprintf(oldMarker, sizeof(oldMarker), "%s/%s", oldDir, SB_DIAG_DLOPEN_MARKER_NAME) < (int)sizeof(oldMarker) &&
+            snprintf(newMarker, sizeof(newMarker), "%s/%s", g_dir, SB_DIAG_DLOPEN_MARKER_NAME) < (int)sizeof(newMarker) &&
+            access(newMarker, F_OK) != 0) {
+            (void)rename(oldMarker, newMarker);
+        }
+    }
+    (void)rmdir(oldDir);
+}
+
+/// 最新一份日志若无完成标记，改名加 -crashed（上次启动中途崩了）。
+// 假定调用方已持锁。
+static void SBDiagRenameLatestIfCrashed(void) {
+    size_t count = 0;
+    SBDiagFileEntry *files = SBDiagListFiles(&count);
+    if (!files || count == 0) {
+        free(files);
+        return;
+    }
+    SBDiagFileEntry latest = files[count - 1]; // 按名升序，最后一个即最新
+    if (latest.crashed) {
+        free(files);
+        return;
+    }
+    char path[PATH_MAX + 64];
+    if (snprintf(path, sizeof(path), "%s/%s", g_dir, latest.name) >= (int)sizeof(path)) {
+        free(files);
+        return;
+    }
+    if (SBDiagFileHasMarker(path)) {
+        free(files);
+        return;
+    }
+    size_t nameLen = strlen(latest.name);
+    if (nameLen < 5 || strcmp(latest.name + nameLen - 4, ".txt") != 0) {
+        free(files);
+        return;
+    }
+    char newName[256];
+    if (snprintf(newName, sizeof(newName), "%.*s-crashed.txt", (int)(nameLen - 4), latest.name) >= (int)sizeof(newName)) {
+        free(files);
+        return;
+    }
+    char newPath[PATH_MAX + 64];
+    if (snprintf(newPath, sizeof(newPath), "%s/%s", g_dir, newName) < (int)sizeof(newPath)) {
+        (void)rename(path, newPath);
+    }
+    free(files);
+}
+
+/// 保留上限：最多 20 个文件、总计 2MB；最旧先删，永不删当前文件。
+// 假定调用方已持锁。
+static void SBDiagPrune(void) {
+    size_t count = 0;
+    SBDiagFileEntry *files = SBDiagListFiles(&count);
+    if (!files) {
+        return;
+    }
+    long total = 0;
+    for (size_t i = 0; i < count; i++) {
+        total += files[i].bytes;
+    }
+    for (size_t i = 0; i < count && (count > SB_DIAG_MAX_FILES || total > SB_DIAG_MAX_TOTAL_BYTES); i++) {
+        if (g_currentName[0] != '\0' && strcmp(files[i].name, g_currentName) == 0) {
+            continue; // 永不删当前文件
+        }
+        char path[PATH_MAX + 64];
+        if (snprintf(path, sizeof(path), "%s/%s", g_dir, files[i].name) >= (int)sizeof(path)) {
+            continue;
+        }
+        if (unlink(path) == 0) {
+            total -= files[i].bytes;
+            count--;
+        }
+    }
+    free(files);
+}
+
 void SBDiagLogBeginRun(void) {
     pthread_mutex_lock(&g_lock);
     if (g_begun) {
@@ -142,32 +434,17 @@ void SBDiagLogBeginRun(void) {
         pthread_mutex_unlock(&g_lock);
         return;
     }
-    int rc = snprintf(g_dir, sizeof(g_dir), "%s/Documents/DiagLogs", home);
+    int rc = snprintf(g_dir, sizeof(g_dir), "%s/Documents/Logs", home);
     if (rc < 0 || (size_t)rc >= sizeof(g_dir)) {
         pthread_mutex_unlock(&g_lock);
         return;
     }
-    rc = snprintf(g_currentPath, sizeof(g_currentPath), "%s/SBStartupLog-current.txt", g_dir);
-    if (rc < 0 || (size_t)rc >= sizeof(g_currentPath)) {
-        pthread_mutex_unlock(&g_lock);
-        return;
-    }
-    rc = snprintf(g_previousPath, sizeof(g_previousPath), "%s/SBStartupLog-previous.txt", g_dir);
-    if (rc < 0 || (size_t)rc >= sizeof(g_previousPath)) {
-        pthread_mutex_unlock(&g_lock);
-        return;
-    }
-    rc = snprintf(g_crashedPath, sizeof(g_crashedPath), "%s/SBStartupLog-crashed.txt", g_dir);
-    if (rc < 0 || (size_t)rc >= sizeof(g_crashedPath)) {
-        pthread_mutex_unlock(&g_lock);
-        return;
-    }
-    rc = snprintf(g_dlopenMarkerPath, sizeof(g_dlopenMarkerPath), "%s/SBStartupLog-dlopen-marker.txt", g_dir);
+    rc = snprintf(g_dlopenMarkerPath, sizeof(g_dlopenMarkerPath), "%s/%s", g_dir, SB_DIAG_DLOPEN_MARKER_NAME);
     if (rc < 0 || (size_t)rc >= sizeof(g_dlopenMarkerPath)) {
         pthread_mutex_unlock(&g_lock);
         return;
     }
-    // 上一级 Documents 不一定存在（如测试沙盒）：先建它再建 DiagLogs。
+    // 上一级 Documents 不一定存在（如测试沙盒）：先建它再建 Logs。
     // 设备上容器目录本就存在，两次 mkdir 都是空操作。
     {
         char docsDir[PATH_MAX + 64];
@@ -177,21 +454,26 @@ void SBDiagLogBeginRun(void) {
             (void)mkdir(g_dir, 0755);
         }
     }
-    size_t prevLen = 0;
-    char *prev = SBDiagReadFile(g_currentPath, &prevLen);
-    if (prev && prevLen > 0) {
-        if (strstr(prev, SB_DIAG_MARKER) == NULL) {
-            // 上次没写完成标记：启动中途崩了，留档。
-            SBDiagWriteFile(g_crashedPath, prev, prevLen);
-        } else {
-            // 上次正常完成：旧的崩溃记录已过时，清掉。
-            (void)unlink(g_crashedPath);
-        }
-        SBDiagWriteFile(g_previousPath, prev, prevLen);
-        free(prev);
-    } else {
-        free(prev);
+    // 0.2.31：旧 DiagLogs 目录一次性迁移到 Logs；上次最新一份若无完成标记
+    // 改名加 -crashed；再开本次启动的新文件。
+    SBDiagMigrateOldLogs(home);
+    SBDiagRenameLatestIfCrashed();
+    struct timeval nowTv;
+    time_t now = time(NULL);
+    if (gettimeofday(&nowTv, NULL) == 0) {
+        now = nowTv.tv_sec;
     }
+    SBDiagMakeRunName(g_currentName, sizeof(g_currentName), now, getpid());
+    rc = snprintf(g_currentPath, sizeof(g_currentPath), "%s/%s", g_dir, g_currentName);
+    if (rc < 0 || (size_t)rc >= sizeof(g_currentPath)) {
+        pthread_mutex_unlock(&g_lock);
+        return;
+    }
+    g_fd = open(g_currentPath, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND, 0644);
+    g_bytesWritten = 0;
+    g_capLogged = 0;
+    // 保留上限（20 个文件 / 总计 2MB），最旧先删，永不删当前文件。
+    SBDiagPrune();
     // 0.2.24：dlopen 标记还在 = 上次启动死在 dlopen 里（0.2.23 闪退就是
     // 死在这里，日志断在“进程身份已改写为客应用”）。先读出客 bundle ID、
     // 删掉标记（只报一次），再开新日志文件，行写在“进程启动”之后。
@@ -215,10 +497,16 @@ void SBDiagLogBeginRun(void) {
         free(marker);
         (void)unlink(g_dlopenMarkerPath);
     }
-    g_fd = open(g_currentPath, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND, 0644);
-    g_bytesWritten = 0;
     pthread_mutex_unlock(&g_lock);
     SBDiagLogLine("进程启动");
+    {
+        // 第 2 行记当前文件名：贴出来的日志能对上文件夹里的哪一份。
+        char fileLine[512];
+        int n = snprintf(fileLine, sizeof(fileLine), "日志文件：%s", g_currentName);
+        if (n > 0) {
+            SBDiagLogLine(fileLine);
+        }
+    }
     if (hasStaleDlopenMarker) {
         char line[512];
         int n = snprintf(line, sizeof(line),
@@ -259,7 +547,22 @@ void SBDiagLogLine(const char *step) {
         line[len] = '\0';
     }
     pthread_mutex_lock(&g_lock);
-    if (!g_begun || g_fd < 0 || g_bytesWritten >= SB_DIAG_MAX_BYTES) {
+    if (!g_begun || g_fd < 0) {
+        pthread_mutex_unlock(&g_lock);
+        return;
+    }
+    if (g_bytesWritten >= SB_DIAG_MAX_BYTES) {
+        // 单文件到上限：只写一次标记行，之后静默丢行（只丢日志，不拦启动）。
+        if (!g_capLogged) {
+            g_capLogged = 1;
+            char capLine[128];
+            int cn = snprintf(capLine, sizeof(capLine),
+                              "[%s] 日志已达上限（1MB），后续日志不再记录\n", ts);
+            if (cn > 0) {
+                SBDiagWriteAll(g_fd, capLine, (size_t)cn);
+                g_bytesWritten += (long)cn;
+            }
+        }
         pthread_mutex_unlock(&g_lock);
         return;
     }
@@ -316,14 +619,27 @@ void SBDiagLogClearDlopenEntry(void) {
 char *SBDiagLogLatestText(void) {
     pthread_mutex_lock(&g_lock);
     char *text = NULL;
-    if (g_crashedPath[0] != '\0') {
-        text = SBDiagReadFile(g_crashedPath, NULL);
-    }
-    if (!text && g_previousPath[0] != '\0') {
-        text = SBDiagReadFile(g_previousPath, NULL);
-    }
-    if (!text && g_currentPath[0] != '\0') {
-        text = SBDiagReadFile(g_currentPath, NULL);
+    if (g_dir[0] != '\0') {
+        size_t count = 0;
+        SBDiagFileEntry *files = SBDiagListFiles(&count);
+        if (files && count > 0) {
+            // 最新崩溃的那份优先，其次最新一份。
+            const char *pick = NULL;
+            for (size_t i = count; i-- > 0;) {
+                if (files[i].crashed) {
+                    pick = files[i].name;
+                    break;
+                }
+            }
+            if (!pick) {
+                pick = files[count - 1].name;
+            }
+            char path[PATH_MAX + 64];
+            if (snprintf(path, sizeof(path), "%s/%s", g_dir, pick) < (int)sizeof(path)) {
+                text = SBDiagReadFile(path, NULL);
+            }
+        }
+        free(files);
     }
     pthread_mutex_unlock(&g_lock);
     return text;
@@ -331,7 +647,95 @@ char *SBDiagLogLatestText(void) {
 
 int SBDiagLogHasCrashedLog(void) {
     pthread_mutex_lock(&g_lock);
-    int has = (g_crashedPath[0] != '\0') && (access(g_crashedPath, F_OK) == 0);
+    int has = 0;
+    if (g_dir[0] != '\0') {
+        size_t count = 0;
+        SBDiagFileEntry *files = SBDiagListFiles(&count);
+        if (files) {
+            for (size_t i = 0; i < count; i++) {
+                if (files[i].crashed) {
+                    has = 1;
+                    break;
+                }
+            }
+            free(files);
+        }
+    }
     pthread_mutex_unlock(&g_lock);
     return has;
+}
+
+char *SBDiagLogFileList(void) {
+    pthread_mutex_lock(&g_lock);
+    char *out = NULL;
+    if (g_dir[0] != '\0') {
+        size_t count = 0;
+        SBDiagFileEntry *files = SBDiagListFiles(&count);
+        if (files) {
+            size_t cap = 1024, len = 0;
+            out = (char *)malloc(cap + 1);
+            if (out) {
+                out[0] = '\0';
+                for (size_t i = count; i-- > 0;) { // 最新在前
+                    char line[512];
+                    int n = snprintf(line, sizeof(line), "%s\t%d\t%ld\n",
+                                     files[i].name, files[i].crashed, files[i].bytes);
+                    if (n <= 0) {
+                        continue;
+                    }
+                    if (len + (size_t)n > cap) {
+                        size_t newCap = cap * 2;
+                        while (newCap < len + (size_t)n) {
+                            newCap *= 2;
+                        }
+                        char *grown = (char *)realloc(out, newCap + 1);
+                        if (!grown) {
+                            break;
+                        }
+                        out = grown;
+                        cap = newCap;
+                    }
+                    memcpy(out + len, line, (size_t)n);
+                    len += (size_t)n;
+                    out[len] = '\0';
+                }
+            }
+            free(files);
+        }
+    }
+    pthread_mutex_unlock(&g_lock);
+    return out;
+}
+
+char *SBDiagLogReadNamedFile(const char *name) {
+    if (!name || name[0] == '\0') {
+        return NULL;
+    }
+    // 只认日志文件夹里的日志文件：拒绝路径穿越（"/"、"\\"、"."、".."），
+    // 且必须以 SBStartupLog- 开头、以 .txt 结尾。
+    if (strchr(name, '/') || strchr(name, '\\') ||
+        strcmp(name, ".") == 0 || strcmp(name, "..") == 0 ||
+        !SBDiagIsLogFileName(name)) {
+        return NULL;
+    }
+    pthread_mutex_lock(&g_lock);
+    char *text = NULL;
+    if (g_dir[0] != '\0') {
+        char path[PATH_MAX + 64];
+        if (snprintf(path, sizeof(path), "%s/%s", g_dir, name) < (int)sizeof(path)) {
+            text = SBDiagReadFile(path, NULL);
+        }
+    }
+    pthread_mutex_unlock(&g_lock);
+    return text;
+}
+
+char *SBDiagLogCurrentFileName(void) {
+    pthread_mutex_lock(&g_lock);
+    char *name = NULL;
+    if (g_currentName[0] != '\0') {
+        name = strdup(g_currentName);
+    }
+    pthread_mutex_unlock(&g_lock);
+    return name;
 }

@@ -16,6 +16,23 @@
 //     App.main 序号 1820，链里恰好 1 个 bind 槽（__DATA_CONST 0x64ced0）；
 //     宿主二进制 App.main 序号仍是 711，不变，无回归。
 //
+// 0.2.31 根因修（Husk 2.0 真机，SealBox-2026-11-21-010321.ips）：
+//   0.2.30 日志说槽已改写（import 序号 1972、文件偏移 0x4fe260），但钩子
+//   根本没触发，客 App.main 照跑、第二遍 runApp 断言崩。离线核实（Husk 2.0
+//   官方 IPA，指纹与已装一致：imports 2911、池 104216、入口 0x18519c）：
+//   入口调 stub 0x3a4c1c，stub 读 __got 槽 vmaddr 0x1004fe260（= 文件偏移
+//   0x4fe260），正是重绑找到的那个槽——槽没找错，错的是换算：
+//   文件偏移→运行时地址算出来 0x125cba260（设备日志），比 stub 真正读的
+//   0x125cb6260 高一页（0x4000），写到了别的槽里。错在手算 slide（header -
+//   首段 vmaddr）：首段是 __PAGEZERO（vmaddr 0）时算出来的是 header 本身
+//   （镜像基址），根本不是 slide——按文件段表忠实模拟，旧换算会得到
+//   0x225CB6260（高 0x100000000），与设备日志的 0x125CBA260 仍对不上，
+//   说明内存里首段记录与文件并不一致、具体哪一项差了一页在本机上看不到。
+//   结论：手算 slide 不可信。修法：slide 改用 dyld API _dyld_get_image_vmaddr_slide（客入口 runtimeAddressForImageAtPath
+//   同款用法，早就是对的）；写前用 dlsym 取期望地址比对槽原值，对不上
+//   不写、走护栏；写后回读，不一致即失败；同一符号的全部 import 序号
+//   都收，不只第一个。任何一步失败都干净失败、不跳 main。
+//
 // 关键：链式修正的原始链项只在磁盘文件里——dlopen 后 dyld 已把 __got 槽
 // 写成解析后的函数地址，编码（bind/next/序号）被覆盖，内存里走不了链。
 // 所以链式路读磁盘文件找槽的文件偏移，再按段 vmaddr+slide 换算成运行时地址
@@ -24,6 +41,7 @@
 // 时找不到槽，返回 NO 走护栏，不会误改别的槽。
 #import "SBChainedFixupRebind.h"
 
+#import <dlfcn.h>
 #import <mach/mach.h>
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
@@ -111,6 +129,42 @@ static const uint8_t *SBLinkeditPointer(SBImageLayout *layout,
     return (const uint8_t *)addr;
 }
 
+/// 取镜像的 vmaddr slide：优先用 dyld API（_dyld_get_image_vmaddr_slide）。
+// 0.2.31 根因：手算 header - firstSegVmaddr 是错的——首段是 __PAGEZERO
+//（vmaddr 0）时算出来的是 header 本身（镜像基址），根本不是 slide；按文件
+// 段表忠实模拟，旧换算会得到 0x225CB6260（比真槽高 0x100000000），与设备
+// 日志的 0x125CBA260（比真槽高一页）仍对不上，说明内存里首段记录与文件
+// 并不一致、具体哪一项差了一页在本机上看不到。结论：手算 slide 不可信。
+// 客入口 runtimeAddressForImageAtPath 早就用 dyld API（正确），重绑路
+// 现在跟它一致。找不到镜像序号时回退到 header - __TEXT 段 vmaddr
+//（fileoff==0 的段即镜像基址段），并记日志。
+static uintptr_t SBSlideForHeader(const struct mach_header *header,
+                                  SBImageLayout *layout) {
+    uint32_t count = _dyld_image_count();
+    for (uint32_t i = 0; i < count; i++) {
+        if (_dyld_get_image_header(i) == header) {
+            intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+            SBDiagLogLine([[NSString stringWithFormat:@"重绑：slide 取自 dyld API（镜像序号 %u）= 0x%lx",
+                            i, (unsigned long)slide] UTF8String]);
+            return (uintptr_t)slide;
+        }
+    }
+    for (uint32_t i = 0; i < layout->segmentCount; i++) {
+        if (layout->segments[i].fileoff == 0 && layout->segments[i].filesize > 0) {
+            uintptr_t slide = (uintptr_t)header - (uintptr_t)layout->segments[i].vmaddr;
+            SBDiagLogLine([[NSString stringWithFormat:@"重绑：dyld 里找不到镜像头，slide 回退到 header-%@ = 0x%lx",
+                            [NSString stringWithUTF8String:layout->segments[i].segname],
+                            (unsigned long)slide] UTF8String]);
+            return slide;
+        }
+    }
+    // 兜底：首段 vmaddr（段表非空时才走到这里，SBParseImageLayout 已保证）。
+    uintptr_t slide = (uintptr_t)header - (uintptr_t)layout->segments[0].vmaddr;
+    SBDiagLogLine([[NSString stringWithFormat:@"重绑：dyld 里找不到镜像头且无 fileoff==0 的段，slide 回退到 header-首段 = 0x%lx",
+                    (unsigned long)slide] UTF8String]);
+    return slide;
+}
+
 /// 读镜像头里的加载命令，填布局。只认 64 位 Mach-O；非法返回 NO。
 static BOOL SBParseImageLayout(const struct mach_header *header,
                                SBImageLayout *layout) {
@@ -122,7 +176,6 @@ static BOOL SBParseImageLayout(const struct mach_header *header,
     layout->header = header64;
     const struct load_command *lc =
         (const struct load_command *)((const uint8_t *)header + sizeof(*header64));
-    uintptr_t firstSegVmaddr = 0;
     BOOL haveFirstSeg = NO;
     BOOL segmentOverflowLogged = NO; // 0.2.29：段数超上限时记一行（静默丢段会误判）
     for (uint32_t i = 0; i < header64->ncmds; i++) {
@@ -131,7 +184,6 @@ static BOOL SBParseImageLayout(const struct mach_header *header,
             const struct segment_command_64 *seg =
                 (const struct segment_command_64 *)lc;
             if (!haveFirstSeg) {
-                firstSegVmaddr = (uintptr_t)seg->vmaddr;
                 haveFirstSeg = YES;
             }
             if (layout->segmentCount < SB_MAX_SEGMENTS) {
@@ -173,7 +225,8 @@ static BOOL SBParseImageLayout(const struct mach_header *header,
     if (!haveFirstSeg) {
         return NO;
     }
-    layout->slide = (uintptr_t)header - firstSegVmaddr;
+    // 0.2.31：slide 不再手算（header - 首段 vmaddr 偏一页，见 SBSlideForHeader）。
+    layout->slide = SBSlideForHeader(header, layout);
     return YES;
 }
 
@@ -205,12 +258,65 @@ static BOOL SBRewriteSlot(uintptr_t slotAddress, void *replacement) {
         return NO;
     }
     *(void **)slotAddress = replacement;
+    // 0.2.31：写后回读——写保护/TPRO 没生效时写指令可能静默丢掉，
+    // 回读对不上即失败（调用方走护栏，不跳 main）。
+    if (*(void **)slotAddress != replacement) {
+#if __arm64__
+        if (needsTPRORevert) {
+            os_thread_self_restrict_tpro_to_ro();
+        }
+#endif
+        return NO;
+    }
 #if __arm64__
     if (needsTPRORevert) {
         os_thread_self_restrict_tpro_to_ro();
     }
 #endif
     return YES;
+}
+
+/// 写槽前校验（只用于链式修正路）：槽里当前值应是目标符号的解析地址
+//（dyld 在 dlopen 时已把 __got 槽绑好）。用 dlsym 取期望地址比对；
+//对不上说明地址算错、或槽根本不是目标符号——不写，调用方走护栏。
+//dlsym 解析不到时跳过校验（只记一行，不拦重绑）。
+//注意：传统懒绑定路不用它——懒槽未绑定时原值还是 dyld stub 地址，
+//预校验会误判（见 SBRebindClassic）。
+//symbolName 带前导 '_'（符号表形态），dlsym 要去 '_' 后的名字。
+//返回：1=一致可写，0=不一致不可写，-1=无法校验（跳过）。
+static int SBSlotPrecheck(uintptr_t slotAddress, const char *symbolName) {
+    if (slotAddress == 0 || !symbolName || symbolName[0] == '\0') {
+        return 0;
+    }
+    const char *lookup = (symbolName[0] == '_') ? symbolName + 1 : symbolName;
+    void *expected = dlsym(RTLD_DEFAULT, lookup);
+    if (!expected) {
+        SBDiagLogLine([[NSString stringWithFormat:@"重绑预校验：dlsym 解析不到 %@，跳过预校验",
+                        [NSString stringWithUTF8String:symbolName]] UTF8String]);
+        return -1;
+    }
+    void *current = *(void **)slotAddress;
+    if (current == expected) {
+        SBDiagLogLine([[NSString stringWithFormat:@"重绑预校验：槽 0x%lx 原值 0x%lx 与期望一致",
+                        (unsigned long)slotAddress, (unsigned long)current] UTF8String]);
+        return 1;
+    }
+    SBDiagLogLine([[NSString stringWithFormat:@"重绑预校验失败：槽 0x%lx 原值 0x%lx ≠ 期望 0x%lx（地址算错或槽不是目标符号），不写",
+                    (unsigned long)slotAddress, (unsigned long)current,
+                    (unsigned long)expected] UTF8String]);
+    return 0;
+}
+
+/// 按文件偏移找所在段名（日志用；找不到返回 "?"）。
+static const char *SBSegmentNameForFileOffset(SBImageLayout *layout,
+                                              uint64_t fileoff) {
+    for (uint32_t i = 0; i < layout->segmentCount; i++) {
+        SBSegmentInfo *seg = &layout->segments[i];
+        if (fileoff >= seg->fileoff && fileoff < seg->fileoff + seg->filesize) {
+            return seg->segname;
+        }
+    }
+    return "?";
 }
 
 #pragma mark - 链式修正路（读磁盘文件）
@@ -374,8 +480,11 @@ static uint32_t SBRebindChained(SBImageLayout *layout,
         SBDiagLogLine([[NSString stringWithFormat:@"链式重绑：%@ imports=%u（格式 %u，符号池格式 %u，池 %zu 字节）",
                         [NSString stringWithUTF8String:symbolName],
                         importsCount, importsFormat, symbolsFormat, poolSize] UTF8String]);
-        // 找目标符号的 import 序号（名逐字相等才认）。
-        int32_t targetOrdinal = -1;
+        // 找目标符号的全部 import 序号（名逐字相等才认；同一符号在表里
+        // 出现多次时只取第一个会漏槽——0.2.31 起全收，最多 16 个）。
+        int32_t targetOrdinals[16];
+        uint32_t targetOrdinalCount = 0;
+        BOOL ordinalOverflow = NO;
         for (uint32_t i = 0; i < importsCount; i++) {
             uint32_t v = *(const uint32_t *)(imports + i * importEntrySize);
             // 0.2.29：符号偏移是 bits 8-31 的 24 位值（= 字节偏移 × 2），
@@ -390,18 +499,26 @@ static uint32_t SBRebindChained(SBImageLayout *layout,
                 continue;
             }
             if (strcmp(name, symbolName) == 0) {
-                targetOrdinal = (int32_t)i;
-                break;
+                if (targetOrdinalCount < 16) {
+                    targetOrdinals[targetOrdinalCount++] = (int32_t)i;
+                } else {
+                    ordinalOverflow = YES;
+                }
             }
         }
-        if (targetOrdinal < 0) {
+        if (targetOrdinalCount == 0) {
             // 情形①：符号根本不在 import 表里（入口调的是镜像内特化/别处符号）。
             SBDiagLogLine([[NSString stringWithFormat:@"链式重绑：%@ 不在 import 表里（共 %u 个 import）",
                             [NSString stringWithUTF8String:symbolName], importsCount] UTF8String]);
             break;
         }
-        SBDiagLogLine([[NSString stringWithFormat:@"链式重绑：%@ import 序号 %d",
-                        [NSString stringWithUTF8String:symbolName], targetOrdinal] UTF8String]);
+        if (ordinalOverflow) {
+            SBDiagLogLine([[NSString stringWithFormat:@"链式重绑：%@ import 序号超过 16 个，只收前 16 个",
+                            [NSString stringWithUTF8String:symbolName]] UTF8String]);
+        }
+        SBDiagLogLine([[NSString stringWithFormat:@"链式重绑：%@ import 序号 %d（共 %u 个）",
+                        [NSString stringWithUTF8String:symbolName],
+                        targetOrdinals[0], targetOrdinalCount] UTF8String]);
         // 走链：dyld_chained_starts_in_image。
         if (startsOff + 4 > chainedDatasize) {
             break;
@@ -460,7 +577,14 @@ static uint32_t SBRebindChained(SBImageLayout *layout,
                     if (isBind) {
                         examinedBindSlots++;
                         uint32_t ordinal = (uint32_t)(raw & 0xFFFF);
-                        if ((int32_t)ordinal == targetOrdinal) {
+                        BOOL ordinalMatches = NO;
+                        for (uint32_t oi = 0; oi < targetOrdinalCount; oi++) {
+                            if ((int32_t)ordinal == targetOrdinals[oi]) {
+                                ordinalMatches = YES;
+                                break;
+                            }
+                        }
+                        if (ordinalMatches) {
                             matchedSlots++;
                             uintptr_t slotAddr =
                                 SBFileOffsetToRuntimeAddress(layout, pos);
@@ -470,12 +594,22 @@ static uint32_t SBRebindChained(SBImageLayout *layout,
                                 SBDiagLogLine([[NSString stringWithFormat:@"链式重绑：%@ 槽文件偏移 0x%llx 换算不到运行时地址",
                                                 [NSString stringWithUTF8String:symbolName],
                                                 (unsigned long long)pos] UTF8String]);
-                            } else if (SBRewriteSlot(slotAddr, replacement)) {
-                                rewrote++;
-                                SBDiagLogLine([[NSString stringWithFormat:@"链式重绑：%@ 槽已改写（文件偏移 0x%llx，运行时地址 0x%lx）",
+                            } else if (SBSlotPrecheck(slotAddr, symbolName) == 0) {
+                                // 情形③c：槽原值与期望（dlsym 解析值）对不上——
+                                // 地址算错或槽不是目标符号，不写（0.2.30 的教训：
+                                // 写到错地址上钩子永不触发）。记为失败，走护栏。
+                                SBDiagLogLine([[NSString stringWithFormat:@"链式重绑：%@ 槽预校验失败，不改写（文件偏移 0x%llx，运行时地址 0x%lx）",
                                                 [NSString stringWithUTF8String:symbolName],
                                                 (unsigned long long)pos,
                                                 (unsigned long)slotAddr] UTF8String]);
+                            } else if (SBRewriteSlot(slotAddr, replacement)) {
+                                rewrote++;
+                                SBDiagLogLine([[NSString stringWithFormat:@"链式重绑：%@ 槽已改写（文件偏移 0x%llx，运行时地址 0x%lx，段 %s，slide=0x%lx，回读一致）",
+                                                [NSString stringWithUTF8String:symbolName],
+                                                (unsigned long long)pos,
+                                                (unsigned long)slotAddr,
+                                                SBSegmentNameForFileOffset(layout, pos),
+                                                (unsigned long)layout->slide] UTF8String]);
                             } else {
                                 // 情形③b：槽找到了，改写失败（vm_protect/TPRO）。
                                 SBDiagLogLine([[NSString stringWithFormat:@"链式重绑：%@ 槽改写失败（文件偏移 0x%llx，运行时地址 0x%lx）",
@@ -493,10 +627,12 @@ static uint32_t SBRebindChained(SBImageLayout *layout,
             }
         }
         if (rewrote == 0) {
-            // 情形②：序号找到了，但链里没有引用它的 bind 槽（或改写全失败）。
-            SBDiagLogLine([[NSString stringWithFormat:@"链式重绑：%@ 序号 %d，检查了 %u 个 bind 槽、%u 个匹配、改写 %u 个",
+            // 情形②：序号找到了，但链里没有引用它的 bind 槽（或改写全失败，
+            // 含预校验失败——见上文）。
+            SBDiagLogLine([[NSString stringWithFormat:@"链式重绑：%@ 序号 %d（共 %u 个），检查了 %u 个 bind 槽、%u 个匹配、改写 %u 个",
                             [NSString stringWithUTF8String:symbolName],
-                            targetOrdinal, examinedBindSlots, matchedSlots, rewrote] UTF8String]);
+                            targetOrdinals[0], targetOrdinalCount,
+                            examinedBindSlots, matchedSlots, rewrote] UTF8String]);
         }
     } while (0);
     free(fixups);
@@ -572,9 +708,13 @@ static uint32_t SBRebindClassic(SBImageLayout *layout,
                     }
                     uintptr_t slotAddr = (uintptr_t)(sections[j].addr +
                                                      layout->slide + k * sizeof(void *));
+                    // 0.2.31：这里不用 SBSlotPrecheck——传统路的懒槽在未绑定时
+                    // 原值还是 dyld stub 地址，不是目标函数地址，预校验会误判；
+                    // 链式路的槽在 dlopen 时已由 dyld 绑好，预校验只在那里做。
+                    // 写后回读在 SBRewriteSlot 里已做。
                     if (SBRewriteSlot(slotAddr, replacement)) {
                         rewrote++;
-                        SBDiagLogLine([[NSString stringWithFormat:@"传统重绑：%@ 槽已改写（%s+%u，运行时地址 0x%lx）",
+                        SBDiagLogLine([[NSString stringWithFormat:@"传统重绑：%@ 槽已改写（%s+%u，运行时地址 0x%lx，回读一致）",
                                         [NSString stringWithUTF8String:symbolName],
                                         sections[j].sectname, k,
                                         (unsigned long)slotAddr] UTF8String]);
