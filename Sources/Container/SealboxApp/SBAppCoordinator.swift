@@ -247,7 +247,10 @@ final class SBAppCoordinator: ObservableObject {
 
     init() {
         activationFailedObserver = NotificationCenter.default.addObserver(
-            forName: SBGuestActivationFailedNotification,
+            // 0.2.27 fixup 2：ObjC `NSString * const ...Notification` 常量在
+            // Swift 侧导入成 NSNotification.Name 的静态成员（原全局名被改名，
+            // 直接写 SBGuestActivationFailedNotification 编译报 renamed）。
+            forName: NSNotification.Name.SBGuestActivationFailed,
             object: nil, queue: .main
         ) { [weak self] note in
             guard let self else { return }
