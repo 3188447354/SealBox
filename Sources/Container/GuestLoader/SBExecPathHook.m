@@ -62,6 +62,10 @@
 //   ⑤ LC 原文的已知写法一并保留：hook 里 builtin_vm_protect 传
 //     sizeof(dyldConfig)——dyldConfig 是指针，实为 8 字节；vm_protect 按页
 //     生效，8 与 0x30 等价，不改。
+//   ⑥ tpro 声明：LC 靠 @import Darwin 间接拿到 os/tpro.h 的声明；iOS 26.2
+//     SDK 里没有 <os/tpro.h>（0.2.22 第一轮 CI run 44675099958 在此报
+//     'os/tpro.h' file not found），故三个 tpro 函数在此以 extern 本地
+//     声明（与 _CFGetProcessPath 同款做法），调用点与 LC 原文一致。
 // 已知 LC 行为（保留，不修）：vtable 槽位被改写的窗口内（一次
 // _NSGetExecutablePath 调用），若有别的线程恰好调 _NSGetExecutablePath，
 // 会被路由进 hook——它的 buf 会被当成新路径写进 DyldConfig。窗口在主线
@@ -74,7 +78,7 @@
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
 #import <mach/mach.h>
-#import <os/tpro.h>
+#import <stdbool.h>
 #import <stdlib.h>
 #import <string.h>
 #import <sys/mman.h>
@@ -84,6 +88,14 @@
 
 // CoreFoundation 私有导出：进程路径全局量的地址（LiveContainer 同款用法）。
 extern char **_CFGetProcessPath(void);
+
+// tpro 私有导出（LiveContainer 靠 @import Darwin 间接拿到声明；
+// iOS 26.2 SDK 里没有 <os/tpro.h>——0.2.22 第一轮 CI（run 44675099958）
+// 在此行报 'os/tpro.h' file not found。函数是 libSystem 导出，
+// 在此本地声明，与 _CFGetProcessPath 同款做法；调用点与 LC 原文一致）。
+extern bool os_tpro_is_supported(void);
+extern void os_thread_self_restrict_tpro_to_rw(void);
+extern void os_thread_self_restrict_tpro_to_ro(void);
 
 // —— LiveContainer builtin_vm_protect：直接打 mach_vm_protect trap ———————
 // 来源：LiveContainer/dyld_bypass_validation.m（ASM 宏，符号改名）。
