@@ -19,6 +19,7 @@
 // 在 UIKit 启动之前直接加载客 App；其余情况起宿主 SwiftUI（SBHostAppMain），
 // 由启动路由接手（需要修复时走异步修复，修完再重起一次，绝不进程内加载）。
 #import <Foundation/Foundation.h>
+#import <dlfcn.h>
 
 #import "SBGuestLoader.h"
 #import "SBDiagLog.h"
@@ -26,8 +27,53 @@
 
 extern void SBHostAppMain(void);
 
+// 0.2.26 G6：LC 同款（LCBootstrap.m:655-663）——未捕获异常处理器：把
+// reason + 调用栈写进 App Group defaults 的 SBLastLaunchError 键，
+// 下次进宿主 UI 时弹一次（见 SealboxApp.showLastLaunchErrorIfNeeded）。
+// 客的 NSSetUncaughtExceptionHandler 已被 hook 成空操作（G5），所以这里
+// 是进程里唯一的未捕获异常处理器。
+static void SBUncaughtExceptionHandler(NSException *exception) {
+    @try {
+        NSString *reason = exception.reason ?: @"（无 reason）";
+        NSString *stack = [[exception callStackSymbols] componentsJoinedByString:@"\n"];
+        NSString *text = [NSString stringWithFormat:@"%@\nCall stack:\n%@", reason, stack];
+        NSString *suiteName = [@"group." stringByAppendingString:
+            ([[NSBundle mainBundle] bundleIdentifier] ?: @"com.mjorb.sealbox")];
+        NSUserDefaults *defaults = [[NSUserDefaults alloc] initWithSuiteName:suiteName];
+        [defaults setObject:text forKey:@"SBLastLaunchError"];
+        [defaults synchronize];
+        SBDiagLogLine([[NSString stringWithFormat:@"未捕获异常：%@", reason] UTF8String]);
+    } @catch (NSException *ignored) {
+        (void)ignored;
+    }
+}
+
 int main(int argc, char *argv[]) {
     SBDiagLogBeginRun();
+    // 0.2.26 G6：见文件头——进程一启动就装未捕获异常处理器。
+    NSSetUncaughtExceptionHandler(SBUncaughtExceptionHandler);
+    // 0.2.26 G7：LC 同款（main.c）——先读 $HOME/Library/preloadLibraries.txt，
+    // 逐行 dlopen（RTLD_LAZY|RTLD_GLOBAL），读完删文件；失败只记日志。
+    // 文件由 SBAppCoordinator.requestRestart 在 iOS 26+ 且客带 MetalANGLE 时写。
+    {
+        NSString *preloadPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/preloadLibraries.txt"];
+        NSString *preloadContent = [NSString stringWithContentsOfFile:preloadPath encoding:NSUTF8StringEncoding error:nil];
+        if (preloadContent) {
+            for (NSString *line in [preloadContent componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]]) {
+                NSString *lib = [line stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+                if (lib.length == 0) {
+                    continue;
+                }
+                if (!dlopen([lib UTF8String], RTLD_LAZY | RTLD_GLOBAL)) {
+                    const char *dlErr = dlerror();
+                    SBDiagLogLine([[NSString stringWithFormat:@"预加载库失败：%@（%@）", lib, dlErr ? [NSString stringWithUTF8String:dlErr] : @"?"] UTF8String]);
+                } else {
+                    SBDiagLogLine([[NSString stringWithFormat:@"预加载库：%@", lib] UTF8String]);
+                }
+            }
+            [[NSFileManager defaultManager] removeItemAtPath:preloadPath error:nil];
+        }
+    }
     NSDictionary *info = [[NSBundle mainBundle] infoDictionary];
     NSString *shortVersion = info[@"CFBundleShortVersionString"];
     if (![shortVersion isKindOfClass:[NSString class]]) {
@@ -60,6 +106,20 @@ int main(int argc, char *argv[]) {
             SBDiagLogLine("客启动：需先修复，进宿主界面走异步修复（修完再重起）");
         } else {
             SBDiagLogLine("客启动：预检不通过，进宿主界面");
+        }
+    }
+
+    // 0.2.26 G4b：LC 同款（LCBootstrap.m:830-848）——客跑过 WebKit 后宿主的
+    // Library/Cookies 是指到客容器的软链、真身在 Cookies2；进宿主界面前移回来。
+    {
+        NSString *homeLibrary = [NSHomeDirectory() stringByAppendingPathComponent:@"Library"];
+        NSString *cookies2Path = [homeLibrary stringByAppendingPathComponent:@"Cookies2"];
+        NSString *cookiesPath = [homeLibrary stringByAppendingPathComponent:@"Cookies"];
+        NSFileManager *fm = [NSFileManager defaultManager];
+        if ([fm fileExistsAtPath:cookies2Path]) {
+            [fm removeItemAtPath:cookiesPath error:nil];
+            [fm moveItemAtPath:cookies2Path toPath:cookiesPath error:nil];
+            SBDiagLogLine("Cookies 已还原（Cookies2 移回）");
         }
     }
 

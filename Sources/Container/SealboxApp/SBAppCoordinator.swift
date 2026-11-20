@@ -177,6 +177,10 @@ final class SBAppCoordinator: ObservableObject {
         displayNameHint: String? = nil,
         onInstalled: (() -> Void)? = nil
     ) async {
+        // 0.2.26 G9：LC 同款（LCAppInfo.m:303）——安装中途崩溃检测：入口置旗，
+        // 退出清掉；下次进宿主 UI 时残留为真即报“上次安装中途崩溃”一次。
+        SBStore.shared.signingInProgress = true
+        defer { SBStore.shared.signingInProgress = false }
         await MainActor.run {
             isInstalling = true
             installingDisplayName = displayNameHint ?? parsed.displayName
@@ -379,6 +383,19 @@ final class SBAppCoordinator: ObservableObject {
 
     /// 发重启请求（launchApp 的后半段，签名门通过后才进）。
     private func requestRestart(app: SBInstalledApp) {
+        // 0.2.26 G7：LC 同款（LCAppModel.swift:403-408）——iOS 26+ 且客包带
+        // Frameworks/MetalANGLE.framework/MetalANGLE 时，把该路径写进宿主
+        // HOME/Library/preloadLibraries.txt（覆盖写一行）；新进程在 main 里
+        // 读它逐行 dlopen 后删文件。只写 MetalANGLE 这一行，LC 同款。
+        if #available(iOS 26, *) {
+            let metalANGLE = app.bundleURL.appendingPathComponent("Frameworks/MetalANGLE.framework/MetalANGLE")
+            if FileManager.default.fileExists(atPath: metalANGLE.path) {
+                let preloadPath = FileManager.default.homeDirectoryForCurrentUser
+                    .appendingPathComponent("Library/preloadLibraries.txt")
+                try? metalANGLE.path.write(toFile: preloadPath.path, atomically: true, encoding: .utf8)
+                SBDiagLog.log("预加载：客带 MetalANGLE，写 preloadLibraries.txt")
+            }
+        }
         launchWatchdog?.cancel()
         launchWatchdog = nil
         launchStage = "证书检查"
@@ -479,5 +496,29 @@ final class SBAppCoordinator: ObservableObject {
         // 被桌面弹出来并清掉，收尾可追溯。
         SBDiagLog.log("启动失败弹窗：\(receipt.guestBundleID) 按 guest-failed 收据弹错（\(message)），收据已清")
         activeAlert = CoordinatorAlert(title: "启动失败", message: message)
+    }
+
+    /// 0.2.26 G6：LC 同款（LCSealBoxRootView.swift:147-162）——上次进程
+    /// 未捕获异常（main.m 的处理器写的 SBLastLaunchError 键），进 UI 弹一次
+    /// 并清掉；文案截短，详情见诊断日志。
+    func showLastLaunchErrorIfNeeded() {
+        guard let error = SBStore.shared.lastLaunchError else { return }
+        SBStore.shared.lastLaunchError = nil
+        let shown = error.count > 400 ? String(error.prefix(400)) + "…" : error
+        SBDiagLog.log("上次启动异常弹窗：\(shown.prefix(120))，键已清")
+        activeAlert = CoordinatorAlert(
+            title: "上次启动崩溃",
+            message: shown + "\n\n详情见诊断日志。")
+    }
+
+    /// 0.2.26 G9：LC 同款 SigningInProgress 崩溃检测——上次安装/重装中途
+    /// 进程死了（signingInProgress 残留为真），报一次并清旗。
+    func showSigningCrashIfNeeded() {
+        guard SBStore.shared.signingInProgress else { return }
+        SBStore.shared.signingInProgress = false
+        SBDiagLog.log("上次安装中途崩溃弹窗：signingInProgress 残留，旗已清")
+        activeAlert = CoordinatorAlert(
+            title: "上次安装中途崩溃",
+            message: "上次安装/重装中途应用崩溃了，安装可能没有完成。请检查应用是否已在桌面，没有的话重新导入。")
     }
 }

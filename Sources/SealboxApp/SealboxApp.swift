@@ -95,6 +95,9 @@ struct VMRootView: View {
                 }
                 SBDiagLog.log("启动路由完成")
                 coordinator.showGuestFailedReceiptIfNeeded()
+                // 0.2.26 G6/G9：上次未捕获异常、安装中途崩溃各弹一次（读到即清）。
+                coordinator.showLastLaunchErrorIfNeeded()
+                coordinator.showSigningCrashIfNeeded()
             }
             // 旧记录迁移只跑一次：后台线程重解析 Documents/IPAs，跑完刷新 SBStore。
             if !didMigrate {

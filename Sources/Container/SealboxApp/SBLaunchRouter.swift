@@ -156,7 +156,7 @@ enum SBLaunchRouter {
             SBStore.shared.recordLaunchResult(
                 bundleID: receipt.guestBundleID,
                 diskDirectoryName: receipt.diskDirectoryName,
-                success: false, message: message)
+                success: false, message: message, containerUUID: receipt.containerUUID)
             SBStore.shared.clearGuestSelection()
             return true
         }
@@ -231,6 +231,33 @@ enum SBLaunchRouter {
             do {
                 SBDiagLog.log("启动路由：\(bundleID) 重启路签名逐项不合格或上次死在 dlopen 签名失败，异步强制重打补丁+重签")
                 _ = try await SBInstaller.ensureLaunchableSignature(record)
+                // 0.2.26 D 护栏：同一客连续修→重启超过 2 次仍未成功启动，
+                // 停下来写 guest-failed、界面弹错，不再重启。计数只在成功
+                // 启动（C）或用户重新点图标时归零；修好但预检仍不过时，
+                // 每轮修完到这里计数 +1，第 3 次直接停住。
+                let restartKey = SBStore.repairRestartKey(
+                    bundleID: bundleID, diskDirectoryName: record.diskDirectoryName)
+                if SBStore.shared.repairRestartCount(forKey: restartKey) >= 2 {
+                    let message = "已连续修复 2 次仍无法启动，已停止自动修复，请检查后重试"
+                    SBDiagLog.log("启动路由：\(bundleID) 护栏停住（连续修→重启已达 2 次），不再重启")
+                    await MainActor.run {
+                        var failed = SBStore.shared.launchReceipt ?? SBLaunchReceipt.requested(
+                            guestBundleID: bundleID,
+                            containerUUID: record.containerUUID,
+                            diskDirectoryName: record.diskDirectoryName,
+                            keychainGroup: record.keychainGroup)
+                        failed.stage = "guest-failed"
+                        failed.stageDetail = message
+                        SBStore.shared.launchReceipt = failed
+                        SBStore.shared.recordLaunchResult(
+                            bundleID: bundleID, diskDirectoryName: record.diskDirectoryName,
+                            success: false, message: message, containerUUID: record.containerUUID)
+                        SBStore.shared.clearGuestSelection()
+                        onRepairSettled?()
+                    }
+                    return
+                }
+                SBStore.shared.incrementRepairRestartCount(forKey: restartKey)
                 SBDiagLog.log("启动路由：\(bundleID) 重启路重签完成，重新请求重启（新进程走 main 前置路）")
                 await MainActor.run {
                     SBGuestLoader.shared().requestGuestLaunch(
@@ -253,7 +280,7 @@ enum SBLaunchRouter {
                             SBStore.shared.launchReceipt = failed
                             SBStore.shared.recordLaunchResult(
                                 bundleID: bundleID, diskDirectoryName: record.diskDirectoryName,
-                                success: false, message: message)
+                                success: false, message: message, containerUUID: record.containerUUID)
                             SBStore.shared.clearGuestSelection()
                         } else {
                             SBDiagLog.log("启动路由：\(bundleID) 修完重起请求已发出，0.6 秒后退出进程")
@@ -277,7 +304,7 @@ enum SBLaunchRouter {
                     SBStore.shared.launchReceipt = failed
                     SBStore.shared.recordLaunchResult(
                         bundleID: bundleID, diskDirectoryName: record.diskDirectoryName,
-                        success: false, message: message)
+                        success: false, message: message, containerUUID: record.containerUUID)
                     SBStore.shared.clearGuestSelection()
                     onRepairSettled?()
                 }
@@ -314,8 +341,27 @@ enum SBLaunchRouter {
             bundleID: receipt.guestBundleID,
             diskDirectoryName: receipt.diskDirectoryName,
             success: false,
-            message: receipt.stageDetail ?? "客 App 加载失败")
+            message: receipt.stageDetail ?? "客 App 加载失败",
+            containerUUID: receipt.containerUUID)
         SBStore.shared.clearGuestSelection()
+    }
+
+    /// 0.2.26 C：客 main 跑完返回，记成功、清标记、护栏计数归零。
+    /// 调用点是 SBGuestBootstrap 的成功路（客 main 返回后），主前置路与
+    /// 同步路都经它，一处覆盖两路；收据在成功时已被 clearLaunchRequest
+    /// 清掉，所以参数须由调用方显式传，不能事后读收据。
+    /// LC 在此记的是一条错串（"App returned from its main function with
+    /// code %d"）；我们记成功——main 返回即证明启动成功，我们的标记只
+    /// 跟踪启动失败，清掉它下次预检才不再误修。
+    static func noteGuestLaunchedSuccessfully(bundleID: String, containerUUID: String,
+                                              diskDirectoryName: String?, returnCode: Int) {
+        SBStore.shared.recordLaunchResult(
+            bundleID: bundleID, diskDirectoryName: diskDirectoryName,
+            success: true, message: "客 App 已启动并退出（main 返回，返回码 \(returnCode)）",
+            containerUUID: containerUUID)
+        SBStore.shared.resetRepairRestartCount(
+            forKey: SBStore.repairRestartKey(bundleID: bundleID, diskDirectoryName: diskDirectoryName))
+        SBDiagLog.log("启动路由：\(bundleID) 客 main 返回（返回码 \(returnCode)），记成功并清护栏计数")
     }
 
     /// App 启动时调用一次。若本次是“重起进客 App”，尝试加载客 App；
@@ -354,7 +400,8 @@ enum SBLaunchRouter {
                     bundleID: receipt.guestBundleID,
                     diskDirectoryName: receipt.diskDirectoryName,
                     success: false,
-                    message: receipt.stageDetail ?? "系统没有重启应用，请重试")
+                    message: receipt.stageDetail ?? "系统没有重启应用，请重试",
+                    containerUUID: receipt.containerUUID)
             }
             return
         }
@@ -380,7 +427,8 @@ enum SBLaunchRouter {
                     bundleID: receipt.guestBundleID,
                     diskDirectoryName: receipt.diskDirectoryName,
                     success: false,
-                    message: receipt.stageDetail ?? "客 App 加载失败")
+                    message: receipt.stageDetail ?? "客 App 加载失败",
+                    containerUUID: receipt.containerUUID)
             }
             SBStore.shared.clearGuestSelection()
         }
@@ -400,5 +448,13 @@ enum SBLaunchRouter {
     /// main 前置路加载失败时补记一次上次启动结果（只在收据已是 guest-failed 时记）。
     @objc static func noteGuestLoadFailedIfNeeded() {
         SBLaunchRouter.noteGuestLoadFailedIfNeeded()
+    }
+
+    /// 0.2.26 C：客 main 跑完返回时记成功（SBGuestBootstrap 成功路调）。
+    @objc static func noteGuestLaunchedSuccessfully(bundleID: String, containerUUID: String,
+                                                    diskDirectoryName: String?, returnCode: Int) {
+        SBLaunchRouter.noteGuestLaunchedSuccessfully(
+            bundleID: bundleID, containerUUID: containerUUID,
+            diskDirectoryName: diskDirectoryName, returnCode: returnCode)
     }
 }

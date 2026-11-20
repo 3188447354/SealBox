@@ -737,6 +737,21 @@ public enum SBInstaller {
     ///   重签后复验再跑一次逐项并记结果；仍坏抛错写明 exact 哪一项坏，
     ///   绝不走到 dlopen 去撞墙。无证书时只拦不修，抛原错。
     /// - LC_ID_DYLIB 缺失 → 走 repatchInstalledApp（补 ID）；无证书时
+    /// 0.2.26 A：修后清标记——任一成功返回前，清掉记录的
+    /// lastLaunchResult 并 upsert 落盘。0.2.25 的无限循环就是 hooks
+    /// 分支修好后直接 return record、不清标记、不落盘导致的：下次预检
+    /// 又见同一标记、再修复、再重启。repatch 路径已在返回的记录里清
+    /// （lastLaunchResult: nil），这里只补两条直接返回的路；记录里本就
+    /// 没有标记时是空操作，不多写一次盘。
+    private static func clearedSignatureFailure(_ record: SBInstalledApp) -> SBInstalledApp {
+        guard record.lastLaunchResult != nil else { return record }
+        var updated = record
+        updated.lastLaunchResult = nil
+        SBStore.shared.upsertApp(updated)
+        SBDiagLog.log("签名修复门：\(record.bundleID) 修后清除上次签名失败标记")
+        return updated
+    }
+
     ///   修不了，直接抛缺 ID 的原因。
     /// - Team 不一致 → 直接抛 teamMismatch，不走 repatch（0.2.11：重签
     ///   换不了宿主的 Team，走 repatch 只是白做工；且无证书时 repatch 的
@@ -748,7 +763,8 @@ public enum SBInstaller {
         // 门是放行还是触发修复、按什么输入决定的，日志里一次看清。
         // 上次启动死在 dlopen 签名失败的判断见 SBInstalledApp
         // .lastLaunchSigFailed（记录里的上次结果由启动路由在加载失败时
-        // 写回，持久化在每包已装记录里，点图标不许清掉它）。
+        // 写回，持久化在每包已装记录里；修好就清——0.2.26 A，任一成功
+        // 返回前 clearedSignatureFailure 清掉并落盘）。
         let lastLaunchSigFailed = record.lastLaunchSigFailed
         SBDiagLog.log("签名修复门验签：\(record.bundleID) \(executablePath) \(signatureDetailFields(detail: gateDetail)) 上次签名失败标记=\(lastLaunchSigFailed ? "是" : "否")\(record.lastLaunchResult.map { "（\($0.message.prefix(80))）" } ?? "")")
         let detailValid = (gateDetail["valid"] as? NSNumber)?.boolValue ?? false
@@ -778,7 +794,9 @@ public enum SBInstaller {
                 }
                 if detailValid {
                     try verifyExecutableSignature(executablePath, bundleID: record.bundleID, checkTeam: true)
-                    return record
+                    // 0.2.26 A：这是 0.2.25 循环的根因——以前这里直接
+                    // return record，标记不清、记录不落盘。
+                    return clearedSignatureFailure(record)
                 }
                 // 客逐项也坏：继续走下面的强制修复（客应用）。
             } else {
@@ -797,7 +815,9 @@ public enum SBInstaller {
         }
         if detailValid && !lastLaunchSigFailed {
             try verifyExecutableSignature(executablePath, bundleID: record.bundleID, checkTeam: true)
-            return record
+            // 0.2.26 A：陈旧标记（容器已换）走到这里时一并清掉，下次
+            // 预检不再靠 B 的容器比对兜底。
+            return clearedSignatureFailure(record)
         }
         // 强制修复：逐项有坏项，或上次启动死在 dlopen 签名失败。
         // Team 不一致重签修不好：先比 Team，不一致直接抛，不白走 repatch。

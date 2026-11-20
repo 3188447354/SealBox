@@ -20,6 +20,15 @@ final class SBStore: ObservableObject {
         static let displayNameOverrides = "SBDisplayNameOverrides"
         /// 种子应用 Via 已装过（0.2.1）：置位后不再自动种；用户删了也不补。
         static let seedViaInstalled = "SBSeedViaInstalled"
+        /// 0.2.26 D：修→重启护栏计数，键是 bundleID|diskDirectoryName，值是
+        /// 连续修→重启次数（成功启动或用户重新点图标时归零）。
+        static let repairRestartCounts = "SBRepairRestartCounts"
+        /// 0.2.26 G9：正在安装/签名（LC 的 SigningInProgress 同款）：置位后
+        /// 进程崩溃，下次启动报“上次安装中途崩溃”。
+        static let signingInProgress = "SBSigningInProgress"
+        /// 0.2.26 G6：上次未捕获异常的原因 + 堆栈（main.m 的异常处理器写，
+        /// 下次进宿主界面弹一次即清）。
+        static let lastLaunchError = "SBLastLaunchError"
     }
 
     init(defaults: UserDefaults? = nil) {
@@ -133,7 +142,7 @@ final class SBStore: ObservableObject {
     /// 0.2.13 的 hdsh 触发器没生效的候选根因之一）。diskDirectoryName
     /// 为空时退到只按 bundleID 找首条（旧收据没有目录名时的兜底）。
     func recordLaunchResult(bundleID: String, diskDirectoryName: String? = nil,
-                           success: Bool, message: String) {
+                           success: Bool, message: String, containerUUID: String? = nil) {
         onMain {
             let app: SBInstalledApp?
             if let dir = diskDirectoryName, !dir.isEmpty {
@@ -144,9 +153,63 @@ final class SBStore: ObservableObject {
                 app = self.app(with: bundleID)
             }
             guard var app = app else { return }
+            // 0.2.26 B：失败结果带上容器——标记只认当前容器，容器换了
+            // 旧标记即陈旧。没传时用记录自己的 containerUUID（调用方
+            // 有收据/记录在手时应显式传，两者一致）。
             app.lastLaunchResult = SBLaunchResult(
-                success: success, date: Date(), message: message)
+                success: success, date: Date(), message: message,
+                containerUUID: containerUUID ?? app.containerUUID)
             upsertApp(app)
+        }
+    }
+
+    // MARK: - 0.2.26 D：修→重启护栏计数
+
+    /// 护栏计数键：bundleID + diskDirectoryName（与 recordLaunchResult
+    /// 的记录定位一致，平行安装的两条同名记录分开数）。
+    static func repairRestartKey(bundleID: String, diskDirectoryName: String?) -> String {
+        "\(bundleID)|\(diskDirectoryName ?? "")"
+    }
+
+    var repairRestartCounts: [String: Int] {
+        get { (defaults.dictionary(forKey: Key.repairRestartCounts) as? [String: Int]) ?? [:] }
+        set { defaults.set(newValue, forKey: Key.repairRestartCounts) }
+    }
+
+    func repairRestartCount(forKey key: String) -> Int {
+        repairRestartCounts[key] ?? 0
+    }
+
+    func incrementRepairRestartCount(forKey key: String) {
+        var counts = repairRestartCounts
+        counts[key, default: 0] += 1
+        repairRestartCounts = counts
+    }
+
+    func resetRepairRestartCount(forKey key: String) {
+        var counts = repairRestartCounts
+        counts.removeValue(forKey: key)
+        repairRestartCounts = counts
+    }
+
+    // MARK: - 0.2.26 G9/G6：安装中途崩溃 / 上次未捕获异常
+
+    /// 正在安装/签名：runInstall 入口置位，defer 清掉；崩溃后残留为真。
+    var signingInProgress: Bool {
+        get { defaults.bool(forKey: Key.signingInProgress) }
+        set { defaults.set(newValue, forKey: Key.signingInProgress) }
+    }
+
+    /// 上次未捕获异常的原因 + 堆栈：main.m 的异常处理器写，下次进宿主
+    /// 界面弹一次即清（nil 表示没有）。
+    var lastLaunchError: String? {
+        get { defaults.string(forKey: Key.lastLaunchError) }
+        set {
+            if let value = newValue {
+                defaults.set(value, forKey: Key.lastLaunchError)
+            } else {
+                defaults.removeObject(forKey: Key.lastLaunchError)
+            }
         }
     }
 

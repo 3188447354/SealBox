@@ -5,6 +5,10 @@ struct SBLaunchResult: Codable, Equatable {
     var success: Bool
     var date: Date
     var message: String
+    /// 0.2.26：这次结果属于哪个数据容器（记录的 containerUUID）。
+    /// 旧记录（无此键）解码为 nil，按新鲜标记算（保守：不误放行）；
+    /// 新记录写失败时一律带上，容器换了旧标记即陈旧，不再触发修复。
+    var containerUUID: String? = nil
 }
 
 /// 已安装的客 App（元数据存在 App Group UserDefaults 的 SBInstalledApps 里；
@@ -37,9 +41,19 @@ struct SBInstalledApp: Codable, Identifiable, Equatable {
     /// 收据不许清掉它，只有重签成功才清）。两处门（点图标门、重启门）与
     /// 日志共用这一处定义，不许各写各的 contains 串——0.2.13 的教训：
     /// 触发条件散在两处，日志里看不出门到底读到了什么。
+    /// 0.2.26 B：标记只认当前容器。结果里带的 containerUUID 与当前记录
+    /// 的 containerUUID 不同 → 陈旧标记（重装/换容器后旧失败不再描述
+    /// 新容器），按当前验签实测决定，不触发修复。无 containerUUID 的
+    /// 旧格式标记按新鲜算——修后清标记（A）会在下一轮修完后把它清掉，
+    /// 0.2.25 的循环最多再走一轮即断。
     var lastLaunchSigFailed: Bool {
-        lastLaunchResult?.success == false
-            && (lastLaunchResult?.message.contains("code signature invalid") ?? false)
+        guard let result = lastLaunchResult,
+              result.success == false,
+              result.message.contains("code signature invalid") else { return false }
+        if let markerContainer = result.containerUUID, !markerContainer.isEmpty {
+            return markerContainer == containerUUID
+        }
+        return true
     }
 
     /// 链式修正段数与实际段数不一致（0.2.5：不再当安装失败，照装；启动时 dyld

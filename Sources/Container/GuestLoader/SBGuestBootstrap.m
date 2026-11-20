@@ -13,6 +13,7 @@
 #import "SBDiagLog.h"
 #import "SBBundleSpoof.h"
 #import "SBExecPathHook.h"
+#import "SealBox-Swift.h"
 
 extern char **environ;
 // CoreFoundation 的进程名全局量（与 _CFGetProcessPath 同款做法，见 SBExecPathHook.m）。
@@ -37,6 +38,7 @@ static const NSInteger SBKeychainGroupCount = 128;
 // strdup 新名字在先、再赋值、最后才 free 旧缓冲：中间没有悬空指针。
 static NSArray *g_sbGuestArguments = nil;
 static IMP g_originalArgumentsIMP = NULL;
+static IMP g_originalSwiftArgumentsIMP = NULL;
 static NSString *g_originalProcessName = nil;
 static char *g_originalProgname = NULL;
 static char *g_guestProgname = NULL;
@@ -67,6 +69,25 @@ static void SBRewriteProcessIdentity(NSString *guestExecPath) {
         }
     } @catch (NSException *exception) {
         NSLog(@"[Sealbox] 改写 NSProcessInfo.arguments 失败：%@", exception.reason);
+    }
+    // 0.2.26 G2：LC 同款（LCBootstrap.m:508-510）——Swift 客读
+    // ProcessInfo.processInfo.arguments 走 _NSSwiftProcessInfo，不走
+    // NSProcessInfo；把它 arguments 的实现也指到（已交换过的）
+    // NSProcessInfo 的实现上。先存原 IMP，恢复时换回去。
+    @try {
+        Class swiftProcessInfo = NSClassFromString(@"_NSSwiftProcessInfo");
+        if (swiftProcessInfo) {
+            Method swiftArgumentsMethod = class_getInstanceMethod(swiftProcessInfo, @selector(arguments));
+            if (swiftArgumentsMethod) {
+                if (!g_originalSwiftArgumentsIMP) {
+                    g_originalSwiftArgumentsIMP = method_getImplementation(swiftArgumentsMethod);
+                }
+                method_setImplementation(swiftArgumentsMethod,
+                    class_getMethodImplementation([NSProcessInfo class], @selector(arguments)));
+            }
+        }
+    } @catch (NSException *exception) {
+        NSLog(@"[Sealbox] 改写 _NSSwiftProcessInfo.arguments 失败：%@", exception.reason);
     }
     // processName：公开 setter（先存原名）。
     @try {
@@ -107,6 +128,19 @@ static void SBRestoreProcessIdentity(void) {
     } @catch (NSException *exception) {
         NSLog(@"[Sealbox] 恢复 NSProcessInfo.arguments 失败：%@", exception.reason);
     }
+    // 0.2.26 G2 恢复：_NSSwiftProcessInfo.arguments 指回原实现。
+    @try {
+        Class swiftProcessInfo = NSClassFromString(@"_NSSwiftProcessInfo");
+        if (swiftProcessInfo && g_originalSwiftArgumentsIMP) {
+            Method swiftArgumentsMethod = class_getInstanceMethod(swiftProcessInfo, @selector(arguments));
+            if (swiftArgumentsMethod) {
+                method_setImplementation(swiftArgumentsMethod, g_originalSwiftArgumentsIMP);
+                g_originalSwiftArgumentsIMP = NULL;
+            }
+        }
+    } @catch (NSException *exception) {
+        NSLog(@"[Sealbox] 恢复 _NSSwiftProcessInfo.arguments 失败：%@", exception.reason);
+    }
     @try {
         if (g_originalProcessName) {
             [[NSProcessInfo processInfo] setProcessName:g_originalProcessName];
@@ -137,6 +171,7 @@ static void SBClearGuestEnvironment(void) {
     unsetenv("SB_GUEST_EXEC_PATH");
     unsetenv("SB_GUEST_KEYCHAIN_GROUP");
     unsetenv("SB_HOST_BUNDLE_ID");
+    unsetenv("SB_HOST_HOME");
 }
 
 // 0.2.11：客加载失败 / 客 main 返回时把进程环境还回去——不止 SB_* 变量，
@@ -337,9 +372,12 @@ static void SBDiagLogGuestFail(SBGuestLoaderErrorCode code, NSString *bundleID, 
     }
 
     // —— 2. 搭数据容器：建目录、HOME、tmp 软链 —————————————————————
+    // 0.2.26 G8：LC 的四目录之外再加 Library/Preferences（LC 的
+    // NSUserDefaults.m 建它；偏好 plist 落在这里，缺了它某些客写偏好失败）。
     NSArray<NSString *> *containerSubdirs = @[
         @"Library/Caches",
         @"Library/Cookies",
+        @"Library/Preferences",
         @"Documents",
         @"SystemData",
     ];
@@ -376,6 +414,13 @@ static void SBDiagLogGuestFail(SBGuestLoaderErrorCode code, NSString *bundleID, 
     if (g_originalFixedHome == NULL) {
         const char *fixed = getenv("CFFIXED_USER_HOME");
         g_originalFixedHome = fixed ? strdup(fixed) : NULL;
+    }
+    // 0.2.26 G4b：LC 的 LC_HOME_PATH 同款——客端 Cookies hook
+    //（SBFileManagerHook）要用宿主 HOME 找宿主的 Library/Cookies；
+    // HOME 改写前先存一份进环境变量，失败/返回时由
+    // SBRestoreGuestEnvironment 经 SBClearGuestEnvironment 清掉。
+    if (g_originalHome) {
+        setenv("SB_HOST_HOME", g_originalHome, 1);
     }
     setenv("HOME", [containerPath UTF8String], 1);
     setenv("CFFIXED_USER_HOME", [containerPath UTF8String], 1);
@@ -498,6 +543,9 @@ static void SBDiagLogGuestFail(SBGuestLoaderErrorCode code, NSString *bundleID, 
         }
         return NO;
     }
+    // 0.2.26 G1：LC 同款（LCBootstrap.m:622）——dlopen 客后、load 前显式触发
+    // NSUserDefaults 的 +initialize，修某些应用的动态属性问题。
+    [NSUserDefaults performSelector:@selector(initialize)];
     NSError *bundleLoadError = nil;
     if (![guestBundle loadAndReturnError:&bundleLoadError]) {
         SBDiagLogGuestFail(SBGuestLoaderErrorGuestLoadFailed, bundleID, guestExecPath,
@@ -573,6 +621,11 @@ static void SBDiagLogGuestFail(SBGuestLoaderErrorCode code, NSString *bundleID, 
     [SBGuestLoader clearLaunchRequest];
     SBDiagLogLine([[NSString stringWithFormat:@"客 App 已退出（返回码 %d），回到桌面", guestResult] UTF8String]);
     NSLog(@"[Sealbox] 客 App 已退出（返回码 %d），回到桌面", guestResult);
+    // 0.2.26 C：客 main 跑完返回，记成功、清标记、护栏计数归零（Swift 侧）。
+    [SBGuestLaunchPreflight noteGuestLaunchedSuccessfullyWithBundleID:bundleID
+                                                        containerUUID:containerUUID
+                                                    diskDirectoryName:diskDirectoryName
+                                                          returnCode:guestResult];
     return YES;
 }
 

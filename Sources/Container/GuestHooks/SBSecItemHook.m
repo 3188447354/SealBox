@@ -20,6 +20,24 @@ static OSStatus (*g_orig_SecItemAdd)(CFDictionaryRef, CFTypeRef *) = NULL;
 static OSStatus (*g_orig_SecItemCopyMatching)(CFDictionaryRef, CFTypeRef *) = NULL;
 static OSStatus (*g_orig_SecItemUpdate)(CFDictionaryRef, CFDictionaryRef) = NULL;
 static OSStatus (*g_orig_SecItemDelete)(CFDictionaryRef) = NULL;
+// 0.2.26 G3：LC 同款——钥匙串建钥的三处也要改组，否则建出来的钥匙落在
+// 宿主默认组里，客下次找不到（还泄漏到宿主组）。
+static SecKeyRef (*g_orig_SecKeyCreateRandomKey)(CFDictionaryRef, CFErrorRef *) = NULL;
+static SecKeyRef (*g_orig_SecKeyCreateWithData)(CFDataRef, CFDictionaryRef, CFErrorRef *) = NULL;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+static OSStatus (*g_orig_SecKeyGeneratePair)(CFDictionaryRef, SecKeyRef *, SecKeyRef *) = NULL;
+#pragma clang diagnostic pop
+
+/// 客容器 UUID（SB_GUEST_CONTAINER_PATH 最后一段），供 SecItemAdd 的 alis 用
+///（LC 同款：LCUI 按容器删钥匙串时靠它定位）。
+static NSString *SBGuestContainerID(void) {
+    const char *container = getenv("SB_GUEST_CONTAINER_PATH");
+    if (!container || container[0] == '\0') {
+        return @"";
+    }
+    return [[NSString stringWithUTF8String:container] lastPathComponent];
+}
 
 /// 复制一份字典并把 kSecAttrAccessGroup 写成客容器组名。original 为 NULL 时返回 NULL。
 /// 返回的字典调用方负责 CFRelease；*outCopied 置 YES 表示返回的是新复制的字典。
@@ -48,9 +66,19 @@ static OSStatus SBHooked_SecItemAdd(CFDictionaryRef attributes, CFTypeRef *resul
     }
     BOOL copied = NO;
     CFDictionaryRef rewritten = SBSecItemRewrittenAttributes(attributes, &copied);
+    // 0.2.26 G3：LC 同款——写 alis=容器 UUID，供按容器删钥匙串时定位。
+    if (copied) {
+        CFDictionarySetValue((CFMutableDictionaryRef)rewritten, @"alis",
+                             (__bridge CFStringRef)SBGuestContainerID());
+    }
     OSStatus status = g_orig_SecItemAdd(rewritten, result);
     if (copied) {
         CFRelease(rewritten);
+    }
+    // 0.2.26 G3：LC 同款——errSecParam 时回退原调用（不带 accessGroup 重试），
+    // 某些查询不支持 kSecAttrAccessGroup。
+    if (status == errSecParam) {
+        return g_orig_SecItemAdd(attributes, result);
     }
     return status;
 }
@@ -64,6 +92,9 @@ static OSStatus SBHooked_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *r
     OSStatus status = g_orig_SecItemCopyMatching(rewritten, result);
     if (copied) {
         CFRelease(rewritten);
+    }
+    if (status == errSecParam) {
+        return g_orig_SecItemCopyMatching(query, result);
     }
     return status;
 }
@@ -82,6 +113,9 @@ static OSStatus SBHooked_SecItemUpdate(CFDictionaryRef query, CFDictionaryRef at
     if (attributesCopied) {
         CFRelease(rewrittenAttributes);
     }
+    if (status == errSecParam) {
+        return g_orig_SecItemUpdate(query, attributesToUpdate);
+    }
     return status;
 }
 
@@ -95,8 +129,67 @@ static OSStatus SBHooked_SecItemDelete(CFDictionaryRef query) {
     if (copied) {
         CFRelease(rewritten);
     }
+    if (status == errSecParam) {
+        return g_orig_SecItemDelete(query);
+    }
     return status;
 }
+
+// 0.2.26 G3：LC 同款 SecKey 建钥 hook——改组；失败时清掉 error 再用原参数重试。
+static SecKeyRef SBHooked_SecKeyCreateRandomKey(CFDictionaryRef parameters, CFErrorRef *error) {
+    if (!g_orig_SecKeyCreateRandomKey) {
+        return NULL;
+    }
+    BOOL copied = NO;
+    CFDictionaryRef rewritten = SBSecItemRewrittenAttributes(parameters, &copied);
+    SecKeyRef key = g_orig_SecKeyCreateRandomKey(rewritten, error);
+    if (copied) {
+        CFRelease(rewritten);
+    }
+    if (!key && error && *error) {
+        CFRelease(*error);
+        *error = NULL;
+        key = g_orig_SecKeyCreateRandomKey(parameters, error);
+    }
+    return key;
+}
+
+static SecKeyRef SBHooked_SecKeyCreateWithData(CFDataRef keyData, CFDictionaryRef parameters, CFErrorRef *error) {
+    if (!g_orig_SecKeyCreateWithData) {
+        return NULL;
+    }
+    BOOL copied = NO;
+    CFDictionaryRef rewritten = SBSecItemRewrittenAttributes(parameters, &copied);
+    SecKeyRef key = g_orig_SecKeyCreateWithData(keyData, rewritten, error);
+    if (copied) {
+        CFRelease(rewritten);
+    }
+    if (!key && error && *error) {
+        CFRelease(*error);
+        *error = NULL;
+        key = g_orig_SecKeyCreateWithData(keyData, parameters, error);
+    }
+    return key;
+}
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+static OSStatus SBHooked_SecKeyGeneratePair(CFDictionaryRef parameters, SecKeyRef *publicKey, SecKeyRef *privateKey) {
+    if (!g_orig_SecKeyGeneratePair) {
+        return errSecParam;
+    }
+    BOOL copied = NO;
+    CFDictionaryRef rewritten = SBSecItemRewrittenAttributes(parameters, &copied);
+    OSStatus status = g_orig_SecKeyGeneratePair(rewritten, publicKey, privateKey);
+    if (copied) {
+        CFRelease(rewritten);
+    }
+    if (status == errSecParam) {
+        return g_orig_SecKeyGeneratePair(parameters, publicKey, privateKey);
+    }
+    return status;
+}
+#pragma clang diagnostic pop
 
 void SBSecItemHookInstall(void) {
     static dispatch_once_t onceToken;
@@ -106,11 +199,32 @@ void SBSecItemHookInstall(void) {
             NSLog(@"[Sealbox] SecItem Hook 未安装：找不到客可执行镜像");
             return;
         }
+        // 0.2.26 G3：LC 同款探针——先拿假查询问钥匙串组能不能用；宿主缺
+        // keychain-access-groups entitlement 时（errSecMissingEntitlement）
+        // 不装 hook，否则所有 SecItem 调用都会被改写进一个不可用的组而失败。
+        NSDictionary *probeQuery = @{
+            (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
+            (__bridge id)kSecAttrAccount: @"NonExistentKey",
+            (__bridge id)kSecAttrService: @"NonExistentService",
+            (__bridge id)kSecAttrAccessGroup: (__bridge id)SBGuestKeychainGroupName(),
+            (__bridge id)kSecReturnData: @NO
+        };
+        OSStatus probeStatus = SecItemCopyMatching((__bridge CFDictionaryRef)probeQuery, NULL);
+        if (probeStatus == errSecMissingEntitlement) {
+            NSLog(@"[Sealbox] SecItem Hook 未安装：钥匙串组 %@ 不可用（缺 entitlement）", SBGuestKeychainGroupName());
+            return;
+        }
         // 先记原函数，再重绑定；顺序反了替身会调到自己。
         g_orig_SecItemAdd = (OSStatus (*)(CFDictionaryRef, CFTypeRef *))dlsym(RTLD_DEFAULT, "SecItemAdd");
         g_orig_SecItemCopyMatching = (OSStatus (*)(CFDictionaryRef, CFTypeRef *))dlsym(RTLD_DEFAULT, "SecItemCopyMatching");
         g_orig_SecItemUpdate = (OSStatus (*)(CFDictionaryRef, CFDictionaryRef))dlsym(RTLD_DEFAULT, "SecItemUpdate");
         g_orig_SecItemDelete = (OSStatus (*)(CFDictionaryRef))dlsym(RTLD_DEFAULT, "SecItemDelete");
+        g_orig_SecKeyCreateRandomKey = (SecKeyRef (*)(CFDictionaryRef, CFErrorRef *))dlsym(RTLD_DEFAULT, "SecKeyCreateRandomKey");
+        g_orig_SecKeyCreateWithData = (SecKeyRef (*)(CFDataRef, CFDictionaryRef, CFErrorRef *))dlsym(RTLD_DEFAULT, "SecKeyCreateWithData");
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        g_orig_SecKeyGeneratePair = (OSStatus (*)(CFDictionaryRef, SecKeyRef *, SecKeyRef *))dlsym(RTLD_DEFAULT, "SecKeyGeneratePair");
+#pragma clang diagnostic pop
         if (g_orig_SecItemAdd) {
             litehook_rebind_symbol(guestHeader, (void *)g_orig_SecItemAdd, (void *)SBHooked_SecItemAdd, NULL);
         }
@@ -123,6 +237,15 @@ void SBSecItemHookInstall(void) {
         if (g_orig_SecItemDelete) {
             litehook_rebind_symbol(guestHeader, (void *)g_orig_SecItemDelete, (void *)SBHooked_SecItemDelete, NULL);
         }
-        NSLog(@"[Sealbox] SecItem Hook 已安装：重绑 SecItemAdd/CopyMatching/Update/Delete（0.2.25 函数指针传法）");
+        if (g_orig_SecKeyCreateRandomKey) {
+            litehook_rebind_symbol(guestHeader, (void *)g_orig_SecKeyCreateRandomKey, (void *)SBHooked_SecKeyCreateRandomKey, NULL);
+        }
+        if (g_orig_SecKeyCreateWithData) {
+            litehook_rebind_symbol(guestHeader, (void *)g_orig_SecKeyCreateWithData, (void *)SBHooked_SecKeyCreateWithData, NULL);
+        }
+        if (g_orig_SecKeyGeneratePair) {
+            litehook_rebind_symbol(guestHeader, (void *)g_orig_SecKeyGeneratePair, (void *)SBHooked_SecKeyGeneratePair, NULL);
+        }
+        NSLog(@"[Sealbox] SecItem Hook 已安装：重绑 SecItemAdd/CopyMatching/Update/Delete + SecKeyCreateRandomKey/CreateWithData/GeneratePair（0.2.25 函数指针传法；0.2.26 补 SecKey* 与探针）");
     });
 }
