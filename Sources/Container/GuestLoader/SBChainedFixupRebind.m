@@ -33,6 +33,24 @@
 // 这里自行声明（与 litehook_rebind_symbol_in_section 同款用法）。
 extern bool os_thread_self_tpro_is_writeable(void);
 
+// 0.2.28 fixup 1（根因修，首版 7ff45f5 的致命 bug）：
+//   SDK 的 LC_DYLD_CHAINED_FIXUPS 自带 LC_REQ_DYLD 位，即 0x80000034
+//   （同款：LC_DYLD_INFO_ONLY = 0x80000022，见 ZSign/common/mach-o.h:217；
+//   LiveContainer 的 LCMachOUtils.m:194 对此是拿原始 cmd 直接比常量）。
+//   首版这里掩了 cmd（& 0x7FFFFFFF）却拿掩过的 cmd 去比没掩的常量——
+//   掩过的值最大 0x7FFFFFFF，永不可能等于 0x80000034，编译期即可判定
+//   为假：Clang 把分支折掉，hasChainedFixups 恒为 NO，链接器再把整条
+//   链式路（SBRebindChained＋SBArm64SliceOffset＋SBFileOffsetToRuntimeAddress
+//   及其全部字串）当死代码消除。实证：首版 IPA 的 dSYM 里无 SBRebindChained，
+//   二进制里无任一“链式重绑”字串；运行时所有链式修正镜像（现代 Xcode
+//   产物全是）都会落到传统路、找不到 __la/__nl_symbol_ptr、经护栏干净
+//   失败——不闪退，但 SwiftUI 客永远嵌不进去。
+//   铁律：掩 cmd 的同时必须掩常量，两边都掩（或两边都不掩）。分型器
+//   SBGuestUIClassifier.m 用字面量 0x34 是对的，不受影响。
+static BOOL SBIsChainedFixupsCommand(uint32_t rawCmd) {
+    return (rawCmd & 0x7FFFFFFF) == (LC_DYLD_CHAINED_FIXUPS & 0x7FFFFFFF);
+}
+
 #define SB_MAX_SEGMENTS 16
 #define SB_MAX_CHAIN_STEPS 100000
 
@@ -130,7 +148,7 @@ static BOOL SBParseImageLayout(const struct mach_header *header,
                 (const struct dysymtab_command *)lc;
             layout->indirectSymoff = dysymtab->indirectsymoff;
             layout->nindirectSyms = dysymtab->nindirectsyms;
-        } else if (baseCmd == LC_DYLD_CHAINED_FIXUPS) {
+        } else if (SBIsChainedFixupsCommand(lc->cmd)) {
             layout->hasChainedFixups = YES;
         }
         if (lc->cmdsize == 0) {
@@ -269,7 +287,7 @@ static uint32_t SBRebindChained(SBImageLayout *layout,
             fclose(file);
             return 0;
         }
-        if ((cmd & 0x7FFFFFFF) == LC_DYLD_CHAINED_FIXUPS) {
+        if (SBIsChainedFixupsCommand(cmd)) {
             fseek(file, (long)(cursor + 8), SEEK_SET);
             if (fread(&chainedDataoff, sizeof(chainedDataoff), 1, file) != 1 ||
                 fread(&chainedDatasize, sizeof(chainedDatasize), 1, file) != 1) {
