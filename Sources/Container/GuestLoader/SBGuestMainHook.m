@@ -26,7 +26,7 @@ static const char * const SBUIApplicationMainCSymbol = "_UIApplicationMain";
 static const char * const SBUIApplicationMainSwiftSymbol =
     "_$s5UIKit17UIApplicationMainys5Int32VAD_SpySpys4Int8VGGSgSSSgAJtF";
 
-typedef int (*SBUIApplicationMainFn)(int argc, char *argv[],
+typedef int (*SBUIApplicationMainFn)(int argc, char * _Nullable * _Nullable argv,
                                       NSString *principalClassName,
                                       NSString *delegateClassName);
 
@@ -62,7 +62,7 @@ static NSString *SBHookCallerImageName(void) {
 
 #pragma mark - 拦截实现
 
-int SBHookedUIApplicationMain(int argc, char *argv[],
+int SBHookedUIApplicationMain(int argc, char * _Nullable * _Nullable argv,
                               NSString *principalClassName,
                               NSString *delegateClassName) {
     UIApplication *app = [UIApplication sharedApplication];

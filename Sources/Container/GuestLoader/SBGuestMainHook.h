@@ -46,7 +46,11 @@ BOOL SBGuestMainHookInstallForGuestImage(const struct mach_header *guestHeader,
                                          SBGuestUIType uiType);
 
 /// 拦截后的替代实现（C 符号替身）。返回 0 表示客 main 可随即返回。
-int SBHookedUIApplicationMain(int argc, char *argv[],
+/// argv 用 UIKit 原签名的可空标注（char * _Nullable * _Nullable），与
+/// Swift 侧替身的 argv 类型逐字对应（0.2.30 fixup 1：`char *argv[]` 桥接
+/// 成内层非可选指针，Swift 侧 `UnsafeMutablePointer<CChar>?>?` 传不过去，
+/// run 44772015671 红于此）。
+int SBHookedUIApplicationMain(int argc, char * _Nullable * _Nullable argv,
                               NSString * _Nullable principalClassName,
                               NSString * _Nullable delegateClassName);
 
