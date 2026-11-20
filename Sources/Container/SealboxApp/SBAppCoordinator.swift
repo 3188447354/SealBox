@@ -247,11 +247,11 @@ final class SBAppCoordinator: ObservableObject {
 
     init() {
         activationFailedObserver = NotificationCenter.default.addObserver(
-            forName: Notification.Name(rawValue: SBGuestActivationFailedNotification as String),
+            forName: SBGuestActivationFailedNotification,
             object: nil, queue: .main
         ) { [weak self] note in
             guard let self else { return }
-            let message = note.userInfo?[SBGuestActivationFailedMessageKey as String] as? String
+            let message = note.userInfo?[SBGuestActivationFailedMessageKey] as? String
                 ?? "客 App 启动失败"
             SBDiagLog.log("启动失败弹窗：客 App 激活失败（\(message)）")
             self.activeAlert = CoordinatorAlert(title: "启动失败", message: message)
@@ -298,7 +298,7 @@ final class SBAppCoordinator: ObservableObject {
         // 恢复失败（上下文重上失败）弹错并停住；返回 false（无会话）时落到首次加载。
         if SBGuestSessionManager.shared().session(forBundleID: app.bundleID) != nil {
             do {
-                if try SBGuestSessionManager.shared().resumeGuest(withBundleID: app.bundleID) {
+                if try SBGuestSessionManager.shared().resumeGuest(withBundleID: app.bundleID) != nil {
                     SBDiagLog.log("点图标：\(app.bundleID) 已在后台，恢复进入（未重加载）")
                     return
                 }
@@ -432,7 +432,6 @@ final class SBAppCoordinator: ObservableObject {
             }
         }
         launchStage = "证书检查"
-        let bundleID = app.bundleID
         SBGuestLoader.shared().requestGuestLaunch(
             withBundleID: app.bundleID,
             containerUUID: app.containerUUID,

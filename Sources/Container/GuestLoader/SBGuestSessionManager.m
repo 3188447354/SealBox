@@ -476,9 +476,9 @@ static const NSTimeInterval SBGuestSceneSystemPathWaitSeconds = 0.4;
 
 #pragma mark - 恢复 / 回后台
 
-- (BOOL)resumeGuestWithBundleID:(NSString *)bundleID error:(NSError **)error {
+- (nullable SBGuestSession *)resumeGuestWithBundleID:(NSString *)bundleID error:(NSError **)error {
     if (![NSThread isMainThread]) {
-        __block BOOL result = NO;
+        __block SBGuestSession *result = nil;
         __block NSError *blockError = nil;
         dispatch_sync(dispatch_get_main_queue(), ^{
             result = [self resumeGuestWithBundleID:bundleID error:&blockError];
@@ -490,10 +490,10 @@ static const NSTimeInterval SBGuestSceneSystemPathWaitSeconds = 0.4;
     }
     SBGuestSession *session = self.sessions[bundleID];
     if (!session || !session.loaded) {
-        return NO; // 未加载过——调用方走首次加载。
+        return nil; // 未加载过——调用方走首次加载（无错，Swift 侧得 nil 不抛错）。
     }
     if (session.active && [self.currentBundleID isEqualToString:bundleID]) {
-        return YES; // 已在前台，无事可做。
+        return session; // 已在前台，无事可做。
     }
     SBGuestSession *current = [self currentSession];
     if (current && current.active && ![current.bundleID isEqualToString:bundleID]) {
@@ -512,7 +512,7 @@ static const NSTimeInterval SBGuestSceneSystemPathWaitSeconds = 0.4;
         if (error) {
             *error = contextError;
         }
-        return NO;
+        return nil;
     }
     session.guestBundle = guestBundle;
     [self saveHostStateIfNeeded];
@@ -529,7 +529,7 @@ static const NSTimeInterval SBGuestSceneSystemPathWaitSeconds = 0.4;
                     bundleID] UTF8String]);
     [[NSNotificationCenter defaultCenter] postNotificationName:SBGuestDidEnterForegroundNotification
                                                         object:nil];
-    return YES;
+    return session;
 }
 
 - (void)backgroundCurrentGuest {
