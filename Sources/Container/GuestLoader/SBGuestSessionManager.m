@@ -8,6 +8,8 @@
 // 进宿主界面（不跨进程恢复）。
 #import "SBGuestSessionManager.h"
 
+#import <objc/message.h>
+
 #import "SBGuestBootstrap.h"
 #import "SBGuestLoader.h"
 #import "SBDiagLog.h"
@@ -263,9 +265,18 @@ static const NSTimeInterval SBGuestSceneSystemPathWaitSeconds = 0.4;
         return;
     }
     UISceneSession *sceneSession = scene.session;
-    // 空 options（alloc/init 造，非 nil）：Swift 写的 scene delegate 若强解
-    // options 不会崩；读 userActivities/URL 上下文只会拿到空值。
-    UISceneConnectionOptions *options = [[UISceneConnectionOptions alloc] init];
+    // 空 options：UISceneConnectionOptions 的 -init 被标 NS_UNAVAILABLE
+    //（只有系统才造它），但实现仍在——NS_UNAVAILABLE 只是编译期标记，
+    // 用 objc_msgSend 绕过它直接调运行时 -init（0.2.27 fixup 5，
+    // run 44733218725 红于 [[alloc] init]）。得一个非 nil 的空对象：
+    // Swift 写的 scene delegate 若强解 options 不会崩；读
+    // userActivities/URL 上下文只会拿到空值。造不出时直接判激活失败，
+    // 不把 nil options 传给 delegate。
+    UISceneConnectionOptions *options = ((id (*)(id, SEL))objc_msgSend)([UISceneConnectionOptions alloc], @selector(init));
+    if (!options) {
+        [self failActivationForSession:session message:@"无法创建 scene 连接选项"];
+        return;
+    }
     UIApplication *app = [UIApplication sharedApplication];
     UISceneConfiguration *config = nil;
     id delegate = session.guestAppDelegate;
@@ -498,14 +509,19 @@ static const NSTimeInterval SBGuestSceneSystemPathWaitSeconds = 0.4;
     }
     // 重上客上下文（Bundle 伪装/可执行路径/进程身份/HOME/env）：hook 件按
     // 环境变量与当前 HOME 工作，恢复时必须重设为该客的值。
+    // applyGuestContext 返回 BOOL、Bundle 由 guestBundleOut 回填（0.2.27
+    // fixup 5：此前调用方错当成返回 NSBundle 且漏 guestBundleOut，
+    // run 44733218725 红于此）。
     NSError *contextError = nil;
-    NSBundle *guestBundle = [SBGuestBootstrap applyGuestContextForBundleID:bundleID
-                                                              guestAppPath:session.guestAppPath
-                                                             guestExecPath:session.guestExecPath
-                                                             containerPath:session.containerPath
-                                                             keychainGroup:session.keychainGroup
-                                                                     error:&contextError];
-    if (!guestBundle) {
+    NSBundle *guestBundle = nil;
+    BOOL contextOK = [SBGuestBootstrap applyGuestContextForBundleID:bundleID
+                                                       guestAppPath:session.guestAppPath
+                                                      guestExecPath:session.guestExecPath
+                                                      containerPath:session.containerPath
+                                                      keychainGroup:session.keychainGroup
+                                                              error:&contextError
+                                                   guestBundleOut:&guestBundle];
+    if (!contextOK) {
         self.lastResumeError = contextError;
         return nil;
     }
