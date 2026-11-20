@@ -767,7 +767,15 @@ public enum SBInstaller {
                 guard await SBCertificate.ensureHooksDylibSigned() else {
                     throw SBError.signFailed(reason: SBCertificate.hooksSignFailureReason)
                 }
-                SBDiagLog.log("签名修复门：\(record.bundleID) 注入件已修好（内核验签通过）")
+                // 0.2.23：静态与门分开报——ensureHooksDylibSigned 只要静态
+                // 通过就返回 true（0.2.21 规则：门只记诊断不拦启动），直接写
+                // “内核验签通过”是假的（0.2.22 真机 15:38:24：上面几行明明是
+                // 门 F_ADDFILESIGS_RETURN errno=1）。门仍拒时明确写未修好。
+                if SBCertificate.hooksKernelGatePassed() {
+                    SBDiagLog.log("签名修复门：\(record.bundleID) 注入件已修好（静态通过，内核验签通过）")
+                } else {
+                    SBDiagLog.log("签名修复门：\(record.bundleID) 注入件未修好（静态通过、内核门仍拒，按 0.2.21 规则不拦启动）")
+                }
                 if detailValid {
                     try verifyExecutableSignature(executablePath, bundleID: record.bundleID, checkTeam: true)
                     return record

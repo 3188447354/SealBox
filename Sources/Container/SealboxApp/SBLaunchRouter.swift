@@ -21,7 +21,10 @@ enum SBLaunchRouter {
     /// 它可能带好签名，门+重签路径会在原地修它；包内件代码自 0.2.6
     /// 起没换过（0.2.17/0.2.18 两版 IPA 的包内件字节相同，
     /// md5 742fe5a5f18ef242b0c90c1467e7b935），不覆盖不会留旧代码。
-    static func ensureGuestHooksDylib() {
+    /// - Returns: 本次是否拷过种子。0.2.23：performEnsureHooksDylibSigned
+    ///   拿它当强制重签的触发条件之一（刚拷的种子一律 ZSign 重签）。
+    @discardableResult
+    static func ensureGuestHooksDylib() -> Bool {
         let fileManager = FileManager.default
         let documentsURL = SBConstants.documentsURL
         let tweaksDir = documentsURL.appendingPathComponent(SBConstants.tweaksDirectoryName)
@@ -30,9 +33,10 @@ enum SBLaunchRouter {
             .appendingPathComponent("Frameworks")
             .appendingPathComponent(SBConstants.guestHooksDylibName)
         guard fileManager.fileExists(atPath: embedded.path),
-              let embeddedData = try? Data(contentsOf: embedded) else { return }
+              let embeddedData = try? Data(contentsOf: embedded) else { return false }
         let embeddedHash = SHA256.hash(data: embeddedData).map { String(format: "%02x", $0) }.joined()
         let defaults = UserDefaults(suiteName: SBConstants.appGroupSuiteName)
+        var didCopy = false
         do {
             try fileManager.createDirectory(at: tweaksDir, withIntermediateDirectories: true)
             let destExists = fileManager.fileExists(atPath: destination.path)
@@ -46,12 +50,14 @@ enum SBLaunchRouter {
                     try? fileManager.removeItem(at: destination)
                 }
                 try fileManager.copyItem(at: embedded, to: destination)
+                didCopy = true
             }
             defaults?.set(embeddedHash, forKey: hooksSyncedHashKey)
         } catch {
             // 拷不过去不拦启动：加载客 App 时 bootstrap 会报缺件。
             NSLog("[Sealbox] SBGuestHooks.dylib 同步到 Tweaks 失败：%@", error.localizedDescription)
         }
+        return didCopy
     }
 
     /// 0.2.9：启动时对账——记录在 App Group UserDefaults 里，包在宿主自己的

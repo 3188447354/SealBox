@@ -457,12 +457,17 @@ public enum SBCertificate {
             return false
         }
         // 先保证 Tweaks 里有件（0.2.19：按包内件哈希同步，不再按大小覆盖——已签好的件不再被抹掉）。
-        SBLaunchRouter.ensureGuestHooksDylib()
+        // 0.2.23：返回值记下来——刚拷的种子一律 ZSign 重签（触发条件之一）。
+        let freshlySeeded = SBLaunchRouter.ensureGuestHooksDylib()
         let tweaksURL = SBConstants.tweaksHookDylibURL(documentsURL: SBConstants.documentsURL)
         guard FileManager.default.fileExists(atPath: tweaksURL.path) else {
             SBDiagLog.log("注入件签名检查失败：注入件不在磁盘 \(tweaksURL.path)")
             return false
         }
+        // 0.2.23：逐项日志（与客验签同款格式），下一份日志直接分出 Seal 件
+        // 还是 ZSign 件：identifier、超块尺寸、CD ver/flags/哈希类型都在里面。
+        let hooksDetail = SBCodesignCheck.signatureDetail(atPath: tweaksURL.path)
+        SBDiagLog.log("注入件签名检查：\(tweaksURL.path) \(SBInstaller.signatureDetailFields(detail: hooksDetail))")
         // 0.2.21：注入件的放行判据改回静态验签＋Team，内核门只记诊断、不再拦启动。
         // 证据：0.2.20 真机（22:46:02）门在 F_ADDFILESIGS_RETURN 死 errno=1
         // （EPERM），0.2.19 同样；三个签名（Seal/CodeSignKit、ZSign 单后缀、
@@ -479,7 +484,15 @@ public enum SBCertificate {
         // 下一份日志直接分出是路径、entitlements 还是件本身。
         let hooksBundleID = Bundle.main.bundleIdentifier ?? "com.mjorb.sealbox"
         let firstGate = kernelGateDetail(path: tweaksURL.path)
-        if hooksStaticValid(at: tweaksURL, teamID: certTeamID) {
+        // 0.2.23：Tweaks 件强制走 ZSign 重签。0.2.22 真机（15:38:21）证明
+        // 静态通过的 Seal 件加载时被内核拒（code signature invalid errno=1，
+        // UUID 2E6580AA…与 0.2.17 同款），而 ZSign 签的件从没走到过加载那
+        // 一步——0.2.18/0.2.19/0.2.20 是门在前面拦着，0.2.21 死在 libqemu
+        // 上。刚拷的种子一律重签；盘上件 identifier/超块不是 ZSign 形也重签
+        // （hooksNeedsResign）。放行判据不变（静态验签＋Team），重签只是
+        // 修复手段，不是放行条件。
+        let needsResign = freshlySeeded || hooksNeedsResign(detail: hooksDetail, bundleID: hooksBundleID)
+        if hooksStaticValid(at: tweaksURL, teamID: certTeamID) && !needsResign {
             if firstGate.passed {
                 SBDiagLog.log("注入件签名检查：内核验签通过 Team=\(certTeamID)（\(tweaksURL.path)，未重签）")
             } else {
@@ -490,7 +503,13 @@ public enum SBCertificate {
             }
             return true
         }
-        SBDiagLog.log("注入件签名检查：静态验签不通过或 Team 不一致，用当前证书重签注入件（bundleID=\(hooksBundleID) Team=\(certTeamID)）\(firstGate.scene)")
+        if needsResign {
+            let identifier = hooksDetail["identifier"] as? String ?? ""
+            let superblobLength = (hooksDetail["superblobLength"] as? NSNumber)?.intValue ?? 0
+            SBDiagLog.log("注入件签名检查：强制 ZSign 重签注入件（刚拷种子=\(freshlySeeded ? "是" : "否") identifier=\(identifier.isEmpty ? "无" : identifier) 超块=0x\(String(superblobLength, radix: 16)) bundleID=\(hooksBundleID) Team=\(certTeamID)）")
+        } else {
+            SBDiagLog.log("注入件签名检查：静态验签不通过或 Team 不一致，用当前证书重签注入件（bundleID=\(hooksBundleID) Team=\(certTeamID)）\(firstGate.scene)")
+        }
         // 0.2.21：直接传宿主 Bundle ID 原值。0.2.20 在它后面又拼了一次
         // ".Team"，写成双后缀 com.mjorb.sealbox.3432ZHJUF9.3432ZHJUF9——
         // 真机上 Bundle.main.bundleIdentifier 本身就是带后缀的
@@ -535,6 +554,30 @@ public enum SBCertificate {
         let detail = SBCodesignCheck.signatureDetail(atPath: url.path)
         let valid = (detail["valid"] as? NSNumber)?.boolValue ?? false
         return valid && teamIDOfSignedMachO(at: url) == teamID
+    }
+
+    /// 0.2.23：Tweaks 件是不是 ZSign 签的形。ZSign 一定把 identifier 写成
+    /// 传入的 bundleID、超块约 0x1a18（0.2.19 实测 6680）；Seal 签的件超块
+    /// 0x14D0（0.2.22 真机：codeBlobOffset 0x18AD0 + codeBlobSize 0x14D0
+    /// = 0x19FA0 = 106400）、identifier 不是我们的 bundleID。任一不符即
+    /// 重签；无签名（identifier 读不到、超块 0）也重签。阈值 0x1800 取
+    /// 两者之间（Seal 5328 < 6144 < 6680 ZSign），原型 29/29（见
+    /// ~/workspace/tmp-sb0223verify/hooks_resign_prototype_0223.py）。
+    private static func hooksNeedsResign(detail: [AnyHashable: Any], bundleID: String) -> Bool {
+        let identifier = detail["identifier"] as? String ?? ""
+        let superblobLength = (detail["superblobLength"] as? NSNumber)?.intValue ?? 0
+        if identifier != bundleID { return true }
+        if superblobLength < 0x1800 { return true }
+        return false
+    }
+
+    /// 0.2.23：Tweaks 注入件的内核门当前是否通过（诊断用，不拦启动）。
+    /// 修复门（SBInstaller.ensureLaunchableSignature）拿它核对“修好”的
+    /// 说法——0.2.22 真机（15:38:24）把静态通过报成“内核验签通过”，
+    /// 紧挨着的上面几行明明是门 F_ADDFILESIGS_RETURN errno=1。
+    static func hooksKernelGatePassed() -> Bool {
+        let tweaksURL = SBConstants.tweaksHookDylibURL(documentsURL: SBConstants.documentsURL)
+        return kernelGateDetail(path: tweaksURL.path).passed
     }
 
     /// 0.2.21：门对照诊断（只在内核门对 Tweaks 件不通过时跑，诊断用、不拦启动）：
