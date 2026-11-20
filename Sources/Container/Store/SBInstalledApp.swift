@@ -81,6 +81,11 @@ struct SBInstalledApp: Codable, Identifiable, Equatable {
     /// 旧记录（无此键）解码时为 nil，不编造。
     var sourceIPAFileName: String?
 
+    /// 客 UI 类型（0.2.28：安装时按符号表分型，@"uikit"/@"swiftui"/@"flutter"/
+    /// @"unknown"；旧记录（无此键）解码为 nil，启动时从磁盘文件现算，启动分流
+    /// 以现算为准，记录里的值只作展示/诊断）。
+    var uiType: String?
+
     init(recordID: UUID = UUID(),
          bundleID: String,
          displayName: String,
@@ -99,7 +104,8 @@ struct SBInstalledApp: Codable, Identifiable, Equatable {
          signingCertFingerprint: String? = nil,
          needsReimport: Bool = false,
          diskDirectoryName: String? = nil,
-         sourceIPAFileName: String? = nil) {
+         sourceIPAFileName: String? = nil,
+         uiType: String? = nil) {
         self.recordID = recordID
         self.bundleID = bundleID
         self.displayName = displayName
@@ -119,6 +125,7 @@ struct SBInstalledApp: Codable, Identifiable, Equatable {
         self.needsReimport = needsReimport
         self.diskDirectoryName = diskDirectoryName ?? (bundleID + ".app")
         self.sourceIPAFileName = sourceIPAFileName
+        self.uiType = uiType
     }
 
     enum CodingKeys: String, CodingKey {
@@ -126,7 +133,7 @@ struct SBInstalledApp: Codable, Identifiable, Equatable {
         case executableName, containerUUID, keychainGroup, installedDate
         case patchRevision, signed, needsJIT, segCountMismatch, entryOffset, lastLaunchResult
         case signingCertFingerprint, needsReimport, diskDirectoryName
-        case sourceIPAFileName
+        case sourceIPAFileName, uiType
     }
 
     init(from decoder: Decoder) throws {
@@ -151,6 +158,7 @@ struct SBInstalledApp: Codable, Identifiable, Equatable {
         needsReimport = try container.decodeIfPresent(Bool.self, forKey: .needsReimport) ?? false
         diskDirectoryName = try container.decode(String.self, forKey: .diskDirectoryName)
         sourceIPAFileName = try container.decodeIfPresent(String.self, forKey: .sourceIPAFileName)
+        uiType = try container.decodeIfPresent(String.self, forKey: .uiType)
     }
 
     var bundleURL: URL {

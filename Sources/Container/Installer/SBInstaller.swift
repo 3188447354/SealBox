@@ -236,6 +236,8 @@ public enum SBInstaller {
             // ---- 登记入库 ----
             // 替换复用旧记录的 recordID（upsert 按 recordID 匹配，原位更新）；
             // 平行 / 全新安装用新 UUID（两条同名记录共存）。
+            // 0.2.28：安装时按符号表定客 UI 类型，记入安装记录（启动分流以现算为准）。
+            let uiType = SBGuestUITypeToString(SBGuestUITypeForGuestExecutable(executablePath))
             let record = SBInstalledApp(
                 recordID: existing?.recordID ?? UUID(),
                 bundleID: parsed.bundleID,
@@ -254,7 +256,8 @@ public enum SBInstaller {
                 lastLaunchResult: nil,
                 signingCertFingerprint: signingCertFingerprint,
                 diskDirectoryName: destinationDir.lastPathComponent,
-                sourceIPAFileName: parsed.sourceIPAFileName
+                sourceIPAFileName: parsed.sourceIPAFileName,
+                uiType: uiType
             )
             SBStore.shared.upsertApp(record)
 
@@ -463,7 +466,8 @@ public enum SBInstaller {
             signingCertFingerprint: signingCertFingerprint,
             needsReimport: record.needsReimport,
             diskDirectoryName: record.diskDirectoryName,
-            sourceIPAFileName: record.sourceIPAFileName
+            sourceIPAFileName: record.sourceIPAFileName,
+            uiType: record.uiType
         )
         SBStore.shared.upsertApp(updated)
         return updated

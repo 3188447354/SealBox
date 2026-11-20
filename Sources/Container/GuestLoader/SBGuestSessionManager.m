@@ -485,6 +485,137 @@ static const NSTimeInterval SBGuestSceneSystemPathWaitSeconds = 0.4;
     return YES;
 }
 
+#pragma mark - SwiftUI 嵌客激活（0.2.28）
+
+- (BOOL)activateSwiftUIGuestWithContext:(SBGuestMainHookContext *)context
+                      hostingController:(UIViewController *)hostingController
+                            appInstance:(nullable id)appInstance
+                            appDelegate:(nullable id)appDelegate
+                                  error:(NSError **)error {
+    if (![NSThread isMainThread]) {
+        __block BOOL result = NO;
+        __block NSError *blockError = nil;
+        dispatch_sync(dispatch_get_main_queue(), ^{
+            result = [self activateSwiftUIGuestWithContext:context
+                                         hostingController:hostingController
+                                               appInstance:appInstance
+                                               appDelegate:appDelegate
+                                                     error:&blockError];
+        });
+        if (error) {
+            *error = blockError;
+        }
+        return result;
+    }
+    if (!hostingController) {
+        if (error) {
+            *error = SBGuestLoaderErrorMake(SBGuestLoaderErrorGuestLoadFailed, @"加载客 App",
+                                            @"SwiftUI 嵌客未建出 UIHostingController",
+                                            @"请重试，或重新导入该应用");
+        }
+        return NO;
+    }
+    if (self.sessions[context.bundleID]) {
+        // 首次加载不应撞上已有会话——点图标应先走恢复路径；撞上了是接线错，干净失败。
+        if (error) {
+            *error = SBGuestLoaderErrorMake(SBGuestLoaderErrorGuestLoadFailed, @"加载客 App",
+                                            @"该应用已在后台，请从桌面恢复进入",
+                                            @"请重试");
+        }
+        return NO;
+    }
+    // 另一客在前台：先让它回后台（藏窗、换出 delegate），再上新客。
+    SBGuestSession *current = [self currentSession];
+    if (current && current.active && ![current.bundleID isEqualToString:context.bundleID]) {
+        [self backgroundCurrentGuest];
+    }
+    [self saveHostStateIfNeeded];
+    UIApplication *app = [UIApplication sharedApplication];
+
+    SBGuestSession *session = [[SBGuestSession alloc] init];
+    session.bundleID = context.bundleID;
+    session.containerUUID = context.containerUUID;
+    session.diskDirectoryName = context.diskDirectoryName;
+    session.keychainGroup = context.keychainGroup;
+    session.guestAppPath = context.guestAppPath;
+    session.guestExecPath = context.guestExecPath;
+    session.containerPath = context.containerPath;
+    session.guestHandle = context.guestHandle;
+    session.guestBundle = context.guestBundle;
+    session.guestSwiftUIApp = appInstance;
+    session.guestHostingController = hostingController;
+    if (appDelegate) {
+        session.guestAppDelegate = appDelegate;
+    }
+    session.guestScene = self.hostScene;
+    session.windowsBeforeActivation = [NSSet setWithArray:app.windows];
+    session.loaded = YES;
+    session.active = NO; // 窗口建好后才置 YES。
+    self.sessions[context.bundleID] = session;
+    self.currentBundleID = context.bundleID;
+
+    // adaptor delegate：有才换上并调 didFinishLaunching（无 adaptor 时不碰
+    // app.delegate——宿主 delegate 必须留着，置 nil 会丢）。
+    if (appDelegate) {
+        SBDiagLogLine([[NSString stringWithFormat:@"进程内进客（SwiftUI）：%@ 有 @UIApplicationDelegateAdaptor，换上客 delegate %@",
+                        context.bundleID, NSStringFromClass([appDelegate class])] UTF8String]);
+        app.delegate = appDelegate;
+        if ([appDelegate respondsToSelector:@selector(application:didFinishLaunchingWithOptions:)]) {
+            @try {
+                [appDelegate application:app didFinishLaunchingWithOptions:nil];
+            } @catch (NSException *exception) {
+                SBDiagLogLine([[NSString stringWithFormat:@"进程内进客（SwiftUI）：%@ didFinishLaunching 抛异常（%@），恢复宿主",
+                                context.bundleID, exception.reason] UTF8String]);
+                [self.sessions removeObjectForKey:context.bundleID];
+                self.currentBundleID = nil;
+                [self restoreHostUI];
+                [SBGuestBootstrap restoreHostContext];
+                if (error) {
+                    *error = SBGuestLoaderErrorMake(SBGuestLoaderErrorGuestLoadFailed, @"加载客 App",
+                                                    [NSString stringWithFormat:@"客 App 启动失败（%@）", exception.reason ?: @"未知原因"],
+                                                    @"请重试，或重新导入该应用");
+                }
+                return NO;
+            }
+        }
+    } else {
+        SBDiagLogLine([[NSString stringWithFormat:@"进程内进客（SwiftUI）：%@ 无 @UIApplicationDelegateAdaptor，不换 app.delegate",
+                        context.bundleID] UTF8String]);
+    }
+    // 在宿主 scene 上建客窗口（rootViewController=hosting），与 UIKit 客
+    // 的窗口/scene 一致处理（侧滑回宿主藏窗、多客后台保留都复用同一套）。
+    UIWindowScene *scene = self.hostScene;
+    if (!scene) {
+        [self.sessions removeObjectForKey:context.bundleID];
+        self.currentBundleID = nil;
+        [self restoreHostUI];
+        [SBGuestBootstrap restoreHostContext];
+        if (error) {
+            *error = SBGuestLoaderErrorMake(SBGuestLoaderErrorGuestLoadFailed, @"加载客 App",
+                                            @"找不到宿主 scene，无法为客 App 创建窗口",
+                                            @"请重试");
+        }
+        return NO;
+    }
+    UIWindow *guestWindow = [[UIWindow alloc] initWithWindowScene:scene];
+    guestWindow.rootViewController = hostingController;
+    guestWindow.hidden = NO;
+    [guestWindow makeKeyAndVisible];
+    session.guestWindow = guestWindow;
+    session.guestScene = scene;
+    session.active = YES;
+    self.currentBundleID = context.bundleID;
+    SBDiagLogLine([[NSString stringWithFormat:@"进程内进客（SwiftUI）：%@ 已激活（客窗 %@，UIHostingController 根视图）",
+                    context.bundleID, NSStringFromCGRect(guestWindow.frame)] UTF8String]);
+    // 激活即证明启动成功：记成功、护栏归零（与 UIKit 客 completeActivation 同款）。
+    [SBGuestLaunchPreflight noteGuestActivatedInProcessWithBundleID:session.bundleID
+                                                      containerUUID:session.containerUUID
+                                                  diskDirectoryName:session.diskDirectoryName];
+    [[NSNotificationCenter defaultCenter] postNotificationName:SBGuestDidEnterForegroundNotification
+                                                        object:nil];
+    return YES;
+}
+
 #pragma mark - 恢复 / 回后台
 
 - (nullable SBGuestSession *)resumeGuestWithBundleID:(NSString *)bundleID {
@@ -528,7 +659,11 @@ static const NSTimeInterval SBGuestSceneSystemPathWaitSeconds = 0.4;
     session.guestBundle = guestBundle;
     [self saveHostStateIfNeeded];
     UIApplication *app = [UIApplication sharedApplication];
-    app.delegate = session.guestAppDelegate;
+    // 0.2.28：SwiftUI 嵌客无 adaptor 时 guestAppDelegate 为 nil，置 nil 会
+    // 丢宿主 delegate；只在非空时换。UIKit 客恒有 delegate，行为不变。
+    if (session.guestAppDelegate) {
+        app.delegate = session.guestAppDelegate;
+    }
     if (session.guestSceneDelegate && session.guestScene) {
         session.guestScene.delegate = session.guestSceneDelegate;
     }

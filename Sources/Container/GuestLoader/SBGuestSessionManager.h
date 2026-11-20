@@ -49,6 +49,11 @@ extern NSString * const SBGuestActivationFailedMessageKey;
 @property (nonatomic, strong, nullable) NSBundle *guestBundle;
 @property (nonatomic, strong, nullable) id guestAppDelegate;
 @property (nonatomic, strong, nullable) id guestSceneDelegate;
+/// 0.2.28：SwiftUI 嵌客的 App 实例（any App，经 SwiftValue 装箱持有；
+/// StateObject 等状态要活着，会话持有它）与 UIHostingController。
+/// UIKit/Flutter 客这两项为 nil。
+@property (nonatomic, strong, nullable) id guestSwiftUIApp;
+@property (nonatomic, strong, nullable) UIViewController *guestHostingController;
 @property (nonatomic, strong, nullable) UIWindow *guestWindow;
 @property (nonatomic, weak, nullable) UIWindowScene *guestScene;
 /// 激活前已有的窗口集合（找客窗时排除；浮层窗口在 dlopen 时已建，故在集合内）。
@@ -93,6 +98,17 @@ extern NSString * const SBGuestActivationFailedMessageKey;
               principalClassName:(nullable NSString *)principalClassName
                delegateClassName:(nullable NSString *)delegateClassName
                            error:(NSError **)error;
+
+/// SwiftUI 嵌客激活入口（SBSwiftUIEmbed 调）：App 实例与 UIHostingController
+// 已由 Swift 侧建好，这里只做会话侧的事——建会话、保存宿主 delegate/窗口、
+// 有 adaptor delegate 时才换上并调 didFinishLaunching（无 adaptor 时不碰
+// app.delegate）、在宿主 scene 上建客窗口（rootViewController=hosting）、
+// 记成功、发进前台通知。同步完成，窗口立即可见；失败返回 NO 且 error 置中文原因。
+- (BOOL)activateSwiftUIGuestWithContext:(SBGuestMainHookContext *)context
+                      hostingController:(UIViewController *)hostingController
+                            appInstance:(nullable id)appInstance
+                            appDelegate:(nullable id)appDelegate
+                                  error:(NSError **)error;
 
 @end
 

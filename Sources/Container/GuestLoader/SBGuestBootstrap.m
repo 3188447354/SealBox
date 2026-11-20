@@ -12,6 +12,8 @@
 #import "SBGuestLoader.h"
 #import "SBGuestMainHook.h"
 #import "SBGuestSessionManager.h"
+#import "SBGuestUIClassifier.h"
+#import "SBSwiftUIAppMainHook.h"
 #import "SBDiagLog.h"
 #import "SBBundleSpoof.h"
 #import "SBExecPathHook.h"
@@ -692,7 +694,11 @@ static void SBDiagLogGuestFail(SBGuestLoaderErrorCode code, NSString *bundleID, 
 // dlsym 软依赖：找不到（旧注入件）时只记一行日志，不拦加载。
     SBCallGuestHooksInstallForGuest();
 
-    // 0.2.27：进程内加载——dlopen 后、跳 main 前装好 UIApplicationMain 拦截。
+    // 0.2.28：进程内加载——dlopen 后、跳 main 前按客 UI 类型装拦截。
+    // SwiftUI 客装 App.main 重绑（跳原入口必崩，改嵌 App 场景）；装不上
+    // 直接干净失败，不跳 main。UIKit/Flutter 客走 0.2.27 的
+    // UIApplicationMain 拦截，不动。
+    BOOL isSwiftUIGuest = NO;
     if (inProcess) {
         SBGuestMainHookContext *hookContext = [[SBGuestMainHookContext alloc] init];
         hookContext.bundleID = bundleID;
@@ -704,7 +710,26 @@ static void SBDiagLogGuestFail(SBGuestLoaderErrorCode code, NSString *bundleID, 
         hookContext.containerPath = containerPath;
         hookContext.guestHandle = guestHandle;
         hookContext.guestBundle = guestBundle;
-        SBGuestMainHookInstallForGuestImage(NULL, hookContext);
+        SBGuestUIType uiType = SBGuestUITypeForGuestExecutable(guestExecPath);
+        if (uiType == SBGuestUITypeSwiftUI) {
+            isSwiftUIGuest = YES;
+            SBDiagLogLine([[NSString stringWithFormat:@"客加载：%@ 是 SwiftUI 应用，装 App.main 重绑（嵌 App 场景，不跳原入口）",
+                            bundleID] UTF8String]);
+            if (!SBSwiftUIAppMainHookInstallForGuestImage(NULL, hookContext)) {
+                // 护栏：重绑装不上 → 干净失败，记日志＋弹错，绝不跳 main。
+                [self restoreHostContext];
+                if (error) {
+                    *error = SBGuestLoaderErrorMake(SBGuestLoaderErrorGuestLoadFailed, @"加载客 App",
+                                                    @"该应用是 SwiftUI 应用，暂不支持进程内启动",
+                                                    @"该应用暂不支持在虚拟机内打开，请等待后续版本");
+                }
+                SBDiagLogLine([[NSString stringWithFormat:@"客加载失败：%@ SwiftUI 应用，App.main 重绑未装上（护栏干净失败）",
+                                bundleID] UTF8String]);
+                return NO;
+            }
+        } else {
+            SBGuestMainHookInstallForGuestImage(NULL, hookContext);
+        }
     }
 
     // —— 8. 取入口并跳入客 main ————————————————————————————————
@@ -750,11 +775,30 @@ static void SBDiagLogGuestFail(SBGuestLoaderErrorCode code, NSString *bundleID, 
     char *guestArgv[] = { (char *)[guestExecPath UTF8String], NULL };
     int guestResult = guestMain(1, guestArgv, environ);
 
-    // 客 App 的 main 返回了。分三种（0.2.27）：
+    // 客 App 的 main 返回了。分四种（0.2.27 三种＋0.2.28 SwiftUI 一种）：
     // ① 进程内 + hook 已激活：main 返回≠退出（hook 返回 0 即回），客在前台运行，
     //    不恢复环境、不清收据、不记成功（激活时会话侧已记），直接返回 YES。
     // ② 进程内 + hook 同步激活失败：按加载失败返回（error 已由 hook 置好），恢复环境。
-    // ③ 其余（新鲜进程真退出 / 客 main 未调 UIApplicationMain 即返回）：恢复伪装、清掉启动标记，记成功。
+    // ③ 进程内 SwiftUI 客：嵌客激活→YES（同①）；未激活→失败（嵌入失败用
+    //    hook 的错；main 返回而 hook 未触发、无错——静默无操作不是成功——
+    //    也按失败处理，护栏文案），恢复环境。
+    // ④ 其余（新鲜进程真退出 / 客 main 未调 UIApplicationMain 即返回）：恢复伪装、清掉启动标记，记成功。
+    // 0.2.28：SwiftUI 客 main 返回后的分流（在 UIKit 分流之前）。
+    if (inProcess && isSwiftUIGuest) {
+        if (SBSwiftUIAppMainHookDidActivate()) {
+            SBDiagLogLine([[NSString stringWithFormat:@"客 main 已返回（SwiftUI 嵌客已激活，%@ 在前台运行，不恢复环境）", bundleID] UTF8String]);
+            return YES;
+        }
+        NSError *swiftUIError = SBSwiftUIAppMainHookActivationError();
+        [self restoreHostContext];
+        SBDiagLogLine([[NSString stringWithFormat:@"客加载失败：%@ SwiftUI 嵌客未激活（%@）", bundleID, swiftUIError.localizedDescription ?: @"main 返回而 hook 未触发"] UTF8String]);
+        if (error) {
+            *error = swiftUIError ?: SBGuestLoaderErrorMake(SBGuestLoaderErrorGuestLoadFailed, @"加载客 App",
+                                                            @"该应用是 SwiftUI 应用，暂不支持进程内启动",
+                                                            @"该应用暂不支持在虚拟机内打开，请等待后续版本");
+        }
+        return NO;
+    }
     if (inProcess && SBGuestMainHookDidActivate()) {
         SBDiagLogLine([[NSString stringWithFormat:@"客 main 已返回（进程内拦截已激活，%@ 在前台运行，不恢复环境）", bundleID] UTF8String]);
         return YES;
