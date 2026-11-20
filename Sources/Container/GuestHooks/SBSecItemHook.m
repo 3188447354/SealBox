@@ -206,7 +206,7 @@ void SBSecItemHookInstall(void) {
             (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
             (__bridge id)kSecAttrAccount: @"NonExistentKey",
             (__bridge id)kSecAttrService: @"NonExistentService",
-            (__bridge id)kSecAttrAccessGroup: (__bridge id)SBGuestKeychainGroupName(),
+            (__bridge id)kSecAttrAccessGroup: SBGuestKeychainGroupName(),
             (__bridge id)kSecReturnData: @NO
         };
         OSStatus probeStatus = SecItemCopyMatching((__bridge CFDictionaryRef)probeQuery, NULL);
