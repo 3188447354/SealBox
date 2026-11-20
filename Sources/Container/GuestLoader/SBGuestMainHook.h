@@ -33,7 +33,9 @@ BOOL SBGuestMainHookDidActivate(void);
 
 /// 同步激活失败的原因（hook 触发但激活失败时置；未触发或成功时为 nil）。
 /// bootstrap 在 main 返回后读到它即按加载失败返回。
-nullable NSError *SBGuestMainHookActivationError(void);
+/// 注：C 函数返回值不能用 leading 的 `nullable`（Clang 只认方法/属性里的
+/// nullable），须用 `_Nullable`（0.2.27 fixup 3，run 44731393741 红于此）。
+NSError * _Nullable SBGuestMainHookActivationError(void);
 
 /// 每次跳 main 前复位激活状态（由 bootstrap 调）。
 void SBGuestMainHookResetActivationState(void);

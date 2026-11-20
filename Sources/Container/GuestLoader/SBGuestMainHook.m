@@ -26,7 +26,7 @@ BOOL SBGuestMainHookDidActivate(void) {
     return g_hookDidActivate;
 }
 
-nullable NSError *SBGuestMainHookActivationError(void) {
+NSError * _Nullable SBGuestMainHookActivationError(void) {
     return g_hookActivationError;
 }
 
