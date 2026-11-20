@@ -9,7 +9,7 @@
 // LCBootstrap.m），没选才 dlopen LiveContainerSwiftUI 跑宿主界面。客 main
 // 返回后 LC 记错并退出，不进宿主 UI。
 //
-// SealBox 的点图标重启本来就是重起进程（收据 + sealbox-launch:// URL +
+// SealBox 的点图标启动 0.2.26 是重起进程（收据 + sealbox-launch:// URL +
 // exit(0)），缺的只是“新进程别先起 SwiftUI”：0.2.24 之前新进程先跑
 // SealboxApp.main()（第一遍 UIApplicationMain），再在 onAppear 里加载客 App，
 // 客再调 UIApplicationMain 就是第二遍——nread 0.2.24 崩溃：
@@ -17,7 +17,9 @@
 // set（崩溃文件 ~/workspace/user/files/SealBox-2026-11-20-180007.ips）。
 // 所以 @main 从 SealboxApp.swift 移走，入口改到这里：收据就绪且预检通过时
 // 在 UIKit 启动之前直接加载客 App；其余情况起宿主 SwiftUI（SBHostAppMain），
-// 由启动路由接手（需要修复时走异步修复，修完再重起一次，绝不进程内加载）。
+// 由启动路由接手（需要修复时走异步修复，0.2.27：修完进程内加载，不再重起）。
+// 0.2.27：点图标走进程内加载（拦截客的第二遍 UIApplicationMain），
+// 本文件的 preflight 直接加载只留作主前置路（MJ 手动重开等遗留收据场景）。
 #import <Foundation/Foundation.h>
 #import <dlfcn.h>
 
@@ -54,7 +56,7 @@ int main(int argc, char *argv[]) {
     NSSetUncaughtExceptionHandler(SBUncaughtExceptionHandler);
     // 0.2.26 G7：LC 同款（main.c）——先读 $HOME/Library/preloadLibraries.txt，
     // 逐行 dlopen（RTLD_LAZY|RTLD_GLOBAL），读完删文件；失败只记日志。
-    // 文件由 SBAppCoordinator.requestRestart 在 iOS 26+ 且客带 MetalANGLE 时写。
+    // 文件由 SBAppCoordinator.launchGuestInProcess 在 iOS 26+ 且客带 MetalANGLE 时写。
     {
         NSString *preloadPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/preloadLibraries.txt"];
         NSString *preloadContent = [NSString stringWithContentsOfFile:preloadPath encoding:NSUTF8StringEncoding error:nil];

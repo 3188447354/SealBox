@@ -22,6 +22,33 @@ NS_ASSUME_NONNULL_BEGIN
                 keychainGroup:(NSInteger)keychainGroup
                         error:(NSError **)error;
 
+/// 进程内加载（0.2.27）：与 loadGuestWithBundleID 同流程，但在 dlopen 后、
+// 跳 main 前装好 UIApplicationMain 拦截（SBGuestMainHook）；hook 激活后客
+// main 返回≠退出，不恢复环境、不清收据（激活时会话侧已记成功），返回 YES
+// 表示客已在前台。调用方是宿主 UI（UIKit 已在跑），绝不用于 main.m 前置路。
++ (BOOL)loadGuestInProcessWithBundleID:(NSString *)bundleID
+                         containerUUID:(NSString *)containerUUID
+                     diskDirectoryName:(nullable NSString *)diskDirectoryName
+                         keychainGroup:(NSInteger)keychainGroup
+                                 error:(NSError **)error;
+
+/// 应用客上下文（原 loadGuest 步骤 2–5b，0.2.27 抽出）：数据容器/HOME/env、
+// 主 Bundle 伪装、可执行路径、进程身份。首次加载与会话恢复共用；
+// 失败时还原已应用的部分并返回 NO。
+/// keychainGroup 由调用方先解析好再传（收据/选择键/容器哈希三档）。
+/// 成功时 guestBundleOut 回填客 Bundle（恢复时重伪装用）。
++ (BOOL)applyGuestContextForBundleID:(NSString *)bundleID
+                       guestAppPath:(NSString *)guestAppPath
+                      guestExecPath:(NSString *)guestExecPath
+                      containerPath:(NSString *)containerPath
+                      keychainGroup:(NSInteger)keychainGroup
+                              error:(NSError **)error
+                   guestBundleOut:(NSBundle **)guestBundleOut;
+
+/// 把进程上下文还原成宿主自己的（伪装/路径/身份/HOME/env）。各还原函数自带
+/// “未改写过即空操作”守卫，重复调无害。
++ (void)restoreHostContext;
+
 @end
 
 NS_ASSUME_NONNULL_END

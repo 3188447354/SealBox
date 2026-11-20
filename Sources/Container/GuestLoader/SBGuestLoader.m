@@ -1,5 +1,5 @@
-// SBGuestLoader.m — 客加载器总入口：证书门、重启请求（带 5 秒看门狗）、
-// 重启后读收据加载客 App、JIT 检测、启动链自测。
+// SBGuestLoader.m — 客加载器总入口：证书门、进程内加载（0.2.27，不再重启）、
+// 收据加载客 App、JIT 检测、启动链自测。
 #import "SBGuestLoader.h"
 
 #import <UIKit/UIKit.h>
@@ -11,6 +11,7 @@
 #import "SBCodesignCheck.h"
 #import "SBDiagLog.h"
 #import "SBGuestBootstrap.h"
+#import "SBGuestSessionManager.h"
 #import "zsigner.h"
 
 NSString * const SBGuestLoaderErrorDomain = @"com.mjorb.sealbox.GuestLoader";
@@ -30,10 +31,9 @@ static NSString * const SBKeyLaunchReceipt = @"SBLaunchReceipt";
 // 密码自步骤 5 起只存系统钥匙串，不再写 App Group UserDefaults 明文，
 // 证书门必须从钥匙串读，否则有证书也会误判成“未导入”。
 
-// 重启截止时间（秒），与契约 restartDeadlineSeconds 一致
+// 重启截止时间（秒），与契约 restartDeadlineSeconds 一致：restart-requested
+// 收据 5 秒内未兑现即过期（进程被杀后重开时，旧收据不复用）。
 static const NSTimeInterval SBRestartDeadlineSeconds = 5.0;
-// openURL 成功后、exit(0) 之前的延迟，让 completion 与 UserDefaults 落盘有时间跑完
-static const NSTimeInterval SBExitDelaySeconds = 0.6;
 
 NSError *SBGuestLoaderErrorMake(SBGuestLoaderErrorCode code,
                                 NSString *stage,
@@ -321,7 +321,7 @@ NSError *SBGuestLoaderErrorMake(SBGuestLoaderErrorCode code,
         }
         return;
     }
-    // openURL 与看门狗都必须在主线程跑。
+    // 进程内加载必须在主线程跑（客 main 是 UIKit）。
     dispatch_async(dispatch_get_main_queue(), ^{
         [self requestGuestLaunchOnMainThreadWithBundleID:bundleID
                                            containerUUID:containerUUID
@@ -336,9 +336,11 @@ NSError *SBGuestLoaderErrorMake(SBGuestLoaderErrorCode code,
                                  diskDirectoryName:(NSString *)diskDirectoryName
                                      keychainGroup:(NSInteger)keychainGroup
                                         completion:(void (^)(NSError * _Nullable error))completion {
+    // 0.2.27：进程内加载——不再发自启 URL、不再退出进程。
+    // 先写 selection 与收据（当前客的记录；侧滑回桌面不清除，客 main 真退出时
+    // bootstrap 清），再在当前进程内同步加载（dlopen→拦截→跳 main；hook 激活后
+    // main 随即返回，客在前台运行，宿主 UIKit 的 runloop 继续驱动它）。
     NSString *requestID = [[NSUUID UUID] UUIDString];
-
-    // 先写 selection 与收据，再发重启请求：收据是新进程判断“这次启动是客启动”的唯一依据。
     NSUserDefaults *defaults = [SBGuestLoader sharedDefaults];
     [defaults setObject:bundleID forKey:SBKeySelectedGuestBundleID];
     [defaults setObject:containerUUID forKey:SBKeySelectedGuestContainer];
@@ -349,75 +351,83 @@ NSError *SBGuestLoaderErrorMake(SBGuestLoaderErrorCode code,
                                       stage:SBReceiptStageRestartRequested
                                   requestID:requestID
                                      detail:nil];
-    SBDiagLogLine([[NSString stringWithFormat:@"点图标：请求启动 %@，已写收据", bundleID] UTF8String]);
-
-    __block BOOL finished = NO;
-    void (^finish)(NSError * _Nullable) = ^(NSError * _Nullable error) {
-        if (finished) {
-            return;
-        }
-        finished = YES;
+    SBDiagLogLine([[NSString stringWithFormat:@"点图标：进程内加载 %@，已写收据", bundleID] UTF8String]);
+    // 另一客在前台：先让它回后台（会话保留），再上新客。
+    [[SBGuestSessionManager sharedManager] backgroundCurrentGuest];
+    NSError *error = nil;
+    BOOL loaded = [SBGuestBootstrap loadGuestInProcessWithBundleID:bundleID
+                                                     containerUUID:containerUUID
+                                                 diskDirectoryName:diskDirectoryName
+                                                     keychainGroup:keychainGroup
+                                                             error:&error];
+    if (loaded) {
+        SBDiagLogLine([[NSString stringWithFormat:@"点图标：%@ 进程内加载完成（客在前台）", bundleID] UTF8String]);
         if (completion) {
-            completion(error);
+            completion(nil);
         }
-    };
-
-    // 5 秒看门狗：活过截止时间，说明重启请求被系统丢弃，当场报错，不许“正常返回”。
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(SBRestartDeadlineSeconds * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        if (finished) {
-            return;
-        }
-        NSString *message = @"系统没有重启应用，请重试";
-        // 0.2.10 报错日志：之前只改收据不记日志——看门狗超时在诊断
-        // 日志里完全看不到，收据却写着“系统没有重启应用”。
-        SBDiagLogLine([[NSString stringWithFormat:@"点图标：重启请求超时：[code=%ld] %@（5 秒看门狗，系统未重启应用）", (long)SBGuestLoaderErrorRestartRequestFailed, bundleID] UTF8String]);
-        [SBGuestLoader markReceiptStage:SBReceiptStageRestartRequested detail:message];
-        finish(SBGuestLoaderErrorMake(SBGuestLoaderErrorRestartRequestFailed,
-                                      @"重启请求",
-                                      message,
-                                      @"请重试，或杀掉宿主后重新打开"));
-    });
-
-    NSURLComponents *components = [[NSURLComponents alloc] init];
-    components.scheme = @"sealbox-launch";
-    components.host = @"guest";
-    NSURLQueryItem *bundleItem = [NSURLQueryItem queryItemWithName:@"bundle" value:bundleID];
-    NSURLQueryItem *containerItem = [NSURLQueryItem queryItemWithName:@"container" value:containerUUID];
-    NSURLQueryItem *requestItem = [NSURLQueryItem queryItemWithName:@"request" value:requestID];
-    components.queryItems = @[ bundleItem, containerItem, requestItem ];
-    NSURL *launchURL = components.URL;
-    if (!launchURL) {
-        SBDiagLogLine([[NSString stringWithFormat:@"点图标：启动链接生成失败：[code=%ld] %@", (long)SBGuestLoaderErrorRestartRequestFailed, bundleID] UTF8String]);
-        finish(SBGuestLoaderErrorMake(SBGuestLoaderErrorRestartRequestFailed,
-                                      @"重启请求",
-                                      @"启动链接生成失败，请重试",
-                                      @"请重试"));
         return;
     }
+    NSString *message = error.localizedDescription;
+    if (message.length == 0) {
+        message = @"客 App 加载失败";
+    }
+    SBDiagLogLine([[NSString stringWithFormat:@"客加载失败：[code=%ld] %@ %@", (long)(error ? error.code : SBGuestLoaderErrorGuestLoadFailed), bundleID, message] UTF8String]);
+    [SBGuestLoader markReceiptStage:SBReceiptStageGuestFailed detail:message];
+    [defaults removeObjectForKey:SBKeySelectedGuestBundleID];
+    [defaults removeObjectForKey:SBKeySelectedGuestContainer];
+    [defaults synchronize];
+    if (completion) {
+        completion(error);
+    }
+}
 
-    [[UIApplication sharedApplication] openURL:launchURL
-                                       options:@{}
-                             completionHandler:^(BOOL success) {
-        if (!success) {
-            SBDiagLogLine([[NSString stringWithFormat:@"重启请求失败：[code=%ld] %@ 系统拒绝 openURL", (long)SBGuestLoaderErrorRestartRequestFailed, bundleID] UTF8String]);
-            [SBGuestLoader markReceiptStage:SBReceiptStageRestartRequested
-                                     detail:@"系统没有重启应用，请重试"];
-            finish(SBGuestLoaderErrorMake(SBGuestLoaderErrorRestartRequestFailed,
-                                          @"重启请求",
-                                          @"系统没有重启应用，请重试",
-                                          @"请重试，或杀掉宿主后重新打开"));
-            return;
-        }
-        // 请求已接下：先把成功交回调用方，再延迟退出，让系统带收据重起本进程。
-        finish(nil);
-        SBDiagLogLine("重启请求已发出，0.6 秒后退出进程");
-        [[SBGuestLoader sharedDefaults] synchronize];
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(SBExitDelaySeconds * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            exit(0);
-        });
-    }];
+/// 同步路（宿主 UIKit 已在跑）读收据、进程内加载客 App：routeOnLaunchIfNeeded
+/// 的兜底——main.m 前置路被绕过时到这里。0.2.27 前这里调 launchGuestIfRequested
+///（新鲜进程加载），在宿主 UI 里跳客 main 会调第二遍 UIApplicationMain 而崩
+///（nread 0.2.24）；现在走进程内加载（带拦截）。
+/// 加载成功返回 YES（客在前台）；无请求或加载失败返回 NO。失败时收据写成
+/// guest-failed（带中文原因），selection 已清掉，宿主进桌面后应按收据弹错。
+- (BOOL)launchGuestInProcessIfRequested {
+    NSDictionary *receipt = [SBGuestLoader currentLaunchReceipt];
+    if (!receipt) {
+        return NO;
+    }
+    if (![[receipt objectForKey:@"stage"] isEqualToString:SBReceiptStageRestartRequested]) {
+        return NO;
+    }
+    NSString *bundleID = receipt[@"guestBundleID"];
+    NSString *containerUUID = receipt[@"containerUUID"];
+    NSString *diskDirectoryName = receipt[@"diskDirectoryName"];
+    NSInteger keychainGroup = -1;
+    if ([receipt[@"keychainGroup"] isKindOfClass:[NSNumber class]]) {
+        keychainGroup = [(NSNumber *)receipt[@"keychainGroup"] integerValue];
+    }
+    if (bundleID.length == 0 || containerUUID.length == 0) {
+        return NO;
+    }
+    SBDiagLogLine([[NSString stringWithFormat:@"同步路：收到客启动请求 %@，进程内加载（宿主 UIKit 已在跑）", bundleID] UTF8String]);
+    [SBGuestLoader markReceiptStage:SBReceiptStageRestartConfirmed detail:nil];
+    [[SBGuestSessionManager sharedManager] backgroundCurrentGuest];
+    NSError *error = nil;
+    BOOL loaded = [SBGuestBootstrap loadGuestInProcessWithBundleID:bundleID
+                                                     containerUUID:containerUUID
+                                                 diskDirectoryName:diskDirectoryName
+                                                     keychainGroup:keychainGroup
+                                                             error:&error];
+    if (loaded) {
+        return YES;
+    }
+    NSString *message = error.localizedDescription;
+    if (message.length == 0) {
+        message = @"客 App 加载失败";
+    }
+    SBDiagLogLine([[NSString stringWithFormat:@"客加载失败：[code=%ld] %@ %@", (long)(error ? error.code : SBGuestLoaderErrorGuestLoadFailed), bundleID, message] UTF8String]);
+    [SBGuestLoader markReceiptStage:SBReceiptStageGuestFailed detail:message];
+    NSUserDefaults *defaults = [SBGuestLoader sharedDefaults];
+    [defaults removeObjectForKey:SBKeySelectedGuestBundleID];
+    [defaults removeObjectForKey:SBKeySelectedGuestContainer];
+    [defaults synchronize];
+    return NO;
 }
 
 #pragma mark - 新进程启动时加载客 App

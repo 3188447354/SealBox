@@ -191,30 +191,20 @@ static OSStatus SBHooked_SecKeyGeneratePair(CFDictionaryRef parameters, SecKeyRe
 }
 #pragma clang diagnostic pop
 
-void SBSecItemHookInstall(void) {
+/// 已装过重绑的客可执行路径（按路径去重；多客各装各的镜像）。
+static NSMutableSet<NSString *> *SBSecItemInstalledExecPaths(void) {
+    static NSMutableSet<NSString *> *set = nil;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        const struct mach_header *guestHeader = SBGuestImageHeader();
-        if (!guestHeader) {
-            NSLog(@"[Sealbox] SecItem Hook 未安装：找不到客可执行镜像");
-            return;
-        }
-        // 0.2.26 G3：LC 同款探针——先拿假查询问钥匙串组能不能用；宿主缺
-        // keychain-access-groups entitlement 时（errSecMissingEntitlement）
-        // 不装 hook，否则所有 SecItem 调用都会被改写进一个不可用的组而失败。
-        NSDictionary *probeQuery = @{
-            (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
-            (__bridge id)kSecAttrAccount: @"NonExistentKey",
-            (__bridge id)kSecAttrService: @"NonExistentService",
-            (__bridge id)kSecAttrAccessGroup: SBGuestKeychainGroupName(),
-            (__bridge id)kSecReturnData: @NO
-        };
-        OSStatus probeStatus = SecItemCopyMatching((__bridge CFDictionaryRef)probeQuery, NULL);
-        if (probeStatus == errSecMissingEntitlement) {
-            NSLog(@"[Sealbox] SecItem Hook 未安装：钥匙串组 %@ 不可用（缺 entitlement）", SBGuestKeychainGroupName());
-            return;
-        }
-        // 先记原函数，再重绑定；顺序反了替身会调到自己。
+        set = [NSMutableSet set];
+    });
+    return set;
+}
+
+/// 原函数指针只记一次（各客共用同一份原函数）。
+static void SBSecItemHookSetupOriginals(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
         g_orig_SecItemAdd = (OSStatus (*)(CFDictionaryRef, CFTypeRef *))dlsym(RTLD_DEFAULT, "SecItemAdd");
         g_orig_SecItemCopyMatching = (OSStatus (*)(CFDictionaryRef, CFTypeRef *))dlsym(RTLD_DEFAULT, "SecItemCopyMatching");
         g_orig_SecItemUpdate = (OSStatus (*)(CFDictionaryRef, CFDictionaryRef))dlsym(RTLD_DEFAULT, "SecItemUpdate");
@@ -225,27 +215,71 @@ void SBSecItemHookInstall(void) {
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
         g_orig_SecKeyGeneratePair = (OSStatus (*)(CFDictionaryRef, SecKeyRef *, SecKeyRef *))dlsym(RTLD_DEFAULT, "SecKeyGeneratePair");
 #pragma clang diagnostic pop
-        if (g_orig_SecItemAdd) {
-            litehook_rebind_symbol(guestHeader, (void *)g_orig_SecItemAdd, (void *)SBHooked_SecItemAdd, NULL);
-        }
-        if (g_orig_SecItemCopyMatching) {
-            litehook_rebind_symbol(guestHeader, (void *)g_orig_SecItemCopyMatching, (void *)SBHooked_SecItemCopyMatching, NULL);
-        }
-        if (g_orig_SecItemUpdate) {
-            litehook_rebind_symbol(guestHeader, (void *)g_orig_SecItemUpdate, (void *)SBHooked_SecItemUpdate, NULL);
-        }
-        if (g_orig_SecItemDelete) {
-            litehook_rebind_symbol(guestHeader, (void *)g_orig_SecItemDelete, (void *)SBHooked_SecItemDelete, NULL);
-        }
-        if (g_orig_SecKeyCreateRandomKey) {
-            litehook_rebind_symbol(guestHeader, (void *)g_orig_SecKeyCreateRandomKey, (void *)SBHooked_SecKeyCreateRandomKey, NULL);
-        }
-        if (g_orig_SecKeyCreateWithData) {
-            litehook_rebind_symbol(guestHeader, (void *)g_orig_SecKeyCreateWithData, (void *)SBHooked_SecKeyCreateWithData, NULL);
-        }
-        if (g_orig_SecKeyGeneratePair) {
-            litehook_rebind_symbol(guestHeader, (void *)g_orig_SecKeyGeneratePair, (void *)SBHooked_SecKeyGeneratePair, NULL);
-        }
-        NSLog(@"[Sealbox] SecItem Hook 已安装：重绑 SecItemAdd/CopyMatching/Update/Delete + SecKeyCreateRandomKey/CreateWithData/GeneratePair（0.2.25 函数指针传法；0.2.26 补 SecKey* 与探针）");
     });
+}
+
+/// 按客镜像安装（0.2.27）：constructor 只跑首客，第二客起由宿主在 dlopen 后
+/// 经 SBGuestHooksInstallForGuest 再调；按执行路径去重，各客镜像各装一套。
+/// 探针按当前客组重跑（组不同 entitlement 覆盖可能不同）；探针失败不记已装，下客再试。
+void SBSecItemHookInstallForGuestImage(void) {
+    const struct mach_header *guestHeader = SBGuestImageHeader();
+    if (!guestHeader) {
+        NSLog(@"[Sealbox] SecItem Hook 未安装：找不到客可执行镜像");
+        return;
+    }
+    const char *execPath = getenv("SB_GUEST_EXEC_PATH");
+    NSString *execPathString = execPath ? [NSString stringWithUTF8String:execPath] : @"";
+    NSMutableSet<NSString *> *installed = SBSecItemInstalledExecPaths();
+    @synchronized (installed) {
+        if ([installed containsObject:execPathString]) {
+            return; // 该客镜像已装过
+        }
+    }
+    // 0.2.26 G3：LC 同款探针——先拿假查询问钥匙串组能不能用；宿主缺
+    // keychain-access-groups entitlement 时（errSecMissingEntitlement）
+    // 不装 hook，否则所有 SecItem 调用都会被改写进一个不可用的组而失败。
+    NSDictionary *probeQuery = @{
+        (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
+        (__bridge id)kSecAttrAccount: @"NonExistentKey",
+        (__bridge id)kSecAttrService: @"NonExistentService",
+        (__bridge id)kSecAttrAccessGroup: SBGuestKeychainGroupName(),
+        (__bridge id)kSecReturnData: @NO
+    };
+    OSStatus probeStatus = SecItemCopyMatching((__bridge CFDictionaryRef)probeQuery, NULL);
+    if (probeStatus == errSecMissingEntitlement) {
+        NSLog(@"[Sealbox] SecItem Hook 未安装：钥匙串组 %@ 不可用（缺 entitlement）", SBGuestKeychainGroupName());
+        return;
+    }
+    // 先记原函数，再重绑定；顺序反了替身会调到自己。
+    SBSecItemHookSetupOriginals();
+    if (g_orig_SecItemAdd) {
+        litehook_rebind_symbol(guestHeader, (void *)g_orig_SecItemAdd, (void *)SBHooked_SecItemAdd, NULL);
+    }
+    if (g_orig_SecItemCopyMatching) {
+        litehook_rebind_symbol(guestHeader, (void *)g_orig_SecItemCopyMatching, (void *)SBHooked_SecItemCopyMatching, NULL);
+    }
+    if (g_orig_SecItemUpdate) {
+        litehook_rebind_symbol(guestHeader, (void *)g_orig_SecItemUpdate, (void *)SBHooked_SecItemUpdate, NULL);
+    }
+    if (g_orig_SecItemDelete) {
+        litehook_rebind_symbol(guestHeader, (void *)g_orig_SecItemDelete, (void *)SBHooked_SecItemDelete, NULL);
+    }
+    if (g_orig_SecKeyCreateRandomKey) {
+        litehook_rebind_symbol(guestHeader, (void *)g_orig_SecKeyCreateRandomKey, (void *)SBHooked_SecKeyCreateRandomKey, NULL);
+    }
+    if (g_orig_SecKeyCreateWithData) {
+        litehook_rebind_symbol(guestHeader, (void *)g_orig_SecKeyCreateWithData, (void *)SBHooked_SecKeyCreateWithData, NULL);
+    }
+    if (g_orig_SecKeyGeneratePair) {
+        litehook_rebind_symbol(guestHeader, (void *)g_orig_SecKeyGeneratePair, (void *)SBHooked_SecKeyGeneratePair, NULL);
+    }
+    @synchronized (installed) {
+        [installed addObject:execPathString];
+    }
+    NSLog(@"[Sealbox] SecItem Hook 已安装：重绑 SecItemAdd/CopyMatching/Update/Delete + SecKeyCreateRandomKey/CreateWithData/GeneratePair（0.2.25 函数指针传法；0.2.26 补 SecKey* 与探针；0.2.27 按客镜像）");
+}
+
+/// 旧入口（兼容）：即 per-guest 安装。
+void SBSecItemHookInstall(void) {
+    SBSecItemHookInstallForGuestImage();
 }

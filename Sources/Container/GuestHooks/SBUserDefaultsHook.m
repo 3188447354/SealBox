@@ -33,17 +33,31 @@ NSUserDefaults *SBGuestDefaults(void);
 
 @end
 
+/// 客偏好实例。0.2.27 多客常驻：按 (suite, HOME) 分键缓存——
+// 旧实现 dispatch_once 只建首客的 suite，第二客会读到首客的偏好。
+// HOME 是键的一部分：同一 suite 的实例在 HOME 指回该客容器时才复用，
+// 否则 initWithSuiteName 解析出的 plist 路径会落在当前（别的客的）容器里。
 NSUserDefaults *SBGuestDefaults(void) {
-    static NSUserDefaults *guestDefaults = nil;
+    const char *bundleID = getenv("SB_GUEST_BUNDLE_ID");
+    NSString *suite = (bundleID && bundleID[0] != '\0')
+        ? [NSString stringWithUTF8String:bundleID]
+        : @"com.mjorb.sealbox.guest";
+    const char *home = getenv("HOME");
+    NSString *key = [NSString stringWithFormat:@"%@|%@",
+                     suite, home ? [NSString stringWithUTF8String:home] : @""];
+    static NSMutableDictionary<NSString *, NSUserDefaults *> *cache = nil;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        const char *bundleID = getenv("SB_GUEST_BUNDLE_ID");
-        NSString *suite = (bundleID && bundleID[0] != '\0')
-            ? [NSString stringWithUTF8String:bundleID]
-            : @"com.mjorb.sealbox.guest";
-        guestDefaults = [[NSUserDefaults alloc] initWithSuiteName:suite];
+        cache = [NSMutableDictionary dictionary];
     });
-    return guestDefaults;
+    @synchronized (cache) {
+        NSUserDefaults *defaults = cache[key];
+        if (!defaults) {
+            defaults = [[NSUserDefaults alloc] initWithSuiteName:suite];
+            cache[key] = defaults;
+        }
+        return defaults;
+    }
 }
 
 void SBUserDefaultsHookInstall(void) {

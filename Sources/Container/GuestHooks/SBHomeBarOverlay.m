@@ -1,9 +1,14 @@
-// SBHomeBarOverlay.m — 客 App 内底部横杠：
-//   上滑 ≥32pt 或快滑（速度 >140pt/s）→ 回桌面（清启动标记 + exit(0)）；
+// SBHomeBarOverlay.m — 客 App 内底部横杠 + 左下角侧滑：
+//   上滑 ≥32pt 或快滑（速度 >140pt/s）→ 回宿主（0.2.27：发通知，不再 exit(0)）；
+//   左下角左边缘右滑 ≥40pt 或速度 >300pt/s → 回宿主（0.2.27 新增，MJ 要求）；
 //   按住 0.42s / 双击 / 上滑后停顿 0.35s → toast「切换器 v1 未提供」
 //   （v1 不做切换器，只提示，不静默吞手势）。
-// 实现：一只高层级透明 UIWindow，只在底部 28pt 的横杠条上接手势，
-// 其余区域 hitTest 返回 nil，触摸原样透给客 App。
+// 实现：一只高层级透明 UIWindow，只在底部 28pt 的横杠条与左下角 16×160pt 的
+// 左边缘区上接手势，其余区域 hitTest 返回 nil，触摸原样透给客 App。
+// 回宿主 = 发通知给宿主会话管理器（当前客回后台，会话保留、收据不清除），
+// 客退出回宿主 UI 仍由客 main 返回/收据生命周期管，不在这里清标记、
+// 更不退出进程（0.2.27 前这里是清标记 + exit(0)，进程内模型下那会杀掉宿主
+// 与全部后台客）。
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
@@ -19,15 +24,28 @@ static const CGFloat SBHomeBarSwipeDistance = 32.0; // 上滑回桌面的距离�
 static const CGFloat SBHomeBarFastSwipeVelocity = 140.0; // 快滑速度阈值（pt/s）
 static const NSTimeInterval SBHomeBarLongPressSeconds = 0.42; // 按住阈值
 static const NSTimeInterval SBHomeBarPauseSeconds = 0.35;     // 上滑停顿阈值
+// 0.2.27 左下角侧滑回宿主：左边缘 16pt 宽 × 底部 160pt 高的区，右滑触发。
+// home indicator 是底边（上滑），左边缘可用；区只占极左 16pt，客底部 UI
+// 几乎不落在该条带内（落在其中的轻点会被吞掉——已知取舍，见 build log）。
+static const CGFloat SBHomeBarLeftEdgeZoneWidth = 16.0;
+static const CGFloat SBHomeBarLeftEdgeZoneHeight = 160.0;
+static const CGFloat SBHomeBarLeftEdgeSwipeDistance = 40.0; // 右滑触发距离（pt）
+static const CGFloat SBHomeBarLeftEdgeFastSwipeVelocity = 300.0; // 右滑快滑速度（pt/s）
+
+// 通知名（与宿主 SBGuestSessionManager.h 里的同名常量必须一致，原型核对）。
+static NSString * const SBGuestReturnToHostRequestedNotification = @"SBGuestReturnToHostRequested";
+static NSString * const SBGuestDidEnterBackgroundNotification = @"SBGuestDidEnterBackground";
+static NSString * const SBGuestDidEnterForegroundNotification = @"SBGuestDidEnterForeground";
 
 static UIWindow *g_overlayWindow = nil;
 static UILabel *g_toastLabel = nil;
 static NSUInteger g_toastGeneration = 0;
 static BOOL g_overlayInstalled = NO;
 
-/// 除横杠条外不拦截触摸的容器视图。
+/// 除横杠条与左边缘区外不拦截触摸的容器视图。
 @interface SBHomeBarPassthroughView : UIView
 @property (nonatomic, weak, nullable) UIView *barView;
+@property (nonatomic, weak, nullable) UIView *leftEdgeZone;
 @end
 
 @implementation SBHomeBarPassthroughView
@@ -37,6 +55,12 @@ static BOOL g_overlayInstalled = NO;
         CGPoint pointInBar = [self convertPoint:point toView:self.barView];
         if ([self.barView pointInside:pointInBar withEvent:event]) {
             return [self.barView hitTest:pointInBar withEvent:event];
+        }
+    }
+    if (self.leftEdgeZone) {
+        CGPoint pointInZone = [self convertPoint:point toView:self.leftEdgeZone];
+        if ([self.leftEdgeZone pointInside:pointInZone withEvent:event]) {
+            return [self.leftEdgeZone hitTest:pointInZone withEvent:event];
         }
     }
     return nil;
@@ -89,18 +113,24 @@ static void SBHomeBarShowToast(NSString *text) {
 
 #pragma mark - 回桌面
 
-/// 回桌面 = 清掉启动标记（selection 与收据），宿主下次启动读不到 selection 即进桌面。
+/// 回桌面（0.2.27 进程内）：发通知给宿主会话管理器——当前客回后台
+///（会话保留、收据不清除），宿主界面恢复。不再清启动标记、不再退出进程。
 static void SBHomeBarGoHome(void) {
-    const char *hostBundleID = getenv("SB_HOST_BUNDLE_ID");
-    NSString *suite = (hostBundleID && hostBundleID[0] != '\0')
-        ? [@"group." stringByAppendingString:[NSString stringWithUTF8String:hostBundleID]]
-        : @"group.com.mjorb.sealbox";
-    NSUserDefaults *defaults = [[NSUserDefaults alloc] initWithSuiteName:suite];
-    [defaults removeObjectForKey:@"SBSelectedGuestBundleID"];
-    [defaults removeObjectForKey:@"SBSelectedGuestContainer"];
-    [defaults removeObjectForKey:@"SBLaunchReceipt"];
-    [defaults synchronize];
-    exit(0);
+    [[NSNotificationCenter defaultCenter] postNotificationName:SBGuestReturnToHostRequestedNotification
+                                                        object:nil];
+}
+
+/// 浮层随客藏/显：客回后台时藏起（不悬在宿主界面上），客进前台时显出。
+static void SBHomeBarSetOverlayHidden(BOOL hidden) {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            SBHomeBarSetOverlayHidden(hidden);
+        });
+        return;
+    }
+    if (g_overlayWindow) {
+        g_overlayWindow.hidden = hidden;
+    }
 }
 
 #pragma mark - 手势处理
@@ -173,6 +203,21 @@ static void SBHomeBarGoHome(void) {
     }
 }
 
+/// 左下角左边缘右滑 → 回宿主（0.2.27，MJ 要求）。只在右滑够远/够快时触发，
+// 轻点与竖滑不触发；触发后浮层随客藏起，后续手势不再进这里。
+- (void)handleLeftEdgePan:(UIScreenEdgePanGestureRecognizer *)pan {
+    if (pan.state != UIGestureRecognizerStateChanged &&
+        pan.state != UIGestureRecognizerStateEnded) {
+        return;
+    }
+    CGFloat translationX = [pan translationInView:pan.view].x;
+    CGFloat velocityX = [pan velocityInView:pan.view].x;
+    if (translationX >= SBHomeBarLeftEdgeSwipeDistance ||
+        velocityX >= SBHomeBarLeftEdgeFastSwipeVelocity) {
+        SBHomeBarGoHome();
+    }
+}
+
 - (void)handleDoubleTap:(UITapGestureRecognizer *)tap {
     SBHomeBarShowToast(@"切换器 v1 未提供");
 }
@@ -183,6 +228,10 @@ static void SBHomeBarGoHome(void) {
 
 static void SBHomeBarEnsureOverlay(void) {
     if (g_overlayWindow) {
+        // 已建好但还没挂上 scene（建时 keyWindow 不在）：补挂一次。
+        if (!g_overlayWindow.windowScene) {
+            g_overlayWindow.windowScene = [UIApplication sharedApplication].keyWindow.windowScene;
+        }
         return;
     }
     if (![NSThread isMainThread]) {
@@ -195,6 +244,8 @@ static void SBHomeBarEnsureOverlay(void) {
     UIWindow *window = [[UIWindow alloc] initWithFrame:screen.bounds];
     window.windowLevel = UIWindowLevelStatusBar + 100.0;
     window.backgroundColor = [UIColor clearColor];
+    // 与客窗同 scene 才能叠在客窗上面（客窗在共享的宿主 scene 里）。
+    window.windowScene = [UIApplication sharedApplication].keyWindow.windowScene;
     window.hidden = NO;
 
     SBHomeBarPassthroughView *container = [[SBHomeBarPassthroughView alloc] initWithFrame:window.bounds];
@@ -239,8 +290,23 @@ static void SBHomeBarEnsureOverlay(void) {
     static const char SBHomeBarHandlerKey;
     objc_setAssociatedObject(barView, &SBHomeBarHandlerKey, handler, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
+    // 0.2.27 左下角左边缘区（16×160pt）：只接左边缘右滑回宿主，其余触摸透过。
+    UIView *leftEdgeZone = [[UIView alloc] initWithFrame:CGRectMake(0.0,
+                                                                     CGRectGetHeight(window.bounds) - SBHomeBarLeftEdgeZoneHeight,
+                                                                     SBHomeBarLeftEdgeZoneWidth,
+                                                                     SBHomeBarLeftEdgeZoneHeight)];
+    leftEdgeZone.backgroundColor = [UIColor clearColor];
+    leftEdgeZone.autoresizingMask = UIViewAutoresizingFlexibleHeight | UIViewAutoresizingFlexibleTopMargin;
+    UIScreenEdgePanGestureRecognizer *edgePan = [[UIScreenEdgePanGestureRecognizer alloc] initWithTarget:handler
+                                                                                                   action:@selector(handleLeftEdgePan:)];
+    edgePan.edges = UIRectEdgeLeft;
+    edgePan.delegate = handler;
+    [leftEdgeZone addGestureRecognizer:edgePan];
+
     container.barView = barView;
+    container.leftEdgeZone = leftEdgeZone;
     [container addSubview:barView];
+    [container addSubview:leftEdgeZone];
 
     UIViewController *rootViewController = [[UIViewController alloc] init];
     rootViewController.view = container;
@@ -264,5 +330,18 @@ void SBHomeBarOverlayInstall(void) {
                                                        queue:[NSOperationQueue mainQueue]
                                                   usingBlock:^(NSNotification * _Nonnull note) {
         SBHomeBarEnsureOverlay();
+    }];
+    // 0.2.27：浮层随客藏/显——客回后台时藏起（不悬在宿主界面上），客进前台时显出。
+    [[NSNotificationCenter defaultCenter] addObserverForName:SBGuestDidEnterBackgroundNotification
+                                                      object:nil
+                                                       queue:[NSOperationQueue mainQueue]
+                                                  usingBlock:^(NSNotification * _Nonnull note) {
+        SBHomeBarSetOverlayHidden(YES);
+    }];
+    [[NSNotificationCenter defaultCenter] addObserverForName:SBGuestDidEnterForegroundNotification
+                                                      object:nil
+                                                       queue:[NSOperationQueue mainQueue]
+                                                  usingBlock:^(NSNotification * _Nonnull note) {
+        SBHomeBarSetOverlayHidden(NO);
     }];
 }

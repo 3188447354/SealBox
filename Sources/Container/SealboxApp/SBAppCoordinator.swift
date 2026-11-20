@@ -234,35 +234,48 @@ final class SBAppCoordinator: ObservableObject {
 
     // MARK: - 启动（A4 / B1–B4）
 
-    /// 当前启动阶段（30 秒看门狗超时提示用）：证书检查 / 重启请求 / 加载客 App 三档。
+    /// 当前启动阶段（超时提示用）：证书检查 / 进程内加载 / 加载客 App 三档。
     /// 旧进程只走得到前两档——证书门与包检查在 requestGuestLaunch 内同步跑，
-    /// 调用返回时回调还没来即已通过证书门，进入重启请求阶段；加载客 App 在新进程
-    /// 的 bootstrap 里，旧进程在那之前已 exit(0)，看门狗随进程一起没了。
+    /// 当前启动阶段（弹“启动超时”时用；0.2.27：加载是同步的，不再设看门狗）。
     private var launchStage: String?
-    /// 30 秒后备看门狗：正常路径（成功 → 进程 exit(0)；失败 → 回调弹错）都会先取消它。
-    private var launchWatchdog: DispatchWorkItem?
-    /// 防重复点：点一次图标只发一次重启请求；失败 / 超时后清零，
-    /// 成功时进程 exit(0)，旗标随进程一起没了。
+    /// 0.2.27：异步激活失败通知的观察者（会话管理器在 scene 驱动无窗时发；
+    /// 宿主界面已在前台，按通知弹错——收据已写成 guest-failed）。
+    private var activationFailedObserver: NSObjectProtocol?
+    /// 防重复点：点一次图标只发一次加载请求；失败后清零，
+    /// 成功时客进前台，旗标由回调清零。
     private var isLaunching = false
 
+    init() {
+        activationFailedObserver = NotificationCenter.default.addObserver(
+            forName: Notification.Name(rawValue: SBGuestActivationFailedNotification as String),
+            object: nil, queue: .main
+        ) { [weak self] note in
+            guard let self else { return }
+            let message = note.userInfo?[SBGuestActivationFailedMessageKey as String] as? String
+                ?? "客 App 启动失败"
+            SBDiagLog.log("启动失败弹窗：客 App 激活失败（\(message)）")
+            self.activeAlert = CoordinatorAlert(title: "启动失败", message: message)
+        }
+    }
+
     /// 点图标后的真实启动：证书门与 5 秒看门狗在 GuestLoader 侧，失败回调里弹错。
-    /// 另加 30 秒后备计时（F5）：从点图标起算，30 秒内无完成回调（进程未死、
-    /// 无错误回调）则按当前阶段弹“启动超时（卡在：<阶段>），请重试”，超时后阶段清零。
+    /// 0.2.27：加载是同步的（dlopen→拦截→跳 main，hook 激活后 main 随即返回），
+    /// 主线程在加载期间被占用，同线程的计时器跑不起来，所以不再设 30 秒后备计时。
     ///
     /// L2 JIT 预检（设计 §3.4，步骤 6 留下的债）：未签名（signed=false）或
     /// 需 JIT（needsJIT）的应用，先查 SBGuestLoader.isJITEnabled；未启用时
     /// 弹“该应用需要 JIT 才能运行”，不发启动请求、不假装启动。
     ///
     /// 0.2.2 注入件签名门：有证书时先跑 SBCertificate.ensureHooksDylibSigned，
-    /// 保证 Tweaks 里的 SBGuestHooks.dylib 带着当前证书的 Team，成功才发重启
-    /// 请求；签名失败直接弹错，不发重启（否则客 App 在新进程里加载注入件时
+    /// 保证 Tweaks 里的 SBGuestHooks.dylib 带着当前证书的 Team，成功才发启动
+    /// 请求；签名失败直接弹错，不发启动（否则客 App 在加载注入件时
     /// 会被 dyld 以 Team 不一致拒绝——0.2.1 自测 dlopen 报的同一个根）。
-    /// 无证书时跳过这一步，由重启请求里的证书门弹“去导入证书”。
+    /// 无证书时跳过这一步，由启动请求里的证书门弹“去导入证书”。
     ///
     /// 0.2.6 重打补丁门：patchRevision 比当前低的已装应用（0.2.4 及更早装的
     /// 包，主可执行文件缺 LC_ID_DYLIB，dlopen 必败——0.2.5 真机实证），
     /// 先走 SBInstaller.repatchInstalledApp 重打补丁 + 重签，成功才继续；
-    /// 失败弹错，不发重启请求。
+    /// 失败弹错，不发启动请求。
     func launchApp(_ app: SBInstalledApp) {
         if app.needsReimport {
             activeAlert = CoordinatorAlert(
@@ -280,20 +293,35 @@ final class SBAppCoordinator: ObservableObject {
             }
         }
         guard !isLaunching else { return }
+        // 0.2.27：已开过的客走恢复路径（不 dlopen、不跑 main、不重调
+        // didFinishLaunching），不走签名门（首次加载时已验过，二进制未变）。
+        // 恢复失败（上下文重上失败）弹错并停住；返回 false（无会话）时落到首次加载。
+        if SBGuestSessionManager.shared().session(forBundleID: app.bundleID) != nil {
+            do {
+                if try SBGuestSessionManager.shared().resumeGuest(withBundleID: app.bundleID) {
+                    SBDiagLog.log("点图标：\(app.bundleID) 已在后台，恢复进入（未重加载）")
+                    return
+                }
+            } catch {
+                SBDiagLog.log("启动失败：\(app.bundleID) 恢复后台会话失败（\(error.localizedDescription)）")
+                self.activeAlert = CoordinatorAlert(title: "启动失败", message: error.localizedDescription)
+                return
+            }
+        }
         isLaunching = true
         // 0.2.11：签名门无条件跑。0.2.10 真机实证（KMusic）：门只在有证书
-        // 且记录 signed==true 时才跑，点图标后照常写收据、重启，新进程
+        // 且记录 signed==true 时才跑，点图标后照常写收据、加载，当前进程
         // 直接走到 dlopen 报 code signature invalid——门没跑等于没门。
         // Team 比对只看二进制本身（记录的 signed 旗标可能是旧的）；无证书
         // 时门只拦不修（ensureLaunchableSignature 内无证书不调 repatch）。
-        // 注入件重签仍需证书：无证书时跳过它，直接发重启请求，由 ObjC 侧
+        // 注入件重签仍需证书：无证书时跳过它，直接发启动请求，由 ObjC 侧
         // 证书门弹“未导入证书”。
         Task {
             var appToLaunch = app
             do {
                 // 0.2.6：旧版本装的包先重打补丁 + 重签（patchRevision < 2 的
                 // 包主可执行文件缺 LC_ID_DYLIB，dlopen 必败——0.2.5 真机实证）。
-                // 重打失败直接弹错，不发重启请求；无证书时不重打（修不了），
+                // 重打失败直接弹错，不发启动请求；无证书时不重打（修不了），
                 // 直接进签名门（门能拦 Team/结构，不依赖证书）。
                 if SBCertificate.hasCertificate,
                    app.patchRevision < SBConstants.patchRevision {
@@ -331,7 +359,7 @@ final class SBAppCoordinator: ObservableObject {
                 }
                 return
             }
-            // 无证书：跳过注入件重签，直接发重启请求（ObjC 侧证书门会弹
+            // 无证书：跳过注入件重签，直接发启动请求（ObjC 侧证书门会弹
             // “未导入证书”并给去导入证书按钮）。
             guard SBCertificate.hasCertificate else {
                 // 0.2.16：同下面 339 行——Swift 6 下 @Sendable 闭包不能捕获 var，
@@ -340,7 +368,7 @@ final class SBAppCoordinator: ObservableObject {
                 //（macos-26-arm64 20261112.0504.1，Xcode 同为 26.2）上它升成
                 // 错误，Archive 步 exit 65。
                 let launchTarget = appToLaunch
-                await MainActor.run { self.requestRestart(app: launchTarget) }
+                await MainActor.run { self.launchGuestInProcess(app: launchTarget) }
                 return
             }
             // 0.2.8：Swift 6 下 @Sendable 闭包不能捕获 var——先把最终值
@@ -350,7 +378,7 @@ final class SBAppCoordinator: ObservableObject {
             let ok = await SBCertificate.ensureHooksDylibSigned()
             await MainActor.run {
                 if ok {
-                    self.requestRestart(app: launchTarget)
+                    self.launchGuestInProcess(app: launchTarget)
                 } else {
                     // 0.2.10 报错日志：注入件签名失败之前只弹弹窗；失败
                     // 的具体原因（无证书/件不在/重签失败）由
@@ -381,12 +409,16 @@ final class SBAppCoordinator: ObservableObject {
         return "旧版本应用升级失败：\(error.localizedDescription)，请删除后重新导入"
     }
 
-    /// 发重启请求（launchApp 的后半段，签名门通过后才进）。
-    private func requestRestart(app: SBInstalledApp) {
+    /// 进程内加载（launchApp 的后半段，签名门通过后才进；0.2.27：不再请求重启）。
+    /// 加载是同步的（dlopen→拦截→跳 main，hook 激活后 main 随即返回），
+    /// 所以不再设 30 秒看门狗——主线程在加载期间被占用，同线程的计时器
+    /// 在主线程阻塞时根本跑不起来，设了也触发不了。
+    private func launchGuestInProcess(app: SBInstalledApp) {
         // 0.2.26 G7：LC 同款（LCAppModel.swift:403-408）——iOS 26+ 且客包带
         // Frameworks/MetalANGLE.framework/MetalANGLE 时，把该路径写进宿主
-        // HOME/Library/preloadLibraries.txt（覆盖写一行）；新进程在 main 里
-        // 读它逐行 dlopen 后删文件。只写 MetalANGLE 这一行，LC 同款。
+        // HOME/Library/preloadLibraries.txt（覆盖写一行）；新鲜进程在 main 里
+        // 读它逐行 dlopen 后删文件；进程内路由 loadGuest 在 dlopen 前读它。
+        // 只写 MetalANGLE 这一行，LC 同款。
         if #available(iOS 26, *) {
             let metalANGLE = app.bundleURL.appendingPathComponent("Frameworks/MetalANGLE.framework/MetalANGLE")
             if FileManager.default.fileExists(atPath: metalANGLE.path) {
@@ -399,22 +431,8 @@ final class SBAppCoordinator: ObservableObject {
                 SBDiagLog.log("预加载：客带 MetalANGLE，写 preloadLibraries.txt")
             }
         }
-        launchWatchdog?.cancel()
-        launchWatchdog = nil
         launchStage = "证书检查"
         let bundleID = app.bundleID
-        let watchdog = DispatchWorkItem { [weak self] in
-            guard let self = self else { return }
-            let stage = self.launchStage ?? "重启请求"
-            // 0.2.10 报错日志：之前只弹“启动超时”，诊断日志里没有这一行。
-            SBDiagLog.log("启动超时：\(bundleID) 卡在：\(stage)（30 秒看门狗，重启请求未回）")
-            self.launchStage = nil
-            self.launchWatchdog = nil
-            self.isLaunching = false
-            self.activeAlert = CoordinatorAlert(title: "启动超时", message: "启动超时（卡在：\(stage)），请重试")
-        }
-        launchWatchdog = watchdog
-        DispatchQueue.main.asyncAfter(deadline: .now() + 30, execute: watchdog)
         SBGuestLoader.shared().requestGuestLaunch(
             withBundleID: app.bundleID,
             containerUUID: app.containerUUID,
@@ -422,14 +440,12 @@ final class SBAppCoordinator: ObservableObject {
             keychainGroup: app.keychainGroup
         ) { [weak self] error in
             guard let self = self else { return }
-            self.launchWatchdog?.cancel()
-            self.launchWatchdog = nil
             self.launchStage = nil
             guard let error = error else { return }
             self.isLaunching = false
             let stage = (error as NSError).userInfo[SBGuestLoaderErrorStageKey] as? String ?? "启动失败"
-            // 0.2.10 报错日志：重启请求失败之前只弹弹窗；原因（证书门/
-            // 包缺失/看门狗/openURL）已由 ObjC 侧记行，这里记弹窗决定。
+            // 0.2.10 报错日志：启动请求失败之前只弹弹窗；原因（证书门/
+            // 包缺失/看门狗）已由 ObjC 侧记行，这里记弹窗决定。
             SBDiagLog.log("启动失败弹窗：[code=\((error as NSError).code)] \(app.bundleID) 阶段：\(stage) \(error.localizedDescription)")
             Task { @MainActor in
                 if (error as NSError).code == SBGuestLoaderErrorCode.bundleNotFound.rawValue {
@@ -449,10 +465,11 @@ final class SBAppCoordinator: ObservableObject {
                 }
             }
         }
-        // 证书门与包检查已同步跑完：回调还没来 = 已通过证书门，进入重启请求阶段。
-        // （证书失败 / 包缺失时回调是同步调的，上面已把 launchStage 置 nil，不会误推进。）
+        // 证书门与包检查已同步跑完：回调还没来 = 已通过证书门，进入加载阶段。
+        // （证书失败 / 包缺失时回调是同步调的，上面已把 launchStage 置 nil，不会误推进。
+        // 进程内加载本身也在 requestGuestLaunch 内同步完成——成功时客已在前台。）
         if launchStage != nil {
-            launchStage = "重启请求"
+            launchStage = "进程内加载"
         }
     }
 

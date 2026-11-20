@@ -218,7 +218,9 @@ enum SBLaunchRouter {
     /// 方按收据弹错——不许静默失败。
     /// 0.2.25：修完不再进程内加载——宿主 UIKit 已初始化，客再调
     /// UIApplicationMain 必崩（nread 0.2.24 崩溃：Dispatch queue already
-    /// set）。修完重新请求重启，让新进程在 UIKit 启动前走 main 前置路加载。
+    /// set）。0.2.27：该句已作废——进程内拦截已装上，修完改回进程内加载，不再重启。
+    /// 0.2.27：进程内拦截已装上（SBGuestMainHook），修完改回进程内加载——
+    /// 不再请求重启，requestGuestLaunch 现在就是进程内加载。
     private static func repairAndLaunchGuest(onRepairSettled: (@MainActor @Sendable () -> Void)?) {
         Task {
             guard let receipt = SBStore.shared.launchReceipt else { return }
@@ -231,15 +233,15 @@ enum SBLaunchRouter {
             do {
                 SBDiagLog.log("启动路由：\(bundleID) 重启路签名逐项不合格或上次死在 dlopen 签名失败，异步强制重打补丁+重签")
                 _ = try await SBInstaller.ensureLaunchableSignature(record)
-                // 0.2.26 D 护栏：同一客连续修→重启超过 2 次仍未成功启动，
-                // 停下来写 guest-failed、界面弹错，不再重启。计数只在成功
-                // 启动（C）或用户重新点图标时归零；修好但预检仍不过时，
+                // 0.2.26 D 护栏：同一客连续修→加载超过 2 次仍未成功启动，
+                // 停下来写 guest-failed、界面弹错，不再修。计数只在成功
+                // 启动（C）或用户重新点图标时归零；修好但加载仍失败时，
                 // 每轮修完到这里计数 +1，第 3 次直接停住。
                 let restartKey = SBStore.repairRestartKey(
                     bundleID: bundleID, diskDirectoryName: record.diskDirectoryName)
                 if SBStore.shared.repairRestartCount(forKey: restartKey) >= 2 {
                     let message = "已连续修复 2 次仍无法启动，已停止自动修复，请检查后重试"
-                    SBDiagLog.log("启动路由：\(bundleID) 护栏停住（连续修→重启已达 2 次），不再重启")
+                    SBDiagLog.log("启动路由：\(bundleID) 护栏停住（连续修→加载已达 2 次），不再修复")
                     await MainActor.run {
                         var failed = SBStore.shared.launchReceipt ?? SBLaunchReceipt.requested(
                             guestBundleID: bundleID,
@@ -258,7 +260,7 @@ enum SBLaunchRouter {
                     return
                 }
                 SBStore.shared.incrementRepairRestartCount(forKey: restartKey)
-                SBDiagLog.log("启动路由：\(bundleID) 重启路重签完成，重新请求重启（新进程走 main 前置路）")
+                SBDiagLog.log("启动路由：\(bundleID) 重启路重签完成，进程内加载（0.2.27，不再重启）")
                 await MainActor.run {
                     SBGuestLoader.shared().requestGuestLaunch(
                         withBundleID: bundleID,
@@ -267,9 +269,9 @@ enum SBLaunchRouter {
                         keychainGroup: record.keychainGroup
                     ) { error in
                         if let error {
-                            // 重启请求失败：按原有失败路径处理（guest-failed 收据 + 弹错）。
+                            // 加载失败：按原有失败路径处理（guest-failed 收据 + 弹错）。
                             let message = error.localizedDescription
-                            SBDiagLog.log("启动路由：\(bundleID) 修完重起请求失败（[code=\((error as NSError).code)] \(message)），不加载")
+                            SBDiagLog.log("启动路由：\(bundleID) 修完进程内加载失败（[code=\((error as NSError).code)] \(message)），不加载")
                             var failed = SBStore.shared.launchReceipt ?? SBLaunchReceipt.requested(
                                 guestBundleID: bundleID,
                                 containerUUID: record.containerUUID,
@@ -283,7 +285,7 @@ enum SBLaunchRouter {
                                 success: false, message: message, containerUUID: record.containerUUID)
                             SBStore.shared.clearGuestSelection()
                         } else {
-                            SBDiagLog.log("启动路由：\(bundleID) 修完重起请求已发出，0.6 秒后退出进程")
+                            SBDiagLog.log("启动路由：\(bundleID) 修完进程内加载完成（客在前台）")
                         }
                         onRepairSettled?()
                     }
@@ -314,7 +316,7 @@ enum SBLaunchRouter {
 
     /// 0.2.25：main.m 在 UIKit 启动前调用的预检（见 SBGuestLaunchPreflight）。
     /// 收据就绪且逐项全过时返回 1——main.m 直接在 main 里加载客 App；
-    /// 需要修复时返回 2——main.m 进宿主 UI 走异步修复（修完再重起一次）；
+    /// 需要修复时返回 2——main.m 进宿主 UI 走异步修复（0.2.27：修完进程内加载，不再重起）；
     /// 其余情况返回 0——进宿主 UI，沿用原有路由。
     /// 注意：这里跑的门与 routeOnLaunchIfNeeded 里的同一套（注入件同步、
     /// 对账、过期收据、Team 门、签名逐项门），顺序一致；幂等，多跑一遍无害。
@@ -362,6 +364,21 @@ enum SBLaunchRouter {
         SBStore.shared.resetRepairRestartCount(
             forKey: SBStore.repairRestartKey(bundleID: bundleID, diskDirectoryName: diskDirectoryName))
         SBDiagLog.log("启动路由：\(bundleID) 客 main 返回（返回码 \(returnCode)），记成功并清护栏计数")
+    }
+
+    /// 0.2.27：进程内激活成功，记成功、护栏计数归零。调用点是会话管理器
+    ///（客窗出现、激活完成时）；与 noteGuestLaunchedSuccessfully 的区别是
+    /// 触发点——进程内路客 main 在 hook 激活后随即返回，那次返回≠退出，
+    /// 不能在 bootstrap 成功路记，要在激活完成时记。
+    static func noteGuestActivatedInProcess(bundleID: String, containerUUID: String,
+                                            diskDirectoryName: String?) {
+        SBStore.shared.recordLaunchResult(
+            bundleID: bundleID, diskDirectoryName: diskDirectoryName,
+            success: true, message: "客 App 已在进程内启动（拦截 UIApplicationMain 成功）",
+            containerUUID: containerUUID)
+        SBStore.shared.resetRepairRestartCount(
+            forKey: SBStore.repairRestartKey(bundleID: bundleID, diskDirectoryName: diskDirectoryName))
+        SBDiagLog.log("启动路由：\(bundleID) 进程内激活成功，记成功并清护栏计数")
     }
 
     /// App 启动时调用一次。若本次是“重起进客 App”，尝试加载客 App；
@@ -415,9 +432,11 @@ enum SBLaunchRouter {
             return
         }
         // 0.2.25：同步路是 main 前置路的兜底——正常情况下就绪的收据已被 main.m
-        // 消费掉（预检通过直接加载、需修复走异步修复再重起），到这里说明前置路
+        // 消费掉（预检通过直接加载、需修复走异步修复再加载），到这里说明前置路
         // 被绕过；仍按原有逻辑进程内加载一次，不静默丢掉这次启动。
-        let loaded = SBGuestLoader.shared().launchGuestIfRequested()
+        // 0.2.27：宿主 UIKit 已在跑，必须走进程内加载（带拦截）；调新鲜进程
+        // 加载会让客调第二遍 UIApplicationMain 而崩（nread 0.2.24）。
+        let loaded = SBGuestLoader.shared().launchGuestInProcessIfRequested()
         if !loaded {
             // 客加载失败：SBGuestLoader 已写收据（guest-failed）与上次启动结果；
             // 清掉选中标记，回桌面。
@@ -456,5 +475,13 @@ enum SBLaunchRouter {
         SBLaunchRouter.noteGuestLaunchedSuccessfully(
             bundleID: bundleID, containerUUID: containerUUID,
             diskDirectoryName: diskDirectoryName, returnCode: returnCode)
+    }
+
+    /// 0.2.27：进程内激活成功时记成功（SBGuestSessionManager 激活完成时调）。
+    @objc static func noteGuestActivatedInProcess(bundleID: String, containerUUID: String,
+                                                  diskDirectoryName: String?) {
+        SBLaunchRouter.noteGuestActivatedInProcess(
+            bundleID: bundleID, containerUUID: containerUUID,
+            diskDirectoryName: diskDirectoryName)
     }
 }

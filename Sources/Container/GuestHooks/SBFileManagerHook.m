@@ -135,7 +135,20 @@ static NSString *SBHookedNSHomeDirectory(void) {
     return nil;
 }
 
-void SBFileManagerHookInstall(void) {
+/// 已装过 NSHomeDirectory 重绑的客可执行路径（按路径去重）。
+static NSMutableSet<NSString *> *SBFileManagerInstalledExecPaths(void) {
+    static NSMutableSet<NSString *> *set = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        set = [NSMutableSet set];
+    });
+    return set;
+}
+
+/// 按客镜像安装（0.2.27）：方法交换（containerURL / createDirectory）是
+/// 进程全局的、只装一次（替身按调用取环境变量，已是动态的）；NSHomeDirectory
+/// 重绑在客镜像上，各客镜像各装一套（按执行路径去重）。
+void SBFileManagerHookInstallForGuestImage(void) {
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
         // 0.2.26 G4b：WebKit 镜像基址现找一次（见文件头），供 Cookies hook
@@ -156,16 +169,32 @@ void SBFileManagerHookInstall(void) {
         if (origCreateDir && replCreateDir) {
             method_exchangeImplementations(origCreateDir, replCreateDir);
         }
-        const struct mach_header *guestHeader = SBGuestImageHeader();
-        if (!guestHeader) {
-            NSLog(@"[Sealbox] NSHomeDirectory Hook 未安装：找不到客可执行镜像");
-            return;
-        }
-        g_orig_NSHomeDirectory = (NSString *(*)(void))dlsym(RTLD_DEFAULT, "NSHomeDirectory");
-        if (g_orig_NSHomeDirectory) {
-            litehook_rebind_symbol(guestHeader, (void *)g_orig_NSHomeDirectory, (void *)SBHookedNSHomeDirectory, NULL);
-            NSLog(@"[Sealbox] NSHomeDirectory Hook 已安装（0.2.25 函数指针传法）");
-        }
-        NSLog(@"[Sealbox] FileManager Hook 已安装：containerURLForSecurityApplicationGroupIdentifier（0.2.26 按组分子目录）＋ createDirectoryAtPath（WebKit Cookies 修法）");
     });
+    const struct mach_header *guestHeader = SBGuestImageHeader();
+    if (!guestHeader) {
+        NSLog(@"[Sealbox] NSHomeDirectory Hook 未安装：找不到客可执行镜像");
+        return;
+    }
+    const char *execPath = getenv("SB_GUEST_EXEC_PATH");
+    NSString *execPathString = execPath ? [NSString stringWithUTF8String:execPath] : @"";
+    NSMutableSet<NSString *> *installed = SBFileManagerInstalledExecPaths();
+    @synchronized (installed) {
+        if ([installed containsObject:execPathString]) {
+            return; // 该客镜像已装过
+        }
+        [installed addObject:execPathString];
+    }
+    if (!g_orig_NSHomeDirectory) {
+        g_orig_NSHomeDirectory = (NSString *(*)(void))dlsym(RTLD_DEFAULT, "NSHomeDirectory");
+    }
+    if (g_orig_NSHomeDirectory) {
+        litehook_rebind_symbol(guestHeader, (void *)g_orig_NSHomeDirectory, (void *)SBHookedNSHomeDirectory, NULL);
+        NSLog(@"[Sealbox] NSHomeDirectory Hook 已安装（0.2.25 函数指针传法；0.2.27 按客镜像）");
+    }
+    NSLog(@"[Sealbox] FileManager Hook 已安装：containerURLForSecurityApplicationGroupIdentifier（0.2.26 按组分子目录）＋ createDirectoryAtPath（WebKit Cookies 修法）");
+}
+
+/// 旧入口（兼容）：即 per-guest 安装。
+void SBFileManagerHookInstall(void) {
+    SBFileManagerHookInstallForGuestImage();
 }

@@ -33,9 +33,6 @@ enum SBConstants {
     /// 证书文件（App Group 容器内）。
     static let certificateFileName = "Certificate.p12"
 
-    /// 自有 URL scheme，用于“重启宿主进程”请求。
-    static let launchURLScheme = "sealbox-launch"
-
     /// 重启请求看门狗：发出请求后本进程若在此时限内仍活着，即判定请求被系统丢弃。
     static let restartDeadlineSeconds: TimeInterval = 5.0
 
