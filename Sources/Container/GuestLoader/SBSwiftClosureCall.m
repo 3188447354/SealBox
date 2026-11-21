@@ -1,6 +1,6 @@
 // SBSwiftClosureCall.m — 经 Mirror 发现的 Swift 闭包 () -> T 的 C 层调用（0.2.34）。
 //
-// 证据链见 SBSwiftClosureCall.h 头注释与 build log 0.2.34 节。
+// 证据链见 SBSwiftClosureCall.h 头注释与 build log 0.2.34/0.2.35/0.2.36 节。
 // 要点重述：
 //  - Any 存在容器 32 字节：值缓冲 0–23，类型元数据 24–31。
 //  - 闭包值（thick 函数值）16 字节：函数指针在 +0，上下文在 +8
@@ -9,20 +9,38 @@
 //  - 函数类型元数据 kind=0x302：Kind@0、Flags@8、ResultType@16。
 //  - 结果类型元数据 metadata[-1] 是 ValueWitnesses 指针；
 //    size@64、stride@72、flags@80（uint32）。
-//  - 直接路：loadable 结果展开 ≤4 寄存器（Clang SwiftABIInfo::shouldPassIndirectly
-//    → occupiesMoreThan(..., 4)），返回 4×uintptr_t 结构体，值在 x0–x3；
-//    Any 值缓冲只有 24 字节：size≤24 且 align≤8 才 inline，否则装盒
-//    （0.2.35 修：直接 memcpy 再写 out[3] 会吃掉值字节 24–31）。
-//  - 间接路：IsNonInline（address-only）置位即间接，与 size 无关；或 loadable
-//    但 size>32（装不进 4 个寄存器），返回一个 4096 字节、16 字节对齐的
-//    结构体，Clang 降为 sret，指针在 x8。
+//  - 调用约定（0.2.36 定论，取代 0.2.34/0.2.35 的 size/flags 判定）：
+//    本函数唯一调用方是 SBSwiftUIEmbed.findRootView，闭包一律取自 SwiftUI
+//    视图结构体的泛型字段（如 WindowGroup<Content> 的 () -> Content）。
+//    该函数值按抽象签名编译：泛型上下文里结果布局未知，语义 lowering 把
+//    结果定为间接（swiftlang/swift docs/ABI/CallingConvention.rst：
+//    “a function intended to be passed as this argument must pass [results]
+//    indirectly, even if they are actually known statically to be
+//    non-address-only types like Int and Float”），物理 lowering 再把间接
+//    结果化作 sret 指针（x8）。因此——与结果尺寸/flags 无关，一律间接。
+//    实证：Asspp 4.2.1（与 MJ 已装版五项指纹一致：43,826,800 字节/10700 页、
+//    __TEXT 0x10b4000、imports 4443、符号池 192300、entryoff 0x4000）
+//    的 content.lazy 闭包（文件偏移 0x5B44，MJ 两回日志 fn 一致）：入口
+//    `mov x19, x8` 存 sret，返回前 `str x8, [x19]`＋`strb w9, [x19, #8]`
+//    把 9 字节 _ConditionalContent 写进 *x8，x0 不返回值。
+//    该结果 size=9 stride=16 flags=0x10007（IsNonPOD 置位、IsNonInline
+//    未置位），0.2.35 判定走直接路、x8 是垃圾、callee 经 x8 写内存即陷阱
+//    ——0.2.35 真机 Asspp 两回死在闭包调用里即此。VWT flags 只描述结果
+//    类型的存储属性（IsNonInline＝address-only 存储），不能决定函数值的
+//    调用约定；0.2.34/0.2.35 用 flags/size 选路是把两件事混为一谈。
+//    Husk 的 32 字节结果（flags=0x30007）走间接能通，是同一规则的另一面。
+//  - 间接路：4096 字节结构体返回值，Clang 降为 sret，指针在 x8，
+//    上下文仍走 x20（swiftself）。调用方在栈上开 4096 字节、16 字节对齐的缓冲，
+//    callee 写 size（≤4096）字节进去，余下字节忽略。4096 覆盖 Husk 的 216 字节
+//    及一般 ContentView；超 4096 的结果干净拒绝（见判定）。
 //  - 不调任何 value witness 函数（witness 指针带 ptrauth 签名，C 层裸调会崩）。
 //    搬运只用 memcpy：take 的定义就是 bitwise copy，适用于 bitwise-takable
 //    类型；非 bitwise-takable 的结果一律干净拒绝。
 //    生命周期：callee 交出 +1 的值，memcpy 进盒即一次 take；源槽是栈内存，
 //    永不析构，不多 retain、不调 destroy，盒销毁时 Swift 释放一次。
 //  - swift_allocBox 是 libswiftCore 导出的 swiftcall 函数，返回
-//    BoxPair＝{object, buffer}；间接路与直接装盒路共用。
+//    BoxPair＝{object, buffer}；值类型结果装盒路共用；类结果不装盒，
+//    直接取 sret 缓冲里的对象指针。
 #import "SBSwiftClosureCall.h"
 #import "SBDiagLog.h"
 #import <dlfcn.h>
@@ -55,15 +73,13 @@
 #define SB_VW_NON_BITWISE_TAKABLE 0x00100000u
 #define SB_VW_INCOMPLETE 0x00400000u
 
-// ---- swiftcall 调用桩（Clang 按 Swift 聚合降低展开）----
-// 直接路：4×uintptr_t＝4 个 int 寄存器，≤4 → 直接返回，值在 x0–x3。
-typedef struct { uintptr_t w0, w1, w2, w3; } SBClosureRet4;
-typedef SBClosureRet4 (__attribute__((swiftcall)) *SBClosureDirectFn)(
-    void *ctx __attribute__((swiftself)));
-// 间接路：4096 字节结构体＝512 个 int 寄存器，>4 → 间接返回，sret 指针走 x8，
+// ---- swiftcall 调用桩 ----
+// 间接路（唯一调用路，0.2.36）：4096 字节结构体＝512 个 int 寄存器，>4 → 间接返回，sret 指针走 x8，
 // 上下文仍走 x20（swiftself）。调用方在栈上开 4096 字节、16 字节对齐的缓冲，
 // callee 写 size（≤4096）字节进去，余下字节忽略。4096 覆盖 Husk 的 216 字节
 // 及一般 ContentView；超 4096 的结果干净拒绝（见判定）。
+// 直接路已删（0.2.36）：泛型字段里取出的闭包一律按抽象签名间接返回，
+// 直接路对 Asspp 的 9 字节结果就是死因（见文件头注释）。
 typedef struct __attribute__((aligned(16))) { uintptr_t w[512]; } SBClosureRetHuge;
 typedef SBClosureRetHuge (__attribute__((swiftcall)) *SBClosureIndirectHugeFn)(
     void *ctx __attribute__((swiftself)));
@@ -166,16 +182,17 @@ BOOL SBCallSwiftClosure(const void *closureAny, void *outAny,
     uintptr_t rkind = rmd[0];
     SBDiagLogLine([[NSString stringWithFormat:@"Swift 闭包调用：结果 kind=0x%lx", (unsigned long)rkind] UTF8String]);
 
-    // 3a. 类结果（Class/ObjCClassWrapper/ForeignClass）：单指针，直接返回。
+    // 3a. 类结果（Class/ObjCClassWrapper/ForeignClass）：单指针，同样间接返回。
+    // 抽象签名下结果走 sret：callee 把 8 字节对象指针写进 *x8；直接取，不装盒。
     if (rkind == SB_MD_KIND_CLASS || rkind == SB_MD_KIND_OBJC_CLASS_WRAPPER ||
         rkind == SB_MD_KIND_FOREIGN_CLASS) {
-        SBClosureRet4 ret = ((SBClosureDirectFn)fn)(callCtx);
+        SBClosureRetHuge ret = ((SBClosureIndirectHugeFn)fn)(callCtx);
         uintptr_t *out = (uintptr_t *)outAny;
-        out[0] = ret.w0;
+        out[0] = ret.w[0];
         out[1] = 0;
         out[2] = 0;
         out[3] = (uintptr_t)resultMD;
-        SBDiagLogLine([[NSString stringWithFormat:@"Swift 闭包调用：类结果，直接返回，对象=%p", (void *)ret.w0] UTF8String]);
+        SBDiagLogLine([[NSString stringWithFormat:@"Swift 闭包调用：类结果，间接返回，对象=%p", (void *)ret.w[0]] UTF8String]);
         return YES;
     }
 
@@ -214,60 +231,37 @@ BOOL SBCallSwiftClosure(const void *closureAny, void *outAny,
         return YES;
     }
 
-    // 3d. 间接返回判定（0.2.35 重写；判定表原型见 tmp-sb0235verify/verify_0235.py）。
-    //  (i) IsNonInline 置位 ⇒ address-only：值须 out-of-line 存储
-    //  （MetadataValues.h：isInlineStorage() "True if the type requires
-    //  out-of-line allocation of its storage"），调用方传/收一律间接，
-    //  与 size 无关。0.2.34 的 size≤24 附加条件是错的：真机 Husk 闭包
-    //  的运行时包装壳 size=32、flags=0x30007 因此被拒（code 1004）。
-    //  (ii) 未置位但 size>32 ⇒ loadable 且装不进 4 个寄存器，一定间接
-    //  （Husk 闭包静态返回 216 字节即此路；反汇编已证入口存 x8）。
-    //  0.2.34 的教训：本函数曾有一处早期拒绝（size>32 直接拒），它先于
-    //  3d 触发，使 3d 的 size>32 间接分支成死代码——0.2.34 报告称“已改
-    //  间接”但残留未删，216 字节结果仍会被拒；0.2.35 已删该早期拒绝。
-    //  两路共用一个大 sret 缓冲（4096 字节栈空间，16 字节对齐），callee
-    //  写 rsize 字节，再 swift_allocBox 建盒、memcpy 搬入
-    //  （bitwise-takable 类型 take 即 memcpy，不调 witness 函数）。
-    //  生命周期：callee 交出的是 +1 的值（sret 槽 / 寄存器里），memcpy
-    //  搬入盒即一次 take——源槽是栈内存，永不析构，不多 retain、不调
-    //  destroy；盒销毁时 Swift 按值 witness 释放一次，不多不少。
-    //  拒绝只留给真正判不出的情形（非 bitwise-takable、对齐>16、size>4096），
-    //  且拒绝行须写清判定依据（size/align/flags）。
-    BOOL indirect = NO;
-    if (rflags & SB_VW_NON_INLINE) {
-        if (rflags & SB_VW_NON_BITWISE_TAKABLE) {
-            return SBFail(errorOut, errorOutLen, "结果 address-only 且非 bitwise-takable，无法搬运，拒绝");
-        }
-        if (ralign > 16) {
-            char buf[192];
-            snprintf(buf, sizeof(buf), "结果 address-only 且对齐 %zu，超 sret 缓冲对齐（16），拒绝",
-                     ralign);
-            return SBFail(errorOut, errorOutLen, buf);
-        }
-        if (rsize > 4096) {
-            char buf[160];
-            snprintf(buf, sizeof(buf), "结果 %zu 字节，超 sret 缓冲 4096，拒绝", rsize);
-            return SBFail(errorOut, errorOutLen, buf);
-        }
-        indirect = YES;
-    } else if (rsize > 32) {
-        if (rflags & SB_VW_NON_BITWISE_TAKABLE) {
-            return SBFail(errorOut, errorOutLen, "结果 >32 字节且非 bitwise-takable，无法搬运，拒绝");
-        }
-        if (ralign > 16) {
-            char buf[192];
-            snprintf(buf, sizeof(buf), "结果 %zu 字节且对齐 %zu，超 sret 缓冲对齐（16），拒绝",
-                     rsize, ralign);
-            return SBFail(errorOut, errorOutLen, buf);
-        }
-        if (rsize > 4096) {
-            char buf[160];
-            snprintf(buf, sizeof(buf), "结果 %zu 字节，超 sret 缓冲 4096，拒绝", rsize);
-            return SBFail(errorOut, errorOutLen, buf);
-        }
-        indirect = YES;
+    // 3d. 一律间接返回（0.2.36；判定表原型见 tmp-sb0236verify/verify_0236_closure.py）。
+    // 闭包取自泛型字段，按抽象签名编译，结果一律走 sret（x8），与 size/flags
+    // 无关——0.2.34/0.2.35 用 IsNonInline/size 选路是错的：Asspp 的 9 字节
+    // 结果 flags=0x10007 被判直接，x8 是垃圾、callee 经 x8 写内存即陷阱，
+    // 0.2.35 真机两回死在闭包调用里即此。VWT flags 只决定结果能不能 memcpy
+    // 搬运，不决定调用约定。sret 缓冲 4096 字节栈空间、16 字节对齐，callee
+    // 写 rsize 字节，再 swift_allocBox 建盒、memcpy 搬入（bitwise-takable
+    // 类型 take 即 memcpy，不调 witness 函数）。
+    // 生命周期：callee 交出的是 +1 的值（sret 槽里），memcpy 搬入盒即一次
+    // take——源槽是栈内存，永不析构，不多 retain、不调 destroy；盒销毁时
+    // Swift 按值 witness 释放一次，不多不少。
+    // 拒绝只留给真正搬不出的情形（非 bitwise-takable、对齐>16、size>4096），
+    // 且拒绝行须写清判定依据（size/align/flags）。
+    if (rflags & SB_VW_NON_BITWISE_TAKABLE) {
+        char buf[192];
+        snprintf(buf, sizeof(buf), "结果 size=%zu flags=0x%x 非 bitwise-takable，无法 memcpy 搬运，拒绝",
+                 rsize, rflags);
+        return SBFail(errorOut, errorOutLen, buf);
     }
-    if (indirect) {
+    if (ralign > 16) {
+        char buf[192];
+        snprintf(buf, sizeof(buf), "结果 size=%zu 对齐 %zu，超 sret 缓冲对齐（16），拒绝",
+                 rsize, ralign);
+        return SBFail(errorOut, errorOutLen, buf);
+    }
+    if (rsize > 4096) {
+        char buf[160];
+        snprintf(buf, sizeof(buf), "结果 %zu 字节，超 sret 缓冲 4096，拒绝", rsize);
+        return SBFail(errorOut, errorOutLen, buf);
+    }
+    {
         SBClosureRetHuge ret = ((SBClosureIndirectHugeFn)fn)(callCtx);
         SBAllocBoxFn allocBox = SBGetAllocBox();
         if (allocBox == NULL) {
@@ -288,39 +282,4 @@ BOOL SBCallSwiftClosure(const void *closureAny, void *outAny,
         return YES;
     }
 
-    // 3e. 直接路：loadable（IsNonInline 未置位），返回值在 x0–x3。
-    // Any 值缓冲只有 24 字节（NumWords_ValueBuffer=3）：size≤24 且 align≤8
-    // 才 inline；25–32 字节或 align>8 须装盒——直接 memcpy 再写 out[3]
-    // 会吃掉值字节 24–31（0.2.35 修，原型见 tmp-sb0235verify/verify_0235.py）。
-    // 已知边界：≤24 字节 struct 含 ≥5 个浮点/向量标量字段时展开超 4 寄存器、
-    // 实为间接返回，本路会误判（见头注释）；SwiftUI View 结构体以指针为主。
-    {
-        SBClosureRet4 ret = ((SBClosureDirectFn)fn)(callCtx);
-        uintptr_t *out = (uintptr_t *)outAny;
-        if (rsize <= 24 && ralign <= 8) {
-            out[0] = 0;
-            out[1] = 0;
-            out[2] = 0;
-            memcpy(out, &ret, rsize);
-            out[3] = (uintptr_t)resultMD;
-            SBDiagLogLine([[NSString stringWithFormat:@"Swift 闭包调用：直接返回，size=%zu 已填 Any", rsize] UTF8String]);
-        } else {
-            SBAllocBoxFn allocBox = SBGetAllocBox();
-            if (allocBox == NULL) {
-                return SBFail(errorOut, errorOutLen, "swift_allocBox 未找到");
-            }
-            SBBoxPair box = allocBox(resultMD);
-            if (box.object == NULL || box.buffer == NULL) {
-                return SBFail(errorOut, errorOutLen, "swift_allocBox 失败");
-            }
-            memset(box.buffer, 0, rstride);
-            memcpy(box.buffer, &ret, rsize);
-            out[0] = (uintptr_t)box.object;
-            out[1] = 0;
-            out[2] = 0;
-            out[3] = (uintptr_t)resultMD;
-            SBDiagLogLine([[NSString stringWithFormat:@"Swift 闭包调用：直接返回，size=%zu 已装盒", rsize] UTF8String]);
-        }
-        return YES;
-    }
 }

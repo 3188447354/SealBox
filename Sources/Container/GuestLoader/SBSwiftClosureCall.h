@@ -7,7 +7,7 @@
 // 用 swiftcall 调它，再把结果包回 Any。
 //
 // 调用约定核定（源码实证，见 build log 0.2.34 节；Husk 2.0 实际闭包的
-// 返回约定另由反汇编核定，两者须一致）：
+// 返回约定另由反汇编核定，两者须一致；0.2.36 改判：见下）：
 //  - 函数类型元数据（kind=0x302）：Kind@0（8 字节）、Flags@8（size_t，
 //    Convention 在 bits 16–23：Swift=0、Block=1、Thin=2、C=3；
 //    NumParameters 在 bits 0–15；Throws 0x01000000；Async 0x20000000；
@@ -17,23 +17,19 @@
 //    size@64、stride@72、flags@80（uint32，alignment＝低字节＋1；
 //    IsNonInline=0x00020000、IsNonBitwiseTakable=0x00100000、
 //    Incomplete=0x00400000）、extraInhabitantCount@84。
-//  - 直接返回当且仅当结果的标量展开 ≤4 个寄存器（Clang SwiftABIInfo::
-//    shouldPassIndirectly → occupiesMoreThan(..., 4)；AArch64 不覆写）；
-//    间接返回时 sret 指针在 x8（AAPCS），上下文（swiftself）在 x20。
-//  - 不调任何 value witness 函数：直接/间接两路都只在 bitwise-takable
-//    类型上用 memcpy 搬运（take 的定义就是 bitwise copy）；witness 函数
-//    指针是 ptrauth 签名的，C 层裸调会崩，故一律不用。
-//  - 判定不出时干净拒绝（返回 NO），绝不猜任一方向：size>4096、
-//    alignment>16 的大结果、IsNonInline 且 size 25–32、IsNonInline 且非
-//    bitwise-takable、alignment>8 的非内联小结果、以及下述已知边界。
-//
-// 已知边界（见 build log 0.2.34 节）：直接路要求结果 loadable 且 size≤24，
-// 但标量展开的寄存器数还取决于字段构成——一个 ≤24 字节的 struct 若含 ≥5 个
-// 浮点/向量标量字段（如 5 个 Float），展开超 4 寄存器、编译器会改间接返回，
-// 而本函数只看 size/flags 会误判为直接。SwiftUI View 结构体的存储属性
-// 实际是引用/包装（指针）为主；Husk 的实际闭包已由反汇编核定（见 build
-// log），其它客若命中该形状会在真机日志里表现为结果错乱——届时按字段记录
-// 补寄存器计数，不在此版臆测修法。
+//  - 一律间接返回（0.2.36 定论，取代 0.2.34/0.2.35 的 size/flags 选路）：
+//    本函数唯一调用方是 findRootView，闭包一律取自 SwiftUI 视图结构体的
+//    泛型字段（如 WindowGroup<Content> 的 () -> Content），该函数值按抽象
+//    签名编译，结果一律走 sret（x8），与尺寸/flags 无关。实证：Asspp 4.2.1
+//    的 content.lazy 闭包（文件偏移 0x5B44）入口 `mov x19, x8`、返回前把
+//    9 字节结果写进 *x8；其 size=9 flags=0x10007 在 0.2.35 判定下走直接路
+//    即死因（见 build log 0.2.36 节与 tmp-sb0236verify/verify_0236_closure.py）。
+//    VWT flags 只决定结果能不能 memcpy 搬运，不决定调用约定。
+//  - 不调任何 value witness 函数：只在 bitwise-takable 类型上用 memcpy
+//    搬运（take 的定义就是 bitwise copy）；witness 函数指针是 ptrauth
+//    签名的，C 层裸调会崩，故一律不用。
+//  - 拒绝只留给真正搬不出的情形：非 bitwise-takable、alignment>16、
+//    size>4096；拒绝行须写清判定依据（size/align/flags）。
 #import <Foundation/Foundation.h>
 
 NS_ASSUME_NONNULL_BEGIN

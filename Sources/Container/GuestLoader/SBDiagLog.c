@@ -40,6 +40,7 @@
 #define SB_DIAG_READ_CAP (SB_DIAG_MAX_BYTES + 1024)
 #define SB_DIAG_FILE_PREFIX "SBStartupLog"
 #define SB_DIAG_DLOPEN_MARKER_NAME "SBStartupLog-dlopen-marker.txt"
+#define SB_DIAG_WILLCONNECT_MARKER_NAME "SBStartupLog-willconnect-marker.txt"
 #define SB_DIAG_MAX_FILES 20
 #define SB_DIAG_MAX_TOTAL_BYTES (2 * 1024 * 1024)
 
@@ -52,6 +53,7 @@ static char g_dir[PATH_MAX + 64];
 static char g_currentPath[PATH_MAX + 64];
 static char g_currentName[256];
 static char g_dlopenMarkerPath[PATH_MAX + 64];
+static char g_willConnectMarkerPath[PATH_MAX + 64];
 
 /// 读整个文件（上限 SB_DIAG_READ_CAP），NUL 结尾；失败返回 NULL。
 static char *SBDiagReadFile(const char *path, size_t *lenOut) {
@@ -147,47 +149,22 @@ static void SBDiagWriteAll(int fd, const char *buf, size_t len) {
     (void)fsync(fd);
 }
 
-/// 文件尾部（最后 4KB，完成标记写在末尾一行）是否含完成标记。
-// 只读尾部：文件再大也不用全读，标记在末尾才有意义。
+/// 文件任意位置是否含完成标记。
+// 0.2.36：之前只读尾部 4KB，但标记写在启动初期（第 9 行附近）；日志超过 4KB
+//（几行签名逐项就上万字节）时标记早已滑出尾部窗口，任何正常启动的长日志
+// 下次都会被误改名 -crashed——0.2.35 的 7 份日志全都 >10KB，标记全不在
+// 尾部 4KB 里，6 份被误标 -crashed（第 7 份只是还没等到下次启动来改名）。
+// -crashed 后缀本身不能证明进程崩了（183539 的进程结束原因仍查不到，
+// 见 build log 0.2.36 节）。改读全文搜标记（单文件上限 1MB）。
 static int SBDiagFileHasMarker(const char *path) {
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) {
+    size_t len = 0;
+    char *text = SBDiagReadFile(path, &len);
+    if (!text) {
         return 0;
     }
-    off_t size = lseek(fd, 0, SEEK_END);
-    if (size < 0) {
-        close(fd);
-        return 0;
-    }
-    off_t start = size > 4096 ? size - 4096 : 0;
-    if (lseek(fd, start, SEEK_SET) < 0) {
-        close(fd);
-        return 0;
-    }
-    char buf[4096 + 1];
-    size_t got = 0;
-    for (;;) {
-        ssize_t n = read(fd, buf + got, sizeof(buf) - 1 - got);
-        if (n < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            break;
-        }
-        if (n == 0) {
-            break;
-        }
-        got += (size_t)n;
-        if (got >= sizeof(buf) - 1) {
-            break;
-        }
-    }
-    close(fd);
-    if (got == 0) {
-        return 0;
-    }
-    buf[got] = '\0';
-    return strstr(buf, SB_DIAG_MARKER) != NULL;
+    int found = strstr(text, SB_DIAG_MARKER) != NULL;
+    free(text);
+    return found;
 }
 
 /// 是否日志文件名（SBStartupLog- 开头、.txt 结尾，dlopen 标记文件除外）。
@@ -200,6 +177,9 @@ static int SBDiagIsLogFileName(const char *name) {
         return 0;
     }
     if (strcmp(name, SB_DIAG_DLOPEN_MARKER_NAME) == 0) {
+        return 0;
+    }
+    if (strcmp(name, SB_DIAG_WILLCONNECT_MARKER_NAME) == 0) {
         return 0;
     }
     return 1;
@@ -444,6 +424,12 @@ void SBDiagLogBeginRun(void) {
         pthread_mutex_unlock(&g_lock);
         return;
     }
+    // 0.2.36：willConnect 标记路径与 dlopen 标记同款。
+    rc = snprintf(g_willConnectMarkerPath, sizeof(g_willConnectMarkerPath), "%s/%s", g_dir, SB_DIAG_WILLCONNECT_MARKER_NAME);
+    if (rc < 0 || (size_t)rc >= sizeof(g_willConnectMarkerPath)) {
+        pthread_mutex_unlock(&g_lock);
+        return;
+    }
     // 上一级 Documents 不一定存在（如测试沙盒）：先建它再建 Logs。
     // 设备上容器目录本就存在，两次 mkdir 都是空操作。
     {
@@ -497,6 +483,27 @@ void SBDiagLogBeginRun(void) {
         free(marker);
         (void)unlink(g_dlopenMarkerPath);
     }
+    // 0.2.36：willConnect 标记还在 = 上次启动死在客 scene delegate willConnect
+    // 里（Swift trap 抓不住，日志只断在“调用…”行；有此标记不用靠缺行推断）。
+    char staleWillConnectGuest[256] = {0};
+    int hasStaleWillConnectMarker = 0;
+    if (g_willConnectMarkerPath[0] != '\0') {
+        size_t markerLen = 0;
+        char *marker = SBDiagReadFile(g_willConnectMarkerPath, &markerLen);
+        if (marker && markerLen > 0) {
+            hasStaleWillConnectMarker = 1;
+            size_t copyLen = markerLen < sizeof(staleWillConnectGuest) - 1
+                ? markerLen : sizeof(staleWillConnectGuest) - 1;
+            memcpy(staleWillConnectGuest, marker, copyLen);
+            staleWillConnectGuest[copyLen] = '\0';
+            char *nl = strchr(staleWillConnectGuest, '\n');
+            if (nl) {
+                *nl = '\0';
+            }
+        }
+        free(marker);
+        (void)unlink(g_willConnectMarkerPath);
+    }
     pthread_mutex_unlock(&g_lock);
     SBDiagLogLine("进程启动");
     {
@@ -512,6 +519,15 @@ void SBDiagLogBeginRun(void) {
         int n = snprintf(line, sizeof(line),
                          "上次启动死在 dlopen 里（标记文件仍在，客=%s）",
                          staleDlopenGuest[0] != '\0' ? staleDlopenGuest : "（未知）");
+        if (n > 0) {
+            SBDiagLogLine(line);
+        }
+    }
+    if (hasStaleWillConnectMarker) {
+        char line[512];
+        int n = snprintf(line, sizeof(line),
+                         "上次启动死在客 scene delegate willConnect 里（标记文件仍在，客=%s）",
+                         staleWillConnectGuest[0] != '\0' ? staleWillConnectGuest : "（未知）");
         if (n > 0) {
             SBDiagLogLine(line);
         }
@@ -612,6 +628,47 @@ void SBDiagLogClearDlopenEntry(void) {
         return;
     }
     memcpy(path, g_dlopenMarkerPath, pathLen + 1);
+    pthread_mutex_unlock(&g_lock);
+    (void)unlink(path);
+}
+
+// 0.2.36：willConnect 标记（与 dlopen 标记同款实现，只换路径）。
+void SBDiagLogMarkWillConnectEntry(const char *guestBundleID) {
+    pthread_mutex_lock(&g_lock);
+    if (!g_begun || g_willConnectMarkerPath[0] == '\0') {
+        pthread_mutex_unlock(&g_lock);
+        return;
+    }
+    char path[PATH_MAX + 64];
+    size_t pathLen = strlen(g_willConnectMarkerPath);
+    if (pathLen >= sizeof(path)) {
+        pthread_mutex_unlock(&g_lock);
+        return;
+    }
+    memcpy(path, g_willConnectMarkerPath, pathLen + 1);
+    pthread_mutex_unlock(&g_lock);
+    char content[512];
+    int n = snprintf(content, sizeof(content), "%s\n",
+                     (guestBundleID && guestBundleID[0] != '\0') ? guestBundleID : "（未知）");
+    if (n <= 0) {
+        return;
+    }
+    SBDiagWriteFile(path, content, (size_t)n);
+}
+
+void SBDiagLogClearWillConnectEntry(void) {
+    pthread_mutex_lock(&g_lock);
+    if (!g_begun || g_willConnectMarkerPath[0] == '\0') {
+        pthread_mutex_unlock(&g_lock);
+        return;
+    }
+    char path[PATH_MAX + 64];
+    size_t pathLen = strlen(g_willConnectMarkerPath);
+    if (pathLen >= sizeof(path)) {
+        pthread_mutex_unlock(&g_lock);
+        return;
+    }
+    memcpy(path, g_willConnectMarkerPath, pathLen + 1);
     pthread_mutex_unlock(&g_lock);
     (void)unlink(path);
 }

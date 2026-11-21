@@ -278,6 +278,10 @@ public enum SBInstaller {
             if let backupDir = backupDir {
                 try? fileManager.removeItem(at: backupDir)
             }
+            // 0.2.36：安装完成记一行——0.2.35 真机 183539 进程在 Husk 分型行后
+            // 15 毫秒结束，安装到底走完没有，分型行之后无任何行可证；下次再有
+            // 进程在安装附近结束，先看有没有这一行。
+            SBDiagLog.log("安装完成：\(parsed.bundleID) \(destinationDir.lastPathComponent) 已入库")
             progress.completedUnitCount = progress.totalUnitCount
             return record
         } catch {

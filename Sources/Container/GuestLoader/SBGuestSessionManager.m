@@ -130,6 +130,13 @@ static const NSTimeInterval SBGuestSceneSystemPathWaitSeconds = 0.4;
         hostWindow.hidden = NO;
         [hostWindow makeKeyAndVisible];
     }
+    // 0.2.36：恢复完记一行可核查的结果——0.2.35 真机 Flutter 失败后“恢复宿主界面”
+    // 只是一句断言，宿主窗到底 key/可见与否无从核对；黑屏时下份日志必须能定位。
+    SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：恢复宿主界面：宿主窗 %@（key=%@ hidden=%@），app.keyWindow=%@",
+                    hostWindow ? NSStringFromClass([hostWindow class]) : @"无",
+                    hostWindow.isKeyWindow ? @"是" : @"否",
+                    hostWindow.hidden ? @"是" : @"否",
+                    app.keyWindow ? NSStringFromClass([app.keyWindow class]) : @"无"] UTF8String]);
 }
 
 #pragma mark - 客窗查找
@@ -154,6 +161,20 @@ static const NSTimeInterval SBGuestSceneSystemPathWaitSeconds = 0.4;
         }
     }
     return nil;
+}
+
+/// 0.2.36：窗口清单（失败/恢复时核查黑屏用）：每只窗一行——层级、hidden、key、frame、rootVC。
+- (void)logWindowInventoryWithTag:(NSString *)tag {
+    UIApplication *app = [UIApplication sharedApplication];
+    SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：窗口清单（%@）：共 %lu 只窗",
+                    tag, (unsigned long)app.windows.count] UTF8String]);
+    for (UIWindow *window in app.windows) {
+        SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：窗口清单（%@）：%@ level=%.0f hidden=%@ key=%@ frame=%@ rootVC=%@",
+                        tag, NSStringFromClass([window class]), window.windowLevel,
+                        window.hidden ? @"是" : @"否", window.isKeyWindow ? @"是" : @"否",
+                        NSStringFromCGRect(window.frame),
+                        window.rootViewController ? NSStringFromClass([window.rootViewController class]) : @"无"] UTF8String]);
+    }
 }
 
 #pragma mark - 激活完成 / 失败
@@ -192,11 +213,28 @@ static const NSTimeInterval SBGuestSceneSystemPathWaitSeconds = 0.4;
 - (void)failActivationForSession:(SBGuestSession *)session message:(NSString *)message {
     SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 激活失败（%@），恢复宿主界面",
                     session.bundleID, message] UTF8String]);
+    // 0.2.36：先藏起激活期间客新建的窗口（再恢复宿主界面）——0.2.35 真机 Flutter
+    // 干净失败后日志写“恢复宿主界面”，MJ 看到的却是黑屏：restoreHostUI 只把宿主窗
+    // 变 key/可见，不藏客窗；客在 willConnect 里建了窗（哪怕没成 key、非 Normal 层级、
+    // 没 rootVC 的黑窗）也会盖在宿主窗上面。按 windowsBeforeActivation 认：
+    // 激活前已有的窗与宿主窗不动，其余一律 hidden=YES。会话还没从表里删，
+    // 此时 guestWindow 判定仍有效；清掉后再扫会把客窗当普通窗漏掉。
+    [self logWindowInventoryWithTag:@"激活失败前"];
+    for (UIWindow *window in [UIApplication sharedApplication].windows) {
+        if (window == self.hostWindow) {
+            continue;
+        }
+        if ([session.windowsBeforeActivation containsObject:window]) {
+            continue;
+        }
+        window.hidden = YES;
+    }
     [self.sessions removeObjectForKey:session.bundleID];
     if ([self.currentBundleID isEqualToString:session.bundleID]) {
         self.currentBundleID = nil;
     }
     [self restoreHostUI];
+    [self logWindowInventoryWithTag:@"恢复宿主界面后"];
     [SBGuestBootstrap restoreHostContext];
     // 写 guest-failed 收据（宿主进桌面后按收据弹错）；selection 清掉，收据留着。
     [SBGuestLoader markReceiptStage:SBGuestReceiptStageGuestFailed detail:message];
@@ -329,9 +367,25 @@ static const NSTimeInterval SBGuestSceneSystemPathWaitSeconds = 0.4;
                     session.bundleID] UTF8String]);
     @try {
         if ([sceneDelegate respondsToSelector:@selector(scene:willConnectToSession:options:)]) {
+            // 0.2.36：调用前环境快照——死在 willConnect 里时，下份日志必须能看到
+            // 调用瞬间的全部前置状态（0.2.35 MediaStormCamera 只剩“调用…”一行，
+            // app.delegate 是谁、session 配置是谁的、options 是否空，全靠猜）。
+            SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 手动 willConnect：调用前环境（app.delegate=%@ scene.session.configuration=%@/%@ options url=%lu activity=%lu keyWindow=%@ scenes=%lu）",
+                            session.bundleID,
+                            NSStringFromClass([app.delegate class]),
+                            sceneSession.configuration.name ?: @"无",
+                            sceneSession.configuration.delegateClass ? NSStringFromClass(sceneSession.configuration.delegateClass) : @"无",
+                            (unsigned long)options.urlContexts.count,
+                            (unsigned long)options.userActivities.count,
+                            app.keyWindow ? @"有" : @"无",
+                            (unsigned long)app.connectedScenes.count] UTF8String]);
             SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 手动 willConnect：调用客 scene delegate willConnect（%@）",
                             session.bundleID, NSStringFromClass([sceneDelegate class])] UTF8String]);
+            // 0.2.36：进入标记（SBDiagLog dlopen 标记同款）——Swift trap 抓不住，
+            // 死在 willConnect 里时标记留下来，下次启动明确报“上次死在 willConnect 里”。
+            SBDiagLogMarkWillConnectEntry([session.bundleID UTF8String]);
             [sceneDelegate scene:scene willConnectToSession:sceneSession options:options];
+            SBDiagLogClearWillConnectEntry();
             SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 手动 willConnect：客 scene delegate willConnect 已返回",
                             session.bundleID] UTF8String]);
         } else {
@@ -339,6 +393,7 @@ static const NSTimeInterval SBGuestSceneSystemPathWaitSeconds = 0.4;
                             session.bundleID] UTF8String]);
         }
     } @catch (NSException *exception) {
+        SBDiagLogClearWillConnectEntry();
         SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ scene willConnect 抛异常（%@）",
                         session.bundleID, exception.reason] UTF8String]);
         [self failActivationForSession:session
@@ -384,6 +439,83 @@ static const NSTimeInterval SBGuestSceneSystemPathWaitSeconds = 0.4;
 
 #pragma mark - 激活
 
+/// 0.2.36：客 storyboard 名——正常启动时 UIKit 读它建窗。先读顶层
+/// UIMainStoryboardFile（OmoFun 等老模板），没有再扫 scene 配置的
+/// UISceneStoryboardFile（新模板放这里；sceneConfigurationFromGuestPlist
+/// 只取 name＋delegateClass，把它丢了）。
+- (nullable NSString *)storyboardNameForSession:(SBGuestSession *)session {
+    NSDictionary *plist = [NSDictionary dictionaryWithContentsOfFile:
+        [session.guestAppPath stringByAppendingPathComponent:@"Info.plist"]];
+    NSString *name = plist[@"UIMainStoryboardFile"];
+    if ([name isKindOfClass:[NSString class]] && name.length > 0) {
+        return name;
+    }
+    NSDictionary *manifest = plist[@"UIApplicationSceneManifest"];
+    NSDictionary *configsByRole = manifest[@"UISceneConfigurations"];
+    if ([configsByRole isKindOfClass:[NSDictionary class]]) {
+        for (id value in configsByRole.allValues) {
+            if (![value isKindOfClass:[NSArray class]]) continue;
+            for (id config in (NSArray *)value) {
+                if (![config isKindOfClass:[NSDictionary class]]) continue;
+                NSString *sceneStoryboard = config[@"UISceneStoryboardFile"];
+                if ([sceneStoryboard isKindOfClass:[NSString class]] && sceneStoryboard.length > 0) {
+                    return sceneStoryboard;
+                }
+            }
+        }
+    }
+    return nil;
+}
+
+/// 0.2.36：Flutter 客建窗（#3/#4）——正常启动时 UIKit 做的事，宿主进程内
+/// 从未替客做过。OmoFun 反汇编实证（Flutter 3.35.7）：FlutterSceneDelegate.
+/// willConnect 只把 app.delegate.window 上已有的 rootVC 搬进新 scene 窗，
+/// rootVC 为 nil 时在 cbz 处静默 return——0.2.35 真机 phoenix/nread 正是
+/// “willConnect 已返回→开始找客窗→未创建窗口”。didFinishLaunching 只做插件
+/// 注册＋转发，不建窗；窗是 UIKit 加载 Main.storyboard 建的（建 UIWindow、
+/// 实例化 FlutterViewController、设 rootVC、赋给 delegate.window）。
+/// 本方法只在 didFinishLaunching 之后、findGuestWindow 之前跑，且仅当尚无客窗
+/// 时才建：didFinishLaunching 里已建窗的 pre-scene 客不受影响；无 storyboard
+/// 的客（纯代码 UI）直接返回 NO，走原有 scene 路／手动 willConnect。
+/// 返回 YES＝已建窗（随后的 findGuestWindow 即命中，直接完成激活，不再走手动
+/// willConnect）；NO＝没建（原因已记日志，调用方继续原流程）。
+- (BOOL)buildGuestWindowFromStoryboardForSession:(SBGuestSession *)session {
+    if ([self findGuestWindowForSession:session]) {
+        return YES; // 已有窗，不重复建。
+    }
+    NSString *storyboardName = [self storyboardNameForSession:session];
+    if (!storyboardName) {
+        SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 无 storyboard（UIMainStoryboardFile/UISceneStoryboardFile 均无），不建窗，走 scene 路",
+                        session.bundleID] UTF8String]);
+        return NO;
+    }
+    UIWindowScene *windowScene = self.hostWindow.windowScene ?: session.guestScene;
+    if (!windowScene) {
+        SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 有 storyboard（%@）但无 windowScene，无法建窗",
+                        session.bundleID, storyboardName] UTF8String]);
+        return NO;
+    }
+    @try {
+        UIStoryboard *storyboard = [UIStoryboard storyboardWithName:storyboardName bundle:session.guestBundle];
+        UIViewController *rootVC = [storyboard instantiateInitialViewController];
+        if (!rootVC) {
+            SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ storyboard（%@）初始 VC 为空，不建窗",
+                            session.bundleID, storyboardName] UTF8String]);
+            return NO;
+        }
+        UIWindow *window = [[UIWindow alloc] initWithWindowScene:windowScene];
+        window.rootViewController = rootVC;
+        [window makeKeyAndVisible];
+        SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ storyboard 建窗（%@）：rootVC=%@，已 makeKeyAndVisible",
+                        session.bundleID, storyboardName, NSStringFromClass([rootVC class])] UTF8String]);
+        return YES;
+    } @catch (NSException *exception) {
+        SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ storyboard 建窗抛异常（%@），走 scene 路",
+                        session.bundleID, exception.reason] UTF8String]);
+        return NO;
+    }
+}
+
 - (BOOL)activateGuestWithContext:(SBGuestMainHookContext *)context
               principalClassName:(nullable NSString *)principalClassName
                delegateClassName:(nullable NSString *)delegateClassName
@@ -428,14 +560,37 @@ static const NSTimeInterval SBGuestSceneSystemPathWaitSeconds = 0.4;
     }
     NSString *resolvedDelegateClassName = delegateClassName;
     if (resolvedDelegateClassName.length == 0) {
-        // main 没传 delegate 类：从客 Info.plist 的 scene 配置里取。
-        NSDictionary *plist = [NSDictionary dictionaryWithContentsOfFile:
-            [context.guestAppPath stringByAppendingPathComponent:@"Info.plist"]];
-        NSDictionary *manifest = plist[@"UIApplicationSceneManifest"];
-        NSDictionary *configsByRole = manifest[@"UISceneConfigurations"];
-        NSArray *configs = configsByRole[@"UIWindowSceneSessionRoleApplication"];
-        if ([configs isKindOfClass:[NSArray class]] && configs.count > 0) {
-            resolvedDelegateClassName = configs[0][@"UISceneDelegateClassName"];
+        // 0.2.36：main 没传 delegate 类时，按名探测真 AppDelegate（模块名取
+        // 客可执行名）——0.2.35 真机 MediaStormCamera 的 main 传 delegate=nil
+        // （SwiftUI lifecycle 调 UIApplicationMain(nil, nil)，见 183528 日志
+        // principal=(nil) delegate=(nil)），旧回退直接拿 UISceneDelegateClassName
+        // （MediaStormCamera.SceneDelegate）当 app.delegate 装上；其 willConnect
+        // 里 `delegate as! AppDelegate` 一类强转必 trap（死在 willConnect 内的
+        // 头号嫌疑）。探测不到时不再回退到 scene delegate 类（见下一块），宁可干净失败。
+        NSString *moduleName = [context.guestExecPath lastPathComponent];
+        NSString *appDelegateName = [NSString stringWithFormat:@"%@.AppDelegate", moduleName];
+        if (NSClassFromString(appDelegateName)) {
+            resolvedDelegateClassName = appDelegateName;
+            SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ main 未传 delegate 类，按名探测到真 AppDelegate（%@），不用 scene delegate 充数",
+                            context.bundleID, appDelegateName] UTF8String]);
+        }
+    }
+    if (resolvedDelegateClassName.length == 0) {
+        // 0.2.36：按名也探测不到真 AppDelegate时，再试 ObjC 风格的裸类名
+        // AppDelegate。仍没有就干净失败——绝不再回退到 plist 的 scene delegate
+        // 类：Flutter 调查（OmoFun 反汇编，见 build log 0.2.36 节）证实，把
+        // Runner.SceneDelegate 当 app.delegate 装上是致命的：SceneDelegate
+        // 不实现 didFinishLaunching，真 AppDelegate 从未实例化、插件从未注册、
+        // launch engine 从未建；其 willConnect 里的 `as? AppDelegate` 也得
+        // nil。装错 delegate 只会静默死或黑屏，不如干净失败写明原因。
+        if (NSClassFromString(@"AppDelegate")) {
+            resolvedDelegateClassName = @"AppDelegate";
+            SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ main 未传 delegate 类，按名探测到裸 AppDelegate 类",
+                            context.bundleID] UTF8String]);
+        } else {
+            NSString *moduleName = [context.guestExecPath lastPathComponent];
+            SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ main 未传 delegate 类，按名探测不到真 AppDelegate（%@.AppDelegate / AppDelegate 均无），不用 scene delegate 类充 app.delegate，干净失败",
+                            context.bundleID, moduleName] UTF8String]);
         }
     }
     Class delegateClass = resolvedDelegateClassName.length > 0
@@ -496,8 +651,18 @@ static const NSTimeInterval SBGuestSceneSystemPathWaitSeconds = 0.4;
             }
             return NO;
         }
+    } else {
+        // 0.2.36：不实现 didFinishLaunching 就记一行——之前静默跳过，下份
+        // 日志无法区分“没调”与“调了无事发生”（0.2.35 真机两 Flutter 客装
+        // 的是 SceneDelegate，本来就不实现它，却无任何痕迹）。
+        SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ delegate（%@）未实现 didFinishLaunching，跳过",
+                        context.bundleID, resolvedDelegateClassName] UTF8String]);
     }
-    // pre-scene 客：delegate 在 didFinishLaunching 里已建窗，同步完成。
+    // 0.2.36：Flutter 客建窗（#3/#4）——didFinishLaunching 只做插件注册，
+    // 不建窗；窗是 UIKit 加载 storyboard 建的。尚无窗且客有 storyboard 时
+    // 在这里同步建好，随后的 findGuestWindow 即命中，直接完成激活。
+    [self buildGuestWindowFromStoryboardForSession:session];
+    // pre-scene 客／storyboard 客：didFinishLaunching 或 storyboard 里已建窗，同步完成。
     if ([self findGuestWindowForSession:session]) {
         [self completeActivationForSession:session];
         return YES;
@@ -748,6 +913,15 @@ static const NSTimeInterval SBGuestSceneSystemPathWaitSeconds = 0.4;
 #pragma mark - 通知
 
 - (void)handleReturnToHostRequested:(NSNotification *)note {
+    // 0.2.36：去重——侧滑/横杠一次手势发 6–7 次通知（0.2.35 真机：84–91 毫秒内
+    // 连发 6–7 次）。第一次已让客回后台（currentBundleID 已空、session.active
+    // 已 NO），之后的全是空操作还各记一行。无前台客时直接忽略，不记日志。
+    // 状态去重而非时间节流：回宿主→再进客→再回宿主可以发生在 0.5 秒内，
+    // 时间窗会误吞第二次合法请求；前台客状态是唯一正确的判据。
+    SBGuestSession *current = [self currentSession];
+    if (!current || !current.active) {
+        return;
+    }
     // 浮层（注入件）发的回宿主请求：当前客回后台，会话保留、收据不清除。
     SBDiagLogLine([@"进程内进客：收到回宿主请求（侧滑/横杠），当前客回后台" UTF8String]);
     [self backgroundCurrentGuest];

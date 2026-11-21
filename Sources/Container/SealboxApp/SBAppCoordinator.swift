@@ -295,10 +295,17 @@ final class SBAppCoordinator: ObservableObject {
                 return
             }
         }
-        guard !isLaunching else { return }
+        guard !isLaunching else {
+            // 0.2.36：之前这里静默 return，日志里看不出点图标被吞了——
+            // 0.2.35 真机 Husk 首次打开成功后旗标永不清，再点直接消失。
+            SBDiagLog.log("点图标：\(app.bundleID) 启动进行中，忽略重复点（isLaunching=true）")
+            return
+        }
+        // 0.2.36：恢复路放防重旗前面——恢复是同步的、不走签名门、不设旗；
+        // 即使将来某路漏清旗标，点后台客也必须能恢复，不能被旗标静默吞掉。
+        // 恢复失败（上下文重上失败）弹错并停住；返回 false（无会话）时落到首次加载。
         // 0.2.27：已开过的客走恢复路径（不 dlopen、不跑 main、不重调
         // didFinishLaunching），不走签名门（首次加载时已验过，二进制未变）。
-        // 恢复失败（上下文重上失败）弹错并停住；返回 false（无会话）时落到首次加载。
         if SBGuestSessionManager.shared().session(forBundleID: app.bundleID) != nil {
             // 0.2.27 fixup 4：resumeGuest 不带 NSError**（见头文件注释），
             // Swift 侧得可选会话：非空=已恢复；空+lastResumeError 非空=恢复失败弹错；
@@ -445,7 +452,14 @@ final class SBAppCoordinator: ObservableObject {
         ) { [weak self] error in
             guard let self = self else { return }
             self.launchStage = nil
-            guard let error = error else { return }
+            guard let error = error else {
+                // 0.2.36：成功也要清旗——之前成功时直接 return，旗标永久为真，
+                // 同进程内再点任何客都被 launchApp 的 guard 静默吞掉（0.2.35
+                // 真机：Husk 首次打开成功后，再点开不了，只能重启进程冷启动）。
+                self.isLaunching = false
+                SBDiagLog.log("点图标：\(app.bundleID) 进程内加载完成，isLaunching 已清")
+                return
+            }
             self.isLaunching = false
             let stage = (error as NSError).userInfo[SBGuestLoaderErrorStageKey] as? String ?? "启动失败"
             // 0.2.10 报错日志：启动请求失败之前只弹弹窗；原因（证书门/

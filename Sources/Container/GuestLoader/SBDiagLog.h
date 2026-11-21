@@ -40,6 +40,13 @@ void SBDiagLogMarkStartupComplete(void);
 void SBDiagLogMarkDlopenEntry(const char *guestBundleID);
 void SBDiagLogClearDlopenEntry(void);
 
+/// 客 scene delegate willConnect 调用前后调用（0.2.36）：与 dlopen 标记同款。
+/// willConnect 里 Swift trap 抓不住（@try/@catch 只能抓 NSException），进程
+/// 死在里面时日志只断在“调用…”行之后；有此标记，下次启动能明确报“上次死在
+/// willConnect 里（客=…）”，不用靠缺行推断。调用前 Mark、返回/抛异常后 Clear。
+void SBDiagLogMarkWillConnectEntry(const char *guestBundleID);
+void SBDiagLogClearWillConnectEntry(void);
+
 /// 最近一次启动日志全文：最新崩过的那份（-crashed）优先，其次最新一份；
 /// 都没有返回 NULL。返回的是 malloc 出来的 UTF-8 字符串，调用方用完 free。
 char *SBDiagLogLatestText(void);
