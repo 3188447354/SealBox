@@ -35,14 +35,40 @@ void SBSwiftUIAppMainHookResetActivationState(void) {
     g_swiftUIHookActivationError = nil;
 }
 
-/// 元数据首字是 kind（小整数：0=Class，1=Struct，2=Enum，3=Optional，…）。
-/// witness 表首字是函数指针（大地址）。首字 < 0x100 即认作元数据。
+/// 元数据首字是 kind（指针大小的整数，在偏移 0 处；Swift ABI
+/// docs/ABI/TypeMetadata.rst）。kind 的取值见 MetadataKind.def /
+/// MetadataValues.h（不是 0/1/2/3 的序号——0.2.28 的注释写错了）：
+///   Class=0x0，Struct=0x200，Enum=0x201，Optional=0x202，
+///   ForeignClass=0x203，Opaque=0x300，Tuple=0x301，Function=0x302，
+///   Existential=0x303，Metatype=0x304，ObjCClassWrapper=0x305，
+///   ExistentialMetatype=0x306，HeapLocalVariable=0x400，
+///   HeapGenericLocalVariable=0x500，ErrorObject=0x501，
+///   LastEnumerated=0x7FF。
+/// 枚举 kind 恒 ≤ LastEnumerated（0x7FF）；指针（isa / witness 表函数
+/// 指针）恒 > 0x7FF（ABI 文档原话：isa 指针保证大于 2047）。旧检查
+/// `kind < 0x100` 只认 Class（0x0）——struct App（0x200）全被拒，
+/// 0.2.31 真机 Husk/STV 同因报“两个隐式参数都不是类型元数据”。
+/// 名义类型（Class/Struct/Enum/Optional/ForeignClass）的 [1] 是 nominal
+/// type descriptor 指针（大地址），再验一次防偶然小整数。
+/// witness 表首字是函数指针（大地址），到不了这里。
+/// 离线实证见 ~/workspace/tmp-sb0232verify/meta0232-verify.py
+///（ALL CHECKS PASS：入口反汇编证 x0=元数据、x1=witness 表；
+/// HuskApp 描述器在位；kind 值表按 MetadataKind.def）。
 static BOOL SBIsSwiftTypeMetadata(const void *ptr) {
     if (!ptr) {
         return NO;
     }
-    uintptr_t kind = *(const uintptr_t *)ptr;
-    return kind < 0x100;
+    const uintptr_t *words = (const uintptr_t *)ptr;
+    uintptr_t kind = words[0];
+    if (kind > 0x7FF) {
+        return NO;
+    }
+    if (kind == 0x0 || (kind >= 0x200 && kind <= 0x203)) {
+        if (words[1] <= 0x7FF) {
+            return NO;
+        }
+    }
+    return YES;
 }
 
 /// 从两个隐式参数里挑出类型元数据（元数据与 witness 表顺序不定）。
@@ -63,6 +89,15 @@ void SBHookedAppMain(const void *arg0, const void *arg1) {
     // “跳入客 main”就断、无拦截行，无法区分“钩子没触发”与“日志丢了”。
     // 现在文件夹＋写穿保证此行若触发必落盘；无此行即钩子没触发）。
     SBDiagLogLine("拦截 App.main：钩子已触发");
+    // 0.2.32：记两参数指向处的前两个字（入口传来的指针恒有效——编译器生成
+    // 的分发器只传元数据与 witness 表，见 meta0232-verify.py 的入口反汇编；
+    // 下版诊断靠这行确认 kind/描述器，不再只靠“是不是元数据”一句话）。
+    SBDiagLogLine([[NSString stringWithFormat:
+                    @"拦截 App.main：隐式参数内容 arg0=[0x%lx, 0x%lx] arg1=[0x%lx, 0x%lx]",
+                    (unsigned long)(arg0 ? ((const uintptr_t *)arg0)[0] : 0),
+                    (unsigned long)(arg0 ? ((const uintptr_t *)arg0)[1] : 0),
+                    (unsigned long)(arg1 ? ((const uintptr_t *)arg1)[0] : 0),
+                    (unsigned long)(arg1 ? ((const uintptr_t *)arg1)[1] : 0)] UTF8String]);
     if (!g_swiftUIHookContext) {
         // 安装时 context 恒非空；走到这里是接线错，置错并直接返回（不跳原入口）。
         SBDiagLogLine("拦截 App.main：钩子 context 为空（接线错），不嵌入、不跳原入口");
@@ -85,9 +120,10 @@ void SBHookedAppMain(const void *arg0, const void *arg1) {
         return;
     }
     SBDiagLogLine([[NSString stringWithFormat:
-                    @"拦截 App.main：%@ 收到 App 类型元数据 %p（kind=%lu），调 Swift 嵌入",
+                    @"拦截 App.main：%@ 收到 App 类型元数据 %p（kind=0x%lx，描述器=%p），调 Swift 嵌入",
                     bundleID, metadata,
-                    (unsigned long)*(const uintptr_t *)metadata] UTF8String]);
+                    (unsigned long)*(const uintptr_t *)metadata,
+                    (const void *)((const uintptr_t *)metadata)[1]] UTF8String]);
     BOOL ok = SBSwiftUIEmbedApp(metadata, g_swiftUIHookContext);
     if (ok) {
         g_swiftUIHookDidActivate = YES;

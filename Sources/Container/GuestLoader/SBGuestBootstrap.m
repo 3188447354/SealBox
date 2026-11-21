@@ -214,7 +214,7 @@ static void SBCallGuestHooksInstallForGuest(void) {
         installFn = (SBGuestHooksInstallFn)dlsym(RTLD_DEFAULT, "SBGuestHooksInstallForGuest");
         if (!installFn) {
             // 只记一次：旧注入件无此入口时，首客靠 constructor，次客 Hook 可能缺装。
-            SBDiagLogLine(@"客加载：注入件 per-guest 安装入口未找到（dlsym 失败），首客靠 constructor，次客 Hook 可能缺装");
+            SBDiagLogLine([@"客加载：注入件 per-guest 安装入口未找到（dlsym 失败），首客靠 constructor，次客 Hook 可能缺装" UTF8String]);
         }
     });
     if (installFn) {
@@ -390,6 +390,10 @@ static void SBDiagLogGuestFail(SBGuestLoaderErrorCode code, NSString *bundleID, 
         const char *fixed = getenv("CFFIXED_USER_HOME");
         g_originalFixedHome = fixed ? strdup(fixed) : NULL;
     }
+    // 0.2.32：宿主 tmp 必须在 HOME 改写前取——NSTemporaryDirectory() 的取值
+    // 与 HOME 有关时，改写后再取会拿到客容器 tmp，软链自指成悬空链，
+    // 下次安装建 tmp 目录报 516（0.2.31 真机 nread 同款；见 SBInstaller.swift）。
+    NSString *hostTmpDir = NSTemporaryDirectory();
     // 0.2.26 G4b：LC 的 LC_HOME_PATH 同款——客端 Cookies hook
     //（SBFileManagerHook）要用宿主 HOME 找宿主的 Library/Cookies；
     // HOME 改写前先存一份进环境变量，失败/返回时由
@@ -402,13 +406,14 @@ static void SBDiagLogGuestFail(SBGuestLoaderErrorCode code, NSString *bundleID, 
 
     // tmp 用软链指回宿主 TMPDIR（宿主 tmp 随进程走，客容器内不另建一份）。
     NSString *tmpLinkPath = [containerPath stringByAppendingPathComponent:@"tmp"];
-    NSString *hostTmpDir = NSTemporaryDirectory();
     struct stat linkStat;
     if (lstat([tmpLinkPath UTF8String], &linkStat) == 0) {
         remove([tmpLinkPath UTF8String]);
     }
     if (symlink([hostTmpDir UTF8String], [tmpLinkPath UTF8String]) != 0) {
         NSLog(@"[Sealbox] 客容器 tmp 软链创建失败（%@），继续启动", tmpLinkPath);
+    } else {
+        SBDiagLogLine([[NSString stringWithFormat:@"客加载：客容器 tmp 软链已建（→%@）", hostTmpDir] UTF8String]);
     }
     SBDiagLogLine("客加载：数据容器就绪，HOME 已指向客容器");
 
@@ -495,7 +500,7 @@ static void SBDiagLogGuestFail(SBGuestLoaderErrorCode code, NSString *bundleID, 
     SBCallHomeBarOverlaySetHidden(YES);
     // 0.2.30（MJ 00:07 立规：客加载每一步都要写日志，不许有静默步骤）：
     // 还原本身记一行——失败路径与客退出都走这里，崩在还原之后也能定位。
-    SBDiagLogLine(@"客加载：已恢复宿主环境（主 Bundle/可执行路径/进程身份/环境已还原，浮层已藏）");
+    SBDiagLogLine([@"客加载：已恢复宿主环境（主 Bundle/可执行路径/进程身份/环境已还原，浮层已藏）" UTF8String]);
 }
 
 /// 失败 + 还原：先还原已应用的客上下文，再按 failWithError 造错返回 NO。

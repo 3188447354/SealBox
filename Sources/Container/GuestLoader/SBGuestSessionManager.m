@@ -334,6 +334,10 @@ static const NSTimeInterval SBGuestSceneSystemPathWaitSeconds = 0.4;
     if (session.guestWindow) {
         return;
     }
+    // 0.2.32：补查入口记一行——0.2.31 phoenix 三回都没走到这里（死在之前），
+    // 有此行即证明进程活到了 0.4 秒后；无此行，死在替身返回到补查之间。
+    SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 0.4 秒补查开始（客窗是否出现见下文）",
+                    session.bundleID] UTF8String]);
     if ([self findGuestWindowForSession:session]) {
         [self completeActivationForSession:session];
         return;
@@ -704,7 +708,7 @@ static const NSTimeInterval SBGuestSceneSystemPathWaitSeconds = 0.4;
 
 - (void)handleReturnToHostRequested:(NSNotification *)note {
     // 浮层（注入件）发的回宿主请求：当前客回后台，会话保留、收据不清除。
-    SBDiagLogLine(@"进程内进客：收到回宿主请求（侧滑/横杠），当前客回后台");
+    SBDiagLogLine([@"进程内进客：收到回宿主请求（侧滑/横杠），当前客回后台" UTF8String]);
     [self backgroundCurrentGuest];
 }
 

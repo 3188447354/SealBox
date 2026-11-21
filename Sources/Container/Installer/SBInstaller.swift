@@ -216,17 +216,30 @@ public enum SBInstaller {
             // ——NSCocoaErrorDomain 516（文件已存在）：containerDir/tmp 路径上
             // 已存在一个同名文件。verify 之后到 return 之间唯一的非 try? try
             // 调用就是这三处 createDirectory，前两处同父目录已成功，父目录
-            // 不可能缺失；只能是目标路径上已有文件。谁写的文件未查到（全仓
-            // 没有任何代码往客容器写名为 "tmp" 的文件）：先记现场（容器是否
-            // 复用、目标路径上是文件），再容错（是文件就移走再建）。
+            // 不可能缺失；只能是目标路径上已有文件。
+            // 0.2.32：0.2.21 只移走了普通文件，漏了悬空软链——0.2.31 真机
+            // nread 同错 516（复用旧容器）。写链的是加载时的 applyGuestContext
+            //（容器 tmp 软链 → 宿主 NSTemporaryDirectory()）；若链目标被清
+            // 或自指（HOME 改写后才取 tmp，见 SBGuestBootstrap.m），链就悬空：
+            // fileExists 跟链走报不存在，createDirectory 撞 EEXIST 报 516。
+            // 修法：先用 destinationOfSymbolicLink 认链（只读链本身、不解析
+            // 目标，悬空也能认出），软链/文件先移走再建；真目录留着（复用旧
+            // 容器保留用户数据）。tmp 的软链加载时由 applyGuestContext 重建，
+            // 移走无损。离线实证见 ~/workspace/tmp-sb0232verify/misc0232-verify.py
+            //（悬空软链上 fileExists=false、mkdir=EEXIST、先移再建成功）。
             SBDiagLog.log("安装容器：\(parsed.bundleID) 容器UUID=\(containerUUID) 复用旧容器=\(existing != nil)")
             for relativePath in ["Documents", "Library/Caches", "tmp"] {
                 let target = containerDir.appendingPathComponent(relativePath, isDirectory: true)
-                var isDirectory: ObjCBool = false
-                if fileManager.fileExists(atPath: target.path, isDirectory: &isDirectory),
-                   !isDirectory.boolValue {
-                    SBDiagLog.log("安装容器：\(parsed.bundleID) \(relativePath) 路径上已有文件，先移走再建目录")
+                if let linkDest = try? fileManager.destinationOfSymbolicLink(atPath: target.path) {
+                    SBDiagLog.log("安装容器：\(parsed.bundleID) \(relativePath) 路径上是软链（→\(linkDest)），先移走再建目录")
                     try fileManager.removeItem(at: target)
+                } else {
+                    var isDirectory: ObjCBool = false
+                    if fileManager.fileExists(atPath: target.path, isDirectory: &isDirectory),
+                       !isDirectory.boolValue {
+                        SBDiagLog.log("安装容器：\(parsed.bundleID) \(relativePath) 路径上已有文件，先移走再建目录")
+                        try fileManager.removeItem(at: target)
+                    }
                 }
                 try fileManager.createDirectory(at: target, withIntermediateDirectories: true)
             }

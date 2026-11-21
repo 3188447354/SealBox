@@ -277,14 +277,19 @@ static BOOL SBRewriteSlot(uintptr_t slotAddress, void *replacement) {
 }
 
 /// 写槽前校验（只用于链式修正路）：槽里当前值应是目标符号的解析地址
-//（dyld 在 dlopen 时已把 __got 槽绑好）。用 dlsym 取期望地址比对；
+///（dyld 在 dlopen 时已把 __got 槽绑好）。用 dlsym 取期望地址比对；
 //对不上说明地址算错、或槽根本不是目标符号——不写，调用方走护栏。
 //dlsym 解析不到时跳过校验（只记一行，不拦重绑）。
+//0.2.32：槽里已是本进程钩子（replacement）即认作已装上、复用，不重写、
+//不失败——同进程再点同一客（0.2.31 真机第二遍 Husk：槽值 0x104a703a4
+//是钩子地址，≠ 期望原值 0x18c0c4964，旧校验判失败走护栏）。
 //注意：传统懒绑定路不用它——懒槽未绑定时原值还是 dyld stub 地址，
 //预校验会误判（见 SBRebindClassic）。
 //symbolName 带前导 '_'（符号表形态），dlsym 要去 '_' 后的名字。
-//返回：1=一致可写，0=不一致不可写，-1=无法校验（跳过）。
-static int SBSlotPrecheck(uintptr_t slotAddress, const char *symbolName) {
+//返回：1=一致可写，0=不一致不可写，-1=无法校验（跳过），
+//      2=槽里已是本进程钩子（复用，不重写）。
+static int SBSlotPrecheck(uintptr_t slotAddress, const char *symbolName,
+                          void *replacement) {
     if (slotAddress == 0 || !symbolName || symbolName[0] == '\0') {
         return 0;
     }
@@ -296,6 +301,11 @@ static int SBSlotPrecheck(uintptr_t slotAddress, const char *symbolName) {
         return -1;
     }
     void *current = *(void **)slotAddress;
+    if (replacement && current == replacement) {
+        SBDiagLogLine([[NSString stringWithFormat:@"重绑预校验：槽 0x%lx 已是本进程钩子 0x%lx（上次重绑留下的），复用，不重写",
+                        (unsigned long)slotAddress, (unsigned long)current] UTF8String]);
+        return 2;
+    }
     if (current == expected) {
         SBDiagLogLine([[NSString stringWithFormat:@"重绑预校验：槽 0x%lx 原值 0x%lx 与期望一致",
                         (unsigned long)slotAddress, (unsigned long)current] UTF8String]);
@@ -383,14 +393,14 @@ static uint32_t SBRebindChained(SBImageLayout *layout,
     }
     uint64_t baseOffset = 0;
     if (!SBArm64SliceOffset(file, &baseOffset)) {
-        SBDiagLogLine(@"链式重绑：取 arm64 切片偏移失败");
+        SBDiagLogLine([@"链式重绑：取 arm64 切片偏移失败" UTF8String]);
         fclose(file);
         return 0;
     }
     uint32_t magic = 0;
     fseek(file, (long)baseOffset, SEEK_SET);
     if (fread(&magic, sizeof(magic), 1, file) != 1 || magic != 0xFEEDFACF) {
-        SBDiagLogLine(@"链式重绑：切片头不是 64 位 Mach-O");
+        SBDiagLogLine([@"链式重绑：切片头不是 64 位 Mach-O" UTF8String]);
         fclose(file);
         return 0;
     }
@@ -426,20 +436,20 @@ static uint32_t SBRebindChained(SBImageLayout *layout,
         cursor += cmdsize;
     }
     if (chainedDataoff == 0 || chainedDatasize < 28) {
-        SBDiagLogLine(@"链式重绑：找不到 LC_DYLD_CHAINED_FIXUPS 数据");
+        SBDiagLogLine([@"链式重绑：找不到 LC_DYLD_CHAINED_FIXUPS 数据" UTF8String]);
         fclose(file);
         return 0;
     }
     // 把整段 fixup 数据读进内存（通常 < 100KB）。
     uint8_t *fixups = (uint8_t *)malloc(chainedDatasize);
     if (!fixups) {
-        SBDiagLogLine(@"链式重绑：fixup 数据分配内存失败");
+        SBDiagLogLine([@"链式重绑：fixup 数据分配内存失败" UTF8String]);
         fclose(file);
         return 0;
     }
     fseek(file, (long)(baseOffset + chainedDataoff), SEEK_SET);
     if (fread(fixups, 1, chainedDatasize, file) != chainedDatasize) {
-        SBDiagLogLine(@"链式重绑：读 fixup 数据失败");
+        SBDiagLogLine([@"链式重绑：读 fixup 数据失败" UTF8String]);
         free(fixups);
         fclose(file);
         return 0;
@@ -456,7 +466,7 @@ static uint32_t SBRebindChained(SBImageLayout *layout,
     uint32_t matchedSlots = 0;      // 0.2.29：诊断——序号对上的槽数
     do {
         if (symbolsFormat != 0) {
-            SBDiagLogLine(@"链式重绑：符号池是压缩格式，不支持");
+            SBDiagLogLine([@"链式重绑：符号池是压缩格式，不支持" UTF8String]);
             break;
         }
         uint32_t importEntrySize = 0;
@@ -471,7 +481,7 @@ static uint32_t SBRebindChained(SBImageLayout *layout,
         }
         if (importsOff + importsCount * importEntrySize > chainedDatasize ||
             symbolsOff >= chainedDatasize) {
-            SBDiagLogLine(@"链式重绑：fixup 头越界（import 表或符号池超出数据段）");
+            SBDiagLogLine([@"链式重绑：fixup 头越界（import 表或符号池超出数据段）" UTF8String]);
             break;
         }
         const uint8_t *imports = fixups + importsOff;
@@ -594,28 +604,39 @@ static uint32_t SBRebindChained(SBImageLayout *layout,
                                 SBDiagLogLine([[NSString stringWithFormat:@"链式重绑：%@ 槽文件偏移 0x%llx 换算不到运行时地址",
                                                 [NSString stringWithUTF8String:symbolName],
                                                 (unsigned long long)pos] UTF8String]);
-                            } else if (SBSlotPrecheck(slotAddr, symbolName) == 0) {
-                                // 情形③c：槽原值与期望（dlsym 解析值）对不上——
-                                // 地址算错或槽不是目标符号，不写（0.2.30 的教训：
-                                // 写到错地址上钩子永不触发）。记为失败，走护栏。
-                                SBDiagLogLine([[NSString stringWithFormat:@"链式重绑：%@ 槽预校验失败，不改写（文件偏移 0x%llx，运行时地址 0x%lx）",
-                                                [NSString stringWithUTF8String:symbolName],
-                                                (unsigned long long)pos,
-                                                (unsigned long)slotAddr] UTF8String]);
-                            } else if (SBRewriteSlot(slotAddr, replacement)) {
-                                rewrote++;
-                                SBDiagLogLine([[NSString stringWithFormat:@"链式重绑：%@ 槽已改写（文件偏移 0x%llx，运行时地址 0x%lx，段 %s，slide=0x%lx，回读一致）",
-                                                [NSString stringWithUTF8String:symbolName],
-                                                (unsigned long long)pos,
-                                                (unsigned long)slotAddr,
-                                                SBSegmentNameForFileOffset(layout, pos),
-                                                (unsigned long)layout->slide] UTF8String]);
                             } else {
-                                // 情形③b：槽找到了，改写失败（vm_protect/TPRO）。
-                                SBDiagLogLine([[NSString stringWithFormat:@"链式重绑：%@ 槽改写失败（文件偏移 0x%llx，运行时地址 0x%lx）",
-                                                [NSString stringWithUTF8String:symbolName],
-                                                (unsigned long long)pos,
-                                                (unsigned long)slotAddr] UTF8String]);
+                                int precheck = SBSlotPrecheck(slotAddr, symbolName, replacement);
+                                if (precheck == 0) {
+                                    // 情形③c：槽原值与期望（dlsym 解析值）对不上——
+                                    // 地址算错或槽不是目标符号，不写（0.2.30 的教训：
+                                    // 写到错地址上钩子永不触发）。记为失败，走护栏。
+                                    SBDiagLogLine([[NSString stringWithFormat:@"链式重绑：%@ 槽预校验失败，不改写（文件偏移 0x%llx，运行时地址 0x%lx）",
+                                                    [NSString stringWithUTF8String:symbolName],
+                                                    (unsigned long long)pos,
+                                                    (unsigned long)slotAddr] UTF8String]);
+                                } else if (precheck == 2) {
+                                    // 0.2.32：槽里已是本进程钩子（同进程再点同一客），
+                                    // 复用，不重写；记为已装上，不走护栏。
+                                    rewrote++;
+                                    SBDiagLogLine([[NSString stringWithFormat:@"链式重绑：%@ 槽已是本进程钩子（文件偏移 0x%llx，运行时地址 0x%lx），复用，不重写",
+                                                    [NSString stringWithUTF8String:symbolName],
+                                                    (unsigned long long)pos,
+                                                    (unsigned long)slotAddr] UTF8String]);
+                                } else if (SBRewriteSlot(slotAddr, replacement)) {
+                                    rewrote++;
+                                    SBDiagLogLine([[NSString stringWithFormat:@"链式重绑：%@ 槽已改写（文件偏移 0x%llx，运行时地址 0x%lx，段 %s，slide=0x%lx，回读一致）",
+                                                    [NSString stringWithUTF8String:symbolName],
+                                                    (unsigned long long)pos,
+                                                    (unsigned long)slotAddr,
+                                                    SBSegmentNameForFileOffset(layout, pos),
+                                                    (unsigned long)layout->slide] UTF8String]);
+                                } else {
+                                    // 情形③b：槽找到了，改写失败（vm_protect/TPRO）。
+                                    SBDiagLogLine([[NSString stringWithFormat:@"链式重绑：%@ 槽改写失败（文件偏移 0x%llx，运行时地址 0x%lx）",
+                                                    [NSString stringWithUTF8String:symbolName],
+                                                    (unsigned long long)pos,
+                                                    (unsigned long)slotAddr] UTF8String]);
+                                }
                             }
                         }
                     }
@@ -741,13 +762,13 @@ BOOL SBRebindGuestSymbolForImage(const struct mach_header *header,
     }
     SBImageLayout layout;
     if (!SBParseImageLayout(header, &layout)) {
-        SBDiagLogLine(@"重绑：镜像头非法（非 64 位 Mach-O）");
+        SBDiagLogLine([@"重绑：镜像头非法（非 64 位 Mach-O）" UTF8String]);
         return NO;
     }
     uint32_t rewrote = 0;
     if (layout.hasChainedFixups) {
         if (execPath.length == 0) {
-            SBDiagLogLine(@"重绑：链式修正镜像须给可执行文件路径（链项只在磁盘文件里）");
+            SBDiagLogLine([@"重绑：链式修正镜像须给可执行文件路径（链项只在磁盘文件里）" UTF8String]);
             return NO;
         }
         rewrote = SBRebindChained(&layout, execPath, symbolName, replacement);

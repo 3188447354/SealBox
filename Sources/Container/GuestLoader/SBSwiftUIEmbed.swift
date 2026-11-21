@@ -131,5 +131,11 @@ public func SBHookedSwiftUIApplicationMain(
     _ delegateClassName: String?
 ) -> Int32 {
     SBDiagLog.log("拦截 Swift UIApplicationMain：principal=\(principalClassName ?? "(nil)") delegate=\(delegateClassName ?? "(nil)")（走 ObjC 替身判别：第一遍转发／第二遍拦截）")
-    return SBHookedUIApplicationMain(argc, argv, principalClassName, delegateClassName)
+    let result = SBHookedUIApplicationMain(argc, argv, principalClassName, delegateClassName)
+    // 0.2.32：替身返回前记一行——0.2.31 phoenix 三回都死在“会话激活成功”
+    // 之后、0.4 秒补查之前；有此行而无 bootstrap 的“客 main 已返回”，
+    // 死在客 main 收尾；无此行，死在替身返回本身（首遍转发时真实
+    // UIApplicationMain 不返回，此行只会在拦截路出现）。
+    SBDiagLog.log("拦截 Swift UIApplicationMain：替身返回 \(result)（客 main 将返回）")
+    return result
 }

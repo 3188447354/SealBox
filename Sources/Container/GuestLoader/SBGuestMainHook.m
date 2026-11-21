@@ -78,7 +78,7 @@ int SBHookedUIApplicationMain(int argc, char * _Nullable * _Nullable argv,
                             SBHookCallerImageName()] UTF8String]);
             return g_orig_UIApplicationMain(argc, argv, principalClassName, delegateClassName);
         }
-        SBDiagLogLine(@"拦截 UIApplicationMain：新鲜进程但找不到原函数，返回 0");
+        SBDiagLogLine([@"拦截 UIApplicationMain：新鲜进程但找不到原函数，返回 0" UTF8String]);
         return 0;
     }
     // 进程内：第二遍 UIApplicationMain——宿主 UIKit 已在跑，绝不能重初始化
@@ -86,7 +86,7 @@ int SBHookedUIApplicationMain(int argc, char * _Nullable * _Nullable argv,
     if (g_hookDidActivate) {
         // 多镜像重绑时同一替身可能被调两次（主镜像＋Framework 各一个槽）：
         // 第一次已激活，第二次直接返回 0，不重复激活（0.2.30）。
-        SBDiagLogLine(@"拦截 UIApplicationMain：已激活过，直接返回 0（重复触发）");
+        SBDiagLogLine([@"拦截 UIApplicationMain：已激活过，直接返回 0（重复触发）" UTF8String]);
         return 0;
     }
     NSString *callerImage = SBHookCallerImageName();
@@ -102,7 +102,11 @@ int SBHookedUIApplicationMain(int argc, char * _Nullable * _Nullable argv,
                                                                        error:&error];
     if (ok) {
         g_hookDidActivate = YES;
-        SBDiagLogLine([[NSString stringWithFormat:@"拦截 UIApplicationMain：%@ 会话激活成功（进程内第二遍已拦截）",
+        // 0.2.32：这里只表示“拦截完成、scene 驱动已安排”，不是“客窗已出现”——
+        // 客窗出现由会话管理器的 completeActivation（“已激活（客窗 …）”）记。
+        // 0.2.31 phoenix 三回都在这行之后、0.4 秒补查之前死了进程，旧文案
+        // “会话激活成功”会让人误以为客已在前台；改名，不在窗出现前记成功。
+        SBDiagLogLine([[NSString stringWithFormat:@"拦截 UIApplicationMain：%@ 拦截完成，已安排 scene 驱动（客窗待出现，0.4 秒后补查）",
                         bundleID] UTF8String]);
         return 0;
     }
