@@ -30,6 +30,7 @@
 // （SBSwiftUIAppMainHook），不在这里装。
 #import <Foundation/Foundation.h>
 #import <mach-o/dyld.h>
+#import <setjmp.h>
 
 #import "SBGuestSessionManager.h"
 #import "SBGuestUIClassifier.h"
@@ -66,5 +67,41 @@ NSError * _Nullable SBGuestMainHookActivationError(void);
 
 /// 每次跳 main 前复位激活状态（由 bootstrap 调）。
 void SBGuestMainHookResetActivationState(void);
+
+#pragma mark - 客 main 收尾的 exit 截获（0.2.33）
+//
+// 根因（原型 0233，本地真实 Flutter Runner 离线证实）：Swift 生成的 Runner
+// main 在覆盖层 UIApplicationMain 返回后无条件调 exit——OmoFun Runner 入口
+// 0x4560，覆盖层调用 0x45d4 返回后 `mov x0, x19; bl _exit`，stub 读 __got 槽
+// 0x8058 = 链式 import 序号 10 = `_exit`（Mach-O 符号 `_exit` 即 C exit；
+// C _exit 是 `__exit`，Runner 没 import 它）；main 里根本没有 ret。替身一返回
+// 0，Runner main 就 exit(0)，进程直接退出——不是崩（故无 .ips），bootstrap
+// 永远拿不回控制权，0.4 秒补查没机会跑（0.2.32 真机 phoenix 三回全断在
+// “替身返回 0”，与此一致）。Husk 2.0 也 import _exit，但它的入口分发器正常
+// 返回（0.2.31 真机 guestMain 回到了 bootstrap），无条件 exit 收尾是 Flutter
+// @UIApplicationMain 生成 main 的形态。
+// 修法：把客主镜像里 `_exit`（有则再加 `__exit`）的导入槽重绑到截获函数；
+// 截获时 siglongjmp 回 bootstrap 在跳 main 前设的 setjmp 点，按 main 正常返回
+// 走同一分流。截获只在跳 main 的同步调用期间武装——bootstrap 一拿回控制权
+// 立即解除；之后客若再调 exit，走原函数（进程退出），不跳回已失效的栈帧。
+// 注意：截获绝不能 return——exit 是 noreturn 调用点，其后是下一个函数的代码，
+// 返回即落入乱码执行；必须 longjmp。被跳过的帧里的 ARC 对象会漏掉（客正在退
+// 出，一次性），不崩。
+// 安装不拦加载：客没 import exit 时返回 NO，只记一行（没东西可截获）。
+
+/// 在客主镜像里重绑 `_exit` / `__exit` 到截获。至少一个装上返回 YES。
+BOOL SBGuestExitTrapInstallForGuestImage(const struct mach_header * _Nullable guestHeader,
+                                         NSString * _Nullable execPath,
+                                         NSString *bundleID);
+
+/// 武装 / 解除截获（由 bootstrap 在跳 main 前后调）。
+void SBGuestExitTrapArm(void);
+void SBGuestExitTrapDisarm(void);
+
+/// 截获到的退出码（仅截获路径有效；bootstrap 在 setjmp 非零分支里读）。
+int SBGuestExitTrapCode(void);
+
+/// setjmp 缓冲区（bootstrap 在跳 main 前调 sigsetjmp；截获由此跳回）。
+sigjmp_buf *SBGuestExitTrapEnv(void);
 
 NS_ASSUME_NONNULL_END

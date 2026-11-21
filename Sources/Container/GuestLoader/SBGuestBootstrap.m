@@ -4,6 +4,7 @@
 #import <dlfcn.h>
 #import <errno.h>
 #import <objc/runtime.h>
+#import <setjmp.h>
 #import <stdlib.h>
 #import <sys/stat.h>
 #import <unistd.h>
@@ -779,6 +780,12 @@ static void SBDiagLogGuestFail(SBGuestLoaderErrorCode code, NSString *bundleID, 
         }
     }
 
+    // 0.2.33：exit 截获（SBGuestMainHook.h）——Flutter Runner 生成的 main 在
+    // 覆盖层返回后无条件调 exit，不截获则替身一返回进程就退出（原型 0233，
+    // OmoFun Runner 入口反汇编已证）。装不上（客没 import exit）不拦加载，
+    // 只记一行；武装/解除在下面跳 main 处。
+    SBGuestExitTrapInstallForGuestImage(NULL, guestExecPath, bundleID);
+
     // —— 8. 取入口并跳入客 main ————————————————————————————————
     uint64_t entryoff = 0;
     NSError *entryError = nil;
@@ -813,14 +820,32 @@ static void SBDiagLogGuestFail(SBGuestLoaderErrorCode code, NSString *bundleID, 
 
     // 加载成功：收据写成 guest-loaded，再跳入口。客 App 随后调 UIApplicationMain，
     // 像正常 App 一样跑起来；直到它退出（横杠回桌面是 exit(0)，main 不返回；
-    // 只有 main 正常返回时才会走到下面的恢复逻辑）。
+    // 只有 main 正常返回时才会走到下面的恢复逻辑）。0.2.33 补充：Flutter 客
+    // main 收尾的 exit 由截获转成 longjmp，同样回到这里（“经 exit 截获”）。
     [SBGuestLoader markReceiptStage:@"guest-loaded" detail:nil];
     SBDiagLogLine([[NSString stringWithFormat:@"客加载：跳入客 main（入口 0x%lx）", (unsigned long)entryAddress] UTF8String]);
 
     typedef int (*SBGuestMainFn)(int argc, char **argv, char **environ);
     SBGuestMainFn guestMain = (SBGuestMainFn)entryAddress;
     char *guestArgv[] = { (char *)[guestExecPath UTF8String], NULL };
-    int guestResult = guestMain(1, guestArgv, environ);
+    // 0.2.33：客 main 一返回立即记一行（跳回后的第一行）——有此行说明 bootstrap
+    // 拿回了控制权、死在之后；无此行说明死在客 main 收尾里。exit 截获先武装：
+    // Runner main 收尾的 exit 会 siglongjmp 回这里，按 main 返回走同一分流。
+    // 注意：setjmp/longjmp 之间改过的非 volatile 局部在跳回后值不确定——
+    // guestResult/exitTrapped 只在跳回后（else 分支里）才赋值，安全；
+    // inProcess/isSwiftUIGuest/bundleID 等在 setjmp 前已定、中间没改过。
+    int guestResult = 0;
+    BOOL exitTrapped = NO;
+    SBGuestExitTrapArm();
+    if (sigsetjmp(*SBGuestExitTrapEnv(), 1) == 0) {
+        guestResult = guestMain(1, guestArgv, environ);
+    } else {
+        guestResult = SBGuestExitTrapCode();
+        exitTrapped = YES;
+    }
+    SBGuestExitTrapDisarm();
+    SBDiagLogLine([[NSString stringWithFormat:@"客 main 已返回（result=%d%@）",
+                    guestResult, exitTrapped ? @"，经 exit 截获" : @""] UTF8String]);
 
     // 客 App 的 main 返回了。分四种（0.2.27 三种＋0.2.28 SwiftUI 一种）：
     // ① 进程内 + hook 已激活：main 返回≠退出（hook 返回 0 即回），客在前台运行，

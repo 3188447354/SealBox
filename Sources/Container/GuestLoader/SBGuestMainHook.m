@@ -4,7 +4,9 @@
 #import <dlfcn.h>
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
+#import <setjmp.h>
 #import <string.h>
+#import <unistd.h>
 
 #import "SBChainedFixupRebind.h"
 #import "SBGuestLoader.h"
@@ -250,6 +252,81 @@ BOOL SBGuestMainHookInstallForGuestImage(const struct mach_header *guestHeader,
         // 绝不再把 Flutter/UIKit 客标成“疑似 SwiftUI 客”（0.2.29 的误标）。
         SBDiagLogLine([[NSString stringWithFormat:@"拦截 UIApplicationMain：%@ 安装失败（客类型 %@，主镜像＋%lu 个 Framework 均无 C/Swift 符号槽，见上文链式重绑诊断；护栏将干净失败，不跳 main）",
                         bundleID, typeString, (unsigned long)frameworkCount] UTF8String]);
+    }
+    return installed;
+}
+
+#pragma mark - 客 main 收尾的 exit 截获（0.2.33，机制见 SBGuestMainHook.h）
+
+static sigjmp_buf g_sbExitTrapEnv;
+static volatile sig_atomic_t g_sbExitTrapArmed = 0;
+static volatile int g_sbExitTrapCode = 0;
+/// 原 exit 地址（解除武装后截获要原样退出；dlsym("exit") 即 Mach-O `_exit`）。
+static void (*g_sbOrigExit)(int) = NULL;
+
+static void SBGuestExitTrap(int code) {
+    if (g_sbExitTrapArmed) {
+        g_sbExitTrapCode = code;
+        SBDiagLogLine([[NSString stringWithFormat:@"客 exit 被截获（code=%d），按 main 返回处理，不退出进程",
+                        code] UTF8String]);
+        siglongjmp(g_sbExitTrapEnv, 1);
+    }
+    if (g_sbOrigExit) {
+        g_sbOrigExit(code);
+    }
+    _exit(code); // 到不了（原函数 noreturn），只为守住 noreturn 约定。
+}
+
+void SBGuestExitTrapArm(void) {
+    g_sbExitTrapCode = 0;
+    g_sbExitTrapArmed = 1;
+}
+
+void SBGuestExitTrapDisarm(void) {
+    g_sbExitTrapArmed = 0;
+}
+
+int SBGuestExitTrapCode(void) {
+    return g_sbExitTrapCode;
+}
+
+sigjmp_buf *SBGuestExitTrapEnv(void) {
+    return &g_sbExitTrapEnv;
+}
+
+BOOL SBGuestExitTrapInstallForGuestImage(const struct mach_header *guestHeader,
+                                         NSString *execPath,
+                                         NSString *bundleID) {
+    if (!guestHeader) {
+        guestHeader = SBGuestImageHeaderForExecPath(execPath);
+    }
+    if (!guestHeader) {
+        SBDiagLogLine([[NSString stringWithFormat:@"客 exit 截获：%@ 找不到客镜像头，不装截获",
+                        bundleID] UTF8String]);
+        return NO;
+    }
+    if (!g_sbOrigExit) {
+        // dlsym 名去 '_'：SBSlotPrecheck 同款（"_exit"→"exit"）；解析不到
+        // 时预校验会跳过，截获本身仍可装（槽值由重绑函数回读核对）。
+        g_sbOrigExit = (void (*)(int))dlsym(RTLD_DEFAULT, "exit");
+    }
+    BOOL installed = NO;
+    // Mach-O `_exit` 即 C exit（Runner main 收尾调的就是它，原型 0233）；
+    // `__exit` 即 C _exit，Runner 没 import，有则一起截，没则跳过。
+    if (SBRebindGuestSymbolForImage(guestHeader, execPath, "_exit",
+                                    (void *)SBGuestExitTrap)) {
+        SBDiagLogLine([[NSString stringWithFormat:@"客 exit 截获：%@ _exit 已在 %@ 重绑到截获",
+                        bundleID, execPath.lastPathComponent] UTF8String]);
+        installed = YES;
+    } else {
+        SBDiagLogLine([[NSString stringWithFormat:@"客 exit 截获：%@ %@ 无 _exit 槽（见上文链式重绑诊断）",
+                        bundleID, execPath.lastPathComponent] UTF8String]);
+    }
+    if (SBRebindGuestSymbolForImage(guestHeader, execPath, "__exit",
+                                    (void *)SBGuestExitTrap)) {
+        SBDiagLogLine([[NSString stringWithFormat:@"客 exit 截获：%@ __exit 已在 %@ 重绑到截获",
+                        bundleID, execPath.lastPathComponent] UTF8String]);
+        installed = YES;
     }
     return installed;
 }

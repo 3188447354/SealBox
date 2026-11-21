@@ -12,6 +12,86 @@ import UIKit
 /// ＋设备日志验证——每步都记诊断日志（App 类型名、body 类型名、WindowGroup
 /// 子项标签/类型、闭包是否找到、调用结果类型），失败只返回 false，不抛异常、
 /// 不调原 App.main（替身收到 false 即置激活错误，bootstrap 按失败处理）。
+///
+/// 0.2.33：WindowGroup 内容递归钻取（RootContent，见第 5 步）＋ adaptor
+/// delegate 递归查找/类名新建（见第 3 步）——Husk 真机四回：闭包找不到、
+/// delegate 未找到。
+
+/// 在一个值里递归找 UIApplicationDelegate：解 Optional、进盒子/结构体子项，
+/// 深度 ≤3。找不到返回 nil（调用方决定后备方案，不抛异常）。
+func findDelegate(in value: Any, depth: Int, path: String) -> UIApplicationDelegate? {
+    if let delegate = value as? UIApplicationDelegate {
+        return delegate
+    }
+    guard depth < 3 else { return nil }
+    for child in Mirror(reflecting: value).children {
+        let label = child.label ?? "(无标签)"
+        if let found = findDelegate(in: child.value, depth: depth + 1, path: "\(path).\(label)") {
+            return found
+        }
+    }
+    return nil
+}
+
+/// 按 adaptor 泛型名建 delegate 实例：UIApplicationDelegateAdaptor<HuskAppDelegate>
+/// ＋ App 类型 Husk.HuskApp → 先试 NSClassFromString("Husk.HuskAppDelegate")，
+/// 再试 "HuskAppDelegate"。建不出返回 nil（调用方不挡窗口）。
+func buildDelegateFromAdaptorTypeName(_ adaptorTypeName: String, appType: Any.Type) -> UIApplicationDelegate? {
+    guard let lt = adaptorTypeName.firstIndex(of: "<"),
+          let gt = adaptorTypeName.firstIndex(of: ">"), lt < gt else { return nil }
+    let delegateName = String(adaptorTypeName[adaptorTypeName.index(after: lt)..<gt])
+    guard !delegateName.isEmpty else { return nil }
+    let moduleName = String(reflecting: appType).split(separator: ".").first.map(String.init) ?? ""
+    var candidates = [delegateName]
+    if !moduleName.isEmpty {
+        candidates.insert("\(moduleName).\(delegateName)", at: 0)
+    }
+    for name in candidates {
+        guard let cls = NSClassFromString(name) as? NSObject.Type else { continue }
+        if let delegate = cls.init() as? UIApplicationDelegate {
+            return delegate
+        }
+    }
+    return nil
+}
+
+/// 在一个值里递归找根视图：本身是 View 即取；否则 Mirror 钻子项——闭包调后
+/// 是 View 即取，或继续钻；深度 ≤3。title 之类已在上层跳过。
+/// 找不到返回 nil（调用方按失败处理，不抛异常）。
+func findRootView(in value: Any, depth: Int, path: String) -> (any View)? {
+    if let view = value as? any View {
+        SBDiagLog.log("SwiftUI 嵌客：\(path) 本身是 View（\(String(describing: type(of: value)))），当根视图")
+        return view
+    }
+    guard depth < 3 else {
+        SBDiagLog.log("SwiftUI 嵌客：\(path) 钻取到深度上限，停")
+        return nil
+    }
+    let mirror = Mirror(reflecting: value)
+    guard !mirror.children.isEmpty else {
+        SBDiagLog.log("SwiftUI 嵌客：\(path) 无子项，不是 View/闭包")
+        return nil
+    }
+    for child in mirror.children {
+        let label = child.label ?? "(无标签)"
+        let childPath = "\(path).\(label)"
+        let childTypeName = String(describing: type(of: child.value))
+        SBDiagLog.log("SwiftUI 嵌客：钻取 \(childPath)：\(childTypeName)")
+        if let contentFn = child.value as? () -> Any {
+            if let view = contentFn() as? any View {
+                SBDiagLog.log("SwiftUI 嵌客：闭包调用得 View（\(childPath)）")
+                return view
+            }
+            SBDiagLog.log("SwiftUI 嵌客：闭包调用结果不是 View（\(childPath)）")
+            continue
+        }
+        if let view = findRootView(in: child.value, depth: depth + 1, path: childPath) {
+            return view
+        }
+    }
+    return nil
+}
+
 @_cdecl("SBSwiftUIEmbedApp")
 public func SBSwiftUIEmbedApp(_ metadata: UnsafeRawPointer,
                               _ context: SBGuestMainHookContext) -> Bool {
@@ -28,23 +108,25 @@ public func SBSwiftUIEmbedApp(_ metadata: UnsafeRawPointer,
     let app = appType.init()
 
     // —— 3. @UIApplicationDelegateAdaptor（有则取 delegate，无则跳过） ————
+    // 0.2.33：0.2.32 真机 Husk 四回都是“adaptor delegate 未找到”——单层
+    // Mirror 扫不到：delegate 可能包在 Optional 里、装在引用型盒子里、或根本
+    // 还没创建（SwiftUI 在 runApp 时才建）。修法：递归钻取（解 Optional、进
+    // 盒子，深度 ≤3）；找不到再按 adaptor 泛型名用 NSClassFromString 建一个
+    //（先 "模块.Delegate" 再 "Delegate"）。仍找不到也不挡窗口：delegate 只
+    // 影响客 AppDelegate 方法跑不跑，不影响开窗。
     var appDelegate: UIApplicationDelegate?
     for child in Mirror(reflecting: app).children {
         let typeName = String(describing: type(of: child.value))
         guard typeName.contains("UIApplicationDelegateAdaptor") else { continue }
         SBDiagLog.log("SwiftUI 嵌客：找到 @UIApplicationDelegateAdaptor 属性（\(typeName)）")
-        // adaptor 是属性包装器，delegate 在它里面；Mirror 扫一层找能转成
-        // UIApplicationDelegate 的子项。
-        for sub in Mirror(reflecting: child.value).children {
-            if let delegate = sub.value as? UIApplicationDelegate {
-                appDelegate = delegate
-                break
-            }
-        }
-        if let delegate = appDelegate {
-            SBDiagLog.log("SwiftUI 嵌客：adaptor delegate 已找到（\(String(describing: type(of: delegate)))）")
+        if let found = findDelegate(in: child.value, depth: 0, path: "adaptor") {
+            appDelegate = found
+            SBDiagLog.log("SwiftUI 嵌客：adaptor delegate 已找到（\(String(describing: type(of: found)))）")
+        } else if let built = buildDelegateFromAdaptorTypeName(typeName, appType: appType) {
+            appDelegate = built
+            SBDiagLog.log("SwiftUI 嵌客：adaptor delegate 未找到，按类名新建（\(String(describing: type(of: built)))）")
         } else {
-            SBDiagLog.log("SwiftUI 嵌客：adaptor delegate 未找到")
+            SBDiagLog.log("SwiftUI 嵌客：adaptor delegate 未找到（递归＋类名都未果，不挡窗口）")
         }
         break
     }
@@ -70,23 +152,26 @@ public func SBSwiftUIEmbedApp(_ metadata: UnsafeRawPointer,
         return false
     }
 
-    // —— 5. WindowGroup 内容闭包 → 根视图 ————————————————————
-    // WindowGroup 按窗口建内容，存的是 @escaping () -> Content 闭包，
-    // 不是单个 Content 值。Mirror 子项里找函数类型子项，强转 () -> Any
-    // 后调用（Swift 函数类型返回协变，() -> ContentView 可转为 () -> Any）。
+    // —— 5. WindowGroup 内容 → 根视图 ————————————————————
+    // 0.2.33：0.2.32 真机 Husk 四回同因失败——WindowGroup 的 content 子项不是
+    // 裸闭包，而是 SwiftUI 内部类型 WindowGroupRootContent<Content>（init 收
+    // 的是 lazyContent 闭包，Husk 2.0 二进制 mangled 名
+    // WindowGroupV2id5title11lazyContent… 为证；RootContent 的字段表在
+    // SwiftUICore 里，客二进制里没有，只能运行时 Mirror 发现、不能硬编码）。
+    // 修法：递归钻取——子项本身是 View 即取（RootContent 就是内容树）；不是则
+    // 钻进去找闭包（调后须是 View）或已建好的 View；title 跳过（Text 也是
+    // View，不能当根视图）；深度 ≤3；每步记日志，找不到只返回 false。
     var rootView: (any View)?
     for child in Mirror(reflecting: group).children {
         let label = child.label ?? "(无标签)"
         let childTypeName = String(describing: type(of: child.value))
         SBDiagLog.log("SwiftUI 嵌客：WindowGroup 子项 \(label)：\(childTypeName)")
-        guard let contentFn = child.value as? () -> Any else { continue }
-        guard let view = contentFn() as? any View else {
-            SBDiagLog.log("SwiftUI 嵌客：内容闭包调用结果不是 View（\(label)）")
-            continue
+        guard label != "title" else { continue }
+        if let view = findRootView(in: child.value, depth: 0, path: label) {
+            rootView = view
+            SBDiagLog.log("SwiftUI 嵌客：根视图类型 \(String(describing: type(of: view)))（子项 \(label)）")
+            break
         }
-        rootView = view
-        SBDiagLog.log("SwiftUI 嵌客：根视图类型 \(String(describing: type(of: view)))（子项 \(label)）")
-        break
     }
     guard let view = rootView else {
         SBDiagLog.log("SwiftUI 嵌客：WindowGroup 里找不到内容闭包或调用后不是 View")

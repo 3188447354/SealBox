@@ -329,9 +329,14 @@ static const NSTimeInterval SBGuestSceneSystemPathWaitSeconds = 0.4;
 - (void)checkSceneSystemPathForSession:(SBGuestSession *)session {
     // 会话已被清掉（失败/切换）则不再动。
     if (self.sessions[session.bundleID] != session) {
+        // 0.2.33：之前这里静默返回，下份日志会误读成“死在替身返回到补查之间”；记一行区分。
+        SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 0.4 秒补查：会话已不在（被清掉/切换），不补查",
+                        session.bundleID] UTF8String]);
         return;
     }
     if (session.guestWindow) {
+        SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 0.4 秒补查：客窗已有（已激活），不重复",
+                        session.bundleID] UTF8String]);
         return;
     }
     // 0.2.32：补查入口记一行——0.2.31 phoenix 三回都没走到这里（死在之前），
@@ -478,12 +483,18 @@ static const NSTimeInterval SBGuestSceneSystemPathWaitSeconds = 0.4;
                         context.bundleID, requestError.localizedDescription] UTF8String]);
     }];
     __weak SBGuestSession *weakSession = session;
+    NSString *checkBundleID = session.bundleID;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
                                  (int64_t)(SBGuestSceneSystemPathWaitSeconds * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         SBGuestSession *strongSession = weakSession;
         if (strongSession) {
             [self checkSceneSystemPathForSession:strongSession];
+        } else {
+            // 0.2.33：会话在 0.4 秒内被释放——之前这里静默无操作，下份日志会
+            // 误读成“死在替身返回到补查之间”；记一行区分。
+            SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 0.4 秒补查：会话已释放，不补查",
+                            checkBundleID] UTF8String]);
         }
     });
     return YES;
