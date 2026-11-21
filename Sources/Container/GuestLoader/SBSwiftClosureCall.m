@@ -183,9 +183,12 @@ BOOL SBCallSwiftClosure(const void *closureAny, void *outAny,
     // @try 抓不住。ctx 非空＝闭包捕获了 App 状态（Locus 的 ctx 是 72 字节堆盒子，
     // 含 session/pairing/setupComplete；体一进来就读它们）；能用的 Husk/Asspp
     // 的 ctx 都是 0x0。捕获未必一定 trap（体内部可能不碰图状态），但 C 层无法
-    // 预判——宁可干净拒绝，不让进程死在闭包体里。0.2.38 方向：让 SwiftUI 自己
-    // 在活的图里求值 body（LiveContainer 路）或先建图上下文；离线无法验证，
-    // 不在本版冒险。Thin 闭包无上下文，不受此限。
+    // 预判——宁可干净拒绝，不让进程死在闭包体里。
+    // 0.2.38 定论（活图里求值 body 做不到，保持拒绝）：宿主本身就是 SwiftUI App，
+    // 第二遍跑客 App.main（runApp）必崩（SBSwiftUIAppMainHook.m）；没有公开 API
+    // 能把 Scene（WindowGroup）挂进 UIHostingController、也没有 API 能在 App
+    // 生命周期之外装好 App 结构体的 @StateObject 存储；在宿主 View 的 body 里代调
+    // 仍会陷阱。私有 SPI／猜符号无编译器、无真机可验，不做。
     if (conv == SB_FN_CONV_SWIFT && ctx != NULL) {
         char buf[192];
         snprintf(buf, sizeof(buf), "闭包捕获了上下文（ctx=%p），体内部可能读 SwiftUI 图状态，直接调用会陷阱，拒绝", ctx);

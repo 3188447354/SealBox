@@ -791,6 +791,58 @@ public enum SBInstaller {
         // 返回前 clearedSignatureFailure 清掉并落盘）。
         let lastLaunchSigFailed = record.lastLaunchSigFailed
         SBDiagLog.log("签名修复门验签：\(record.bundleID) \(executablePath) \(signatureDetailFields(detail: gateDetail)) 上次签名失败标记=\(lastLaunchSigFailed ? "是" : "否")\(record.lastLaunchResult.map { "（\($0.message.prefix(80))）" } ?? "")")
+        // 0.2.38：叶子指纹比对——静态逐项“有效=是”不再单独作为放行依据。
+        // 0.2.37 真机（2026-11-22 01:04–01:09）：Husk（两回）、Asspp（两份副本）、
+        // nread 的修复门逐项全过（有效=是、CMS 链完整、Team 一致），随后 dlopen 全死
+        // code signature invalid；它们的叶子全是旧证书（到期 271110144946Z），而同进程
+        // 同 Team 的 Locus／彩云叶子是新证书（到期 271121124929Z）且 dlopen 成功。
+        // 静态逐项只验签名结构与 CMS 数学（SBCodesignCheck.h：证书链的系统信任评估、
+        // 吊销状态是 dyld／amfid 在加载时做的事，静态验签看不见）——旧叶子在内核那里
+        // 已不被接受，静态“有效”放行即撞墙。0.2.36 验过 Husk 通是因为当时还没换证书，
+        // 不是 0.2.37 代码回归。另：第二回点 Husk 时标记仍是“否”（进程内二次点击
+        // 不走 noteGuestLoadFailedIfNeeded 的补记），光靠标记触发修复不够——叶子
+        // 比对不依赖标记，每次点图标都验。
+        // 故：客叶子指纹必须等于当前已导入证书的叶子指纹，否则用当前证书把整个客包
+        // 重签（repatchInstalledApp：打补丁＋ZSign 全包重签＋内核门＋复验；与安装时
+        // signApp 同款签法），重签后复验叶子与逐项；复验不过抛错写明原因，绝不走到
+        // dlopen。任一指纹算不出时跳过本项比对、走原有修复门（不因算不出而误拦）。
+        // 本块在注入件分支之前：叶子不符时先修客包；注入件若也旧，启动时注入件检查
+        // 已重签过它，极端双旧时下一回点图标走注入件分支再修（各干净失败一次）。
+        if let currentFingerprint = currentCertificateLeafFingerprint() {
+            if let guestFingerprint = guestLeafFingerprint(atPath: executablePath) {
+                if guestFingerprint != currentFingerprint {
+                    let guestExpiry = gateDetail["cmsLeafExpiry"] as? String ?? "未知"
+                    SBDiagLog.log("签名修复门：\(record.bundleID) 客叶子指纹与当前证书不符（客=\(guestFingerprint.prefix(12)) 到期\(guestExpiry)，当前=\(currentFingerprint.prefix(12))），用当前证书重签整个客包")
+                    try checkTeamMatch(executablePath, bundleID: record.bundleID)
+                    guard canRepair else {
+                        SBDiagLog.log("签名修复门：\(record.bundleID) 客叶子不是当前证书（客=\(guestFingerprint.prefix(12))，当前=\(currentFingerprint.prefix(12))），且未导入证书，无法重签修复，干净失败")
+                        throw SBError.signFailed(reason: "客叶子不是当前证书（客=\(guestFingerprint.prefix(12))，当前=\(currentFingerprint.prefix(12))），且未导入证书，无法重签修复")
+                    }
+                    SBDiagLog.log("签名修复门：\(record.bundleID) \(executablePath) 叶子不符强制重签（客=\(guestFingerprint.prefix(12)) 当前=\(currentFingerprint.prefix(12))）")
+                    let repaired = try await repatchInstalledApp(record)
+                    // 重签后复验（与下面强制修复路同款逐项复验，再加叶子复验）。
+                    let postDetail = SBCodesignCheck.signatureDetail(atPath: repaired.executableURL.path)
+                    SBDiagLog.log("签名修复门复验：\(record.bundleID) \(repaired.executableURL.path) \(signatureDetailFields(detail: postDetail))")
+                    let postItems = failingSignatureItems(detail: postDetail)
+                    if !postItems.isEmpty {
+                        SBDiagLog.log("签名修复门：\(record.bundleID) 重签后复验仍不合格（\(postItems.joined(separator: "；"))），干净失败")
+                        throw SBError.signFailed(reason: "重签后签名仍不合格：\(postItems.joined(separator: "；"))")
+                    }
+                    let postFingerprint = guestLeafFingerprint(atPath: repaired.executableURL.path)
+                    guard postFingerprint == currentFingerprint else {
+                        SBDiagLog.log("签名修复门：\(record.bundleID) 重签后叶子仍不是当前证书（重签后客=\(postFingerprint.map { String($0.prefix(12)) } ?? "算不出")，当前=\(currentFingerprint.prefix(12))），干净失败")
+                        throw SBError.signFailed(reason: "重签后叶子仍不是当前证书（重签后客=\(postFingerprint.map { String($0.prefix(12)) } ?? "算不出")，当前=\(currentFingerprint.prefix(12))），不走到 dlopen")
+                    }
+                    SBDiagLog.log("签名修复门：\(record.bundleID) 重签后叶子已是当前证书（\(currentFingerprint.prefix(12))），复验通过")
+                    return repaired
+                }
+                SBDiagLog.log("签名修复门：\(record.bundleID) 叶子已是当前证书（\(currentFingerprint.prefix(12))），跳过重签")
+            } else {
+                SBDiagLog.log("签名修复门：\(record.bundleID) 客叶子指纹算不出（无 CMS 或解析失败），跳过叶子比对")
+            }
+        } else {
+            SBDiagLog.log("签名修复门：当前证书叶子指纹算不出（无证书或口令错），跳过叶子比对")
+        }
         let detailValid = (gateDetail["valid"] as? NSNumber)?.boolValue ?? false
         // 0.2.18：上次启动死在注入件签名上时，先修注入件，不白打客应用
         // 的补丁。失败文案里带 SBGuestHooks.dylib 即上次 dlopen 死在注
@@ -962,6 +1014,267 @@ public enum SBInstaller {
         let derData = SecCertificateCopyData(certificate) as Data
         let digest = SHA256.hash(data: derData)
         return digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    // MARK: - 0.2.38：客可执行文件的叶子指纹（CMS DER 解析）
+
+    /// 0.2.38：修复门必须把客叶子指纹与当前证书叶子指纹比对——SecStaticCode
+    /// 系 API 是 macOS-only，iOS 上没有（见 SBCodesignCheck.h），只能像
+    /// SBCodesignCheck 那样手动解析 Mach-O＋superblob＋CMS DER。下面是它的
+    /// Swift 侧镜像：同样的常量（LC_CODE_SIGNATURE 0x1d、superblob magic
+    /// 0xfade0cc0、CMS 槽 0x10000、BlobWrapper 头 8 字节）、同样的 DER 读法
+    /// （SBDerReadTLV／SBDerChildren）、同样的证书解析（SBParseCert：TBS
+    /// 字段顺序严格校验）与同样的叶子判定（主体不等于任何其他证书签发者的
+    /// 那张，且唯一；自签单证书时叶子就是它自己）。
+    /// 只取叶子身份（issuer／subject TLV＋整张证书 DER），不验链、不验签名值——
+    /// 链与签名值的校验仍由 SBCodesignCheck 的逐项负责；这里只回答“这张叶子
+    /// 是不是当前证书的那张”。任一步解析失败返回 nil（调用方跳过本项比对，
+    /// 不因算不出而误拦）。
+
+    /// DER TLV（起止均为在整个 Data 里的偏移）。
+    private struct SBDerTLV {
+        var tag: UInt8
+        var contentStart: Int
+        var contentLen: Int
+        var totalLen: Int
+        /// TLV 起点（含标签头）＝内容起点－头长。
+        var start: Int { contentStart - (totalLen - contentLen) }
+        var end: Int { contentStart + contentLen }
+    }
+
+    /// 读一个 TLV（SBDerReadTLV 同款：多字节标签不支持；不定长 0x80 扫子项
+    /// 到 EOC；长形式长度 1–4 字节；嵌套深度 ≤16）。
+    private static func derReadTLV(_ data: Data, at offset: Int, depth: Int) -> SBDerTLV? {
+        guard depth <= 16 else { return nil }
+        guard offset + 2 <= data.count else { return nil }
+        let tag = data[offset]
+        guard tag != 0x1F else { return nil }
+        let lenByte = data[offset + 1]
+        var headerLen = 2
+        var contentLen = 0
+        if lenByte == 0x80 {
+            var p = offset + headerLen
+            while true {
+                guard p + 2 <= data.count else { return nil }
+                if data[p] == 0x00 && data[p + 1] == 0x00 {
+                    contentLen = p - (offset + headerLen)
+                    return SBDerTLV(tag: tag, contentStart: offset + headerLen,
+                                    contentLen: contentLen, totalLen: (p + 2) - offset)
+                }
+                guard let child = derReadTLV(data, at: p, depth: depth + 1) else { return nil }
+                p += child.totalLen
+            }
+        } else if lenByte & 0x80 != 0 {
+            let n = Int(lenByte & 0x7F)
+            guard n >= 1 && n <= 4 && offset + 2 + n <= data.count else { return nil }
+            for i in 0..<n {
+                contentLen = (contentLen << 8) | Int(data[offset + 2 + i])
+            }
+            headerLen = 2 + n
+        } else {
+            contentLen = Int(lenByte)
+        }
+        guard offset + headerLen + contentLen <= data.count else { return nil }
+        return SBDerTLV(tag: tag, contentStart: offset + headerLen,
+                        contentLen: contentLen, totalLen: headerLen + contentLen)
+    }
+
+    /// 列出一个构造型 TLV 的全部子项（必须恰好在内容尾结束；子项 ≤16，
+    /// SBDerMaxChildren 同款）。
+    private static func derChildren(_ data: Data, of parent: SBDerTLV, depth: Int) -> [SBDerTLV]? {
+        var items: [SBDerTLV] = []
+        var p = parent.contentStart
+        let end = parent.contentStart + parent.contentLen
+        while p < end {
+            guard let child = derReadTLV(data, at: p, depth: depth + 1) else { return nil }
+            items.append(child)
+            guard items.count <= 16 else { return nil }
+            p += child.totalLen
+        }
+        guard p == end else { return nil }
+        return items
+    }
+
+    /// 一张 CMS 证书里叶子判定要用的三段 DER 范围（SBParseCert 同款字段）。
+    private struct SBCMSCert {
+        var certRange: Range<Int>
+        var issuerRange: Range<Int>
+        var subjectRange: Range<Int>
+    }
+
+    /// 解析一张证书（SBParseCert 同款：TBS 字段顺序严格校验
+    /// serial／signature／issuer／validity／subject，validity 两时间标签须是
+    /// UTCTime／GeneralizedTime；只取 issuer／subject 完整 TLV，不取 CN）。
+    private static func parseCMSCert(_ certTLV: SBDerTLV, in data: Data) -> SBCMSCert? {
+        guard certTLV.tag == 0x30 else { return nil }
+        guard let kids = derChildren(data, of: certTLV, depth: 0),
+              !kids.isEmpty, kids[0].tag == 0x30 else { return nil }
+        guard let tbs = derChildren(data, of: kids[0], depth: 0) else { return nil }
+        var idx = 0
+        if idx < tbs.count && tbs[idx].tag == 0xA0 { idx += 1 }
+        let expected: [UInt8] = [0x02, 0x30, 0x30, 0x30, 0x30]
+        for k in 0..<5 {
+            guard idx + k < tbs.count, tbs[idx + k].tag == expected[k],
+                  tbs[idx + k].contentLen > 0 else { return nil }
+        }
+        let issuer = tbs[idx + 2]
+        let validity = tbs[idx + 3]
+        let subject = tbs[idx + 4]
+        guard let times = derChildren(data, of: validity, depth: 0), times.count >= 2,
+              (times[0].tag == 0x17 || times[0].tag == 0x18),
+              (times[1].tag == 0x17 || times[1].tag == 0x18) else { return nil }
+        return SBCMSCert(
+            certRange: certTLV.start..<(certTLV.start + certTLV.totalLen),
+            issuerRange: issuer.start..<issuer.end,
+            subjectRange: subject.start..<subject.end)
+    }
+
+    /// CMS DER（BlobWrapper 头已去掉）→ 叶子证书 DER 的 SHA-256 hex。
+    /// ContentInfo SEQ{OID, [0] SignedData} → SignedData SEQ{version,
+    /// digestAlgorithms SET, contentInfo SEQ, [0] 证书集…}；取第一个证书集
+    /// （SBCodesignCheck 同款：certCount == 0 时才取），叶子判定同款规则。
+    private static func cmsLeafFingerprint(_ cmsDER: Data) -> String? {
+        guard let top = derReadTLV(cmsDER, at: 0, depth: 0), top.tag == 0x30 else { return nil }
+        guard let ci = derChildren(cmsDER, of: top, depth: 0), ci.count >= 2,
+              ci[0].tag == 0x06, ci[1].tag == 0xA0 else { return nil }
+        guard let sdWrap = derChildren(cmsDER, of: ci[1], depth: 0),
+              !sdWrap.isEmpty, sdWrap[0].tag == 0x30 else { return nil }
+        guard let sd = derChildren(cmsDER, of: sdWrap[0], depth: 0), sd.count >= 3,
+              sd[0].tag == 0x02, sd[1].tag == 0x31, sd[2].tag == 0x30 else { return nil }
+        var certs: [SBCMSCert] = []
+        for i in 3..<sd.count where sd[i].tag == 0xA0 {
+            guard let certKids = derChildren(cmsDER, of: sd[i], depth: 0) else { return nil }
+            for kid in certKids {
+                guard certs.count < 8, let cert = parseCMSCert(kid, in: cmsDER) else { return nil }
+                certs.append(cert)
+            }
+            break
+        }
+        guard !certs.isEmpty else { return nil }
+        var leafIdx = -1
+        for i in certs.indices {
+            let subject = cmsDER[certs[i].subjectRange]
+            var isIssuerOfAnother = false
+            for j in certs.indices where j != i {
+                if subject == cmsDER[certs[j].issuerRange] {
+                    isIssuerOfAnother = true
+                    break
+                }
+            }
+            if !isIssuerOfAnother {
+                guard leafIdx < 0 else { return nil }
+                leafIdx = i
+            }
+        }
+        guard leafIdx >= 0 else { return nil }
+        let leafDER = cmsDER[certs[leafIdx].certRange]
+        let digest = SHA256.hash(data: leafDER)
+        return digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func be32(_ data: Data, at offset: Int) -> UInt32? {
+        guard offset >= 0 && offset + 4 <= data.count else { return nil }
+        return (UInt32(data[offset]) << 24) | (UInt32(data[offset + 1]) << 16)
+            | (UInt32(data[offset + 2]) << 8) | UInt32(data[offset + 3])
+    }
+
+    private static func le32(_ data: Data, at offset: Int) -> UInt32? {
+        guard offset >= 0 && offset + 4 <= data.count else { return nil }
+        return UInt32(data[offset]) | (UInt32(data[offset + 1]) << 8)
+            | (UInt32(data[offset + 2]) << 16) | (UInt32(data[offset + 3]) << 24)
+    }
+
+    /// 客可执行文件 → CMS 叶子证书 DER 的 SHA-256 hex（与 certificateFingerprint
+    /// 同款算法，可直接比对）。Mach-O 定位同款 SBCodesignCheck.SBFindSignature
+    /// （fat 取 arm64 slice；thin 须是 MH_MAGIC_64；LC_CODE_SIGNATURE 给签名区），
+    /// superblob 定位同款 SBParseSignature（magic 0xfade0cc0；索引里找 CMS 槽
+    /// 0x10000；CMS blob 长度含 8 字节 BlobWrapper 头，DER 从槽偏移＋8 起）。
+    /// 无签名、无 CMS 槽、解析失败都返回 nil。
+    private static func guestLeafFingerprint(atPath path: String) -> String? {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+              data.count >= 4 else { return nil }
+        var sliceBase = 0
+        var sliceLen = data.count
+        let magicLE = le32(data, at: 0) ?? 0
+        if magicLE == 0xBEBAFECA || magicLE == 0xCAFEBABE {
+            guard let nfat = be32(data, at: 4) else { return nil }
+            var found = false
+            for i in 0..<Int(nfat) {
+                let arch = 8 + i * 20
+                guard arch + 20 <= data.count,
+                      let cputype = be32(data, at: arch),
+                      let offset = be32(data, at: arch + 8),
+                      let size = be32(data, at: arch + 12) else { return nil }
+                if cputype == 0x0100000C {
+                    guard Int(offset) + Int(size) <= data.count else { return nil }
+                    sliceBase = Int(offset)
+                    sliceLen = Int(size)
+                    found = true
+                    break
+                }
+            }
+            guard found else { return nil }
+        } else if magicLE != 0xFEEDFACF {
+            return nil
+        }
+        guard sliceLen >= 32, let ncmds = le32(data, at: sliceBase + 16) else { return nil }
+        var lc = sliceBase + 32
+        var sigOff = 0
+        var sigSize = 0
+        var foundSig = false
+        for _ in 0..<Int(ncmds) {
+            guard lc + 8 <= sliceBase + sliceLen,
+                  let cmd = le32(data, at: lc),
+                  let cmdsize = le32(data, at: lc + 4),
+                  cmdsize >= 8, lc + Int(cmdsize) <= sliceBase + sliceLen else { return nil }
+            if cmd == 0x1D {
+                guard cmdsize >= 16,
+                      let dataoff = le32(data, at: lc + 8),
+                      let datasize = le32(data, at: lc + 12),
+                      dataoff != 0, datasize != 0,
+                      Int(dataoff) + Int(datasize) <= sliceLen else { return nil }
+                sigOff = Int(dataoff)
+                sigSize = Int(datasize)
+                foundSig = true
+            }
+            lc += Int(cmdsize)
+        }
+        guard foundSig else { return nil }
+        let sigBase = sliceBase + sigOff
+        guard sigSize >= 12,
+              let sigMagic = be32(data, at: sigBase), sigMagic == 0xFADE0CC0,
+              let blobLength = be32(data, at: sigBase + 4),
+              let count = be32(data, at: sigBase + 8),
+              blobLength <= sigSize, 12 + Int(count) * 8 <= sigSize else { return nil }
+        var cmsOffset = 0
+        var cmsBlobLength = 0
+        var foundCMS = false
+        for i in 0..<Int(count) {
+            let entry = sigBase + 12 + i * 8
+            guard let type = be32(data, at: entry),
+                  let offset = be32(data, at: entry + 4),
+                  Int(offset) < sigSize else { return nil }
+            if type == 0x10000 {
+                cmsOffset = Int(offset)
+                guard let len = be32(data, at: sigBase + cmsOffset + 4) else { return nil }
+                cmsBlobLength = Int(len)
+                foundCMS = true
+                break
+            }
+        }
+        guard foundCMS, cmsBlobLength >= 8 else { return nil }
+        let derLen = cmsBlobLength - 8
+        guard derLen > 0, cmsOffset + 8 + derLen <= sigSize else { return nil }
+        let cmsDER = data[(sigBase + cmsOffset + 8)..<(sigBase + cmsOffset + 8 + derLen)]
+        return cmsLeafFingerprint(cmsDER)
+    }
+
+    /// 当前已导入证书的叶子指纹（与安装时记的 signingCertFingerprint 同款算法）。
+    /// 无证书／口令错／p12 读不出时返回 nil。
+    private static func currentCertificateLeafFingerprint() -> String? {
+        guard let certData = certificateData(),
+              let password = certificatePassword(), !password.isEmpty else { return nil }
+        return certificateFingerprint(certData: certData, password: password)
     }
 
     /// 调 ObjC++ 包装 `SBSigner` 对整个 .app 重签；失败抛 `SBError.signFailed`。

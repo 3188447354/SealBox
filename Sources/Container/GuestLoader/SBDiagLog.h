@@ -44,6 +44,9 @@ void SBDiagLogClearDlopenEntry(void);
 /// willConnect 里 Swift trap 抓不住（@try/@catch 只能抓 NSException），进程
 /// 死在里面时日志只断在“调用…”行之后；有此标记，下次启动能明确报“上次死在
 /// willConnect 里（客=…）”，不用靠缺行推断。调用前 Mark、返回/抛异常后 Clear。
+/// 0.2.38：标记文件改存 App Group 共享区（<组容器>/SBDiag，与拦截记录同目录；
+/// 重装宿主换容器也不丢——标记丢了下次启动就写不出拦截记录、会再死一次）。
+/// 写／清标记各记一行诊断日志。dlopen 标记仍在 Logs（只作诊断，不拦启动）。
 void SBDiagLogMarkWillConnectEntry(const char *guestBundleID);
 void SBDiagLogClearWillConnectEntry(void);
 
@@ -52,11 +55,15 @@ void SBDiagLogClearWillConnectEntry(void);
 /// 跳过该客的 willConnect 调用（见下 willConnect 熔断）。
 const char *SBDiagLogStaleWillConnectGuest(void);
 
-/// 0.2.37：willConnect 熔断记录（Logs/willconnect-blocked-<bundleID>.txt，
-/// 内容两行：客可执行指纹、宿主版本）。死过一次 willConnect 的客写入此记录；
-/// 之后启动：指纹与宿主版本均未变 → 不再调 willConnect、干净失败；
-/// 重装/重导（指纹变）或宿主升级（版本变）→ 记录失效，自动重试一次。
-/// willConnect 成功返回与重装都会清掉记录。任何失败都静默丢弃。
+/// 0.2.37：willConnect 熔断记录（内容两行：客可执行指纹、宿主版本）。死过一次
+/// willConnect 的客写入此记录；之后启动：指纹与宿主版本均未变 → 不再调
+/// willConnect、干净失败；重装/重导（指纹变）或宿主升级（版本变）→ 记录失效，
+/// 自动重试一次。willConnect 成功返回与重装都会清掉记录。任何失败都静默丢弃。
+/// 0.2.38：记录改存 App Group 共享区（<组容器>/SBDiag/willconnect-blocked-<bundleID>.txt，
+/// 0.2.37 在 Logs 里，重装宿主换容器就丢——本轮彩云 01:04:19 又死在 willConnect
+/// 里就是这个原因）。共享区不可用时回落到 Logs（行为与 0.2.37 一致，日志里写明）。
+/// 0.2.37 升 0.2.38 不重装时，BeginRun 把 Logs 里残留的记录搬到共享区（目标已
+/// 存在时按 mtime 定去留）。写／查／清记录各记一行诊断日志。
 void SBDiagLogBlockWillConnectForGuest(const char *guestBundleID, const char *fingerprint, const char *hostVersion);
 int SBDiagLogIsWillConnectBlockedForGuest(const char *guestBundleID, const char *fingerprint, const char *hostVersion);
 void SBDiagLogClearWillConnectBlockForGuest(const char *guestBundleID);

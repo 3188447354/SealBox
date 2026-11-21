@@ -34,6 +34,18 @@
 //    SwiftUI 图状态（StateObject/LazyState/environmentStores），图外直调
 //    即陷阱；能用的 Husk/Asspp 的 ctx 都是 0x0，Locus 的 ctx 非空即死因。
 //    Thin 闭包无上下文，不受此限。
+//  - 0.2.38：活图里求值 body（让 SwiftUI 自己在真的图里求值 LocusApp.body
+//    的 WindowGroup 内容闭包）本版做不到，保持干净拒绝——三点：① 宿主本身
+//    就是 SwiftUI App，第二遍跑客 App.main（runApp）必崩（见
+//    SBSwiftUIAppMainHook.m“不调原 App.main（第二遍 runApp 必崩）”）；
+//    ② 没有公开 API 能把一个 Scene（WindowGroup）挂进 UIHostingController
+//    （宿主只能托管 View，不能托管 Scene），也没有 API 能在 App 生命周期之外
+//    装好一个 App 结构体的 @StateObject 存储；③ 闭包体读的 StateObject／
+//    LazyState／environmentStores 只在 SwiftUI 运行该 App 时才有图存储，
+//    在宿主 View 的 body 里代调仍会陷阱。任何绕路（私有 SPI、猜符号）都无
+//    编译器、无真机可验，撞陷阱即杀进程——不做。真修待 LiveContainer 路
+//    （客 App.main 真跑）或等能验证的方案。另：Locus 无 _exit 槽是客二进制
+//    本身不 import _exit，不是钩子问题，别往那修。
 #import <Foundation/Foundation.h>
 
 NS_ASSUME_NONNULL_BEGIN

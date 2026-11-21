@@ -379,12 +379,6 @@ struct InstalledAppDetailView: View {
                                         .padding(.vertical, 8)
                                     infoRow(label: "文件大小", value: size)
                                 }
-                                // 证书指纹：有则显示前 16 位 hex，无则不显示该行。
-                                if let fingerprint = app.signingCertFingerprint, !fingerprint.isEmpty {
-                                    Divider()
-                                        .padding(.vertical, 8)
-                                    infoRow(label: "证书指纹", value: String(fingerprint.prefix(16)))
-                                }
                             }
                             .padding()
                             .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 12))

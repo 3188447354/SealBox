@@ -25,6 +25,10 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#if defined(__APPLE__)
+#include <objc/message.h>
+#include <objc/runtime.h>
+#endif
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -52,6 +56,10 @@ static int g_fd = -1;
 static long g_bytesWritten = 0;
 static int g_capLogged = 0;
 static char g_dir[PATH_MAX + 64];
+/// 0.2.38：熔断记录生效目录——App Group 共享区里的 SBDiag 子目录（重装宿主
+/// 换容器也不丢）；共享区不可用时回落到 Logs（g_dir，与 0.2.37 一致）。
+static char g_fuseDir[PATH_MAX + 64];
+static int g_fuseDirIsShared = 0;
 static char g_currentPath[PATH_MAX + 64];
 static char g_currentName[256];
 static char g_dlopenMarkerPath[PATH_MAX + 64];
@@ -407,7 +415,160 @@ static void SBDiagPrune(void) {
     free(files);
 }
 
+#if defined(__APPLE__)
+/// 0.2.38：App Group 共享区里的熔断记录目录（<组容器>/SBDiag），成功时写进
+/// out 并返回 1。解析办法与注入件签名检查同一路
+/// （FileManager.containerURL(forSecurityApplicationGroupIdentifier:
+/// SBConstants.appGroupSuiteName)，套件名＝"group."＋Bundle.main.bundleIdentifier，
+/// 真机上即 group.com.mjorb.sealbox.3432ZHJUF9，日志里报“共享区=可用
+/// 组容器=可用”的那路）——纯 C 文件不能直接调 Foundation，经 ObjC 运行时调
+/// （id／SEL 显式转型，arm64 必备；与 SBGuestSessionManager.m 里
+/// objc_msgSend 绕 NS_UNAVAILABLE 的写法同款）。只在调用当场用返回的
+/// NSURL／NSString 取路径并立即拷进 C 缓冲，不持有 ObjC 对象。失败返回 0
+/// （调用方回落到 Logs，不丢熔断）。非 Apple 平台无 ObjC 运行时，直接返回 0。
+static int SBDiagSharedDir(char *out, size_t outSize) {
+    if (!out || outSize == 0) {
+        return 0;
+    }
+    Class nsBundleClass = objc_getClass("NSBundle");
+    Class nsFileManagerClass = objc_getClass("NSFileManager");
+    Class nsStringClass = objc_getClass("NSString");
+    if (!nsBundleClass || !nsFileManagerClass || !nsStringClass) {
+        return 0;
+    }
+    id mainBundle = ((id (*)(id, SEL))objc_msgSend)((id)nsBundleClass,
+                                                    sel_registerName("mainBundle"));
+    if (!mainBundle) {
+        return 0;
+    }
+    id bundleID = ((id (*)(id, SEL))objc_msgSend)(mainBundle,
+                                                  sel_registerName("bundleIdentifier"));
+    char bundleIDBuf[256];
+    bundleIDBuf[0] = '\0';
+    if (bundleID) {
+        const char *s = ((const char *(*)(id, SEL))objc_msgSend)(bundleID,
+                                                                 sel_registerName("UTF8String"));
+        if (s && s[0] != '\0') {
+            (void)snprintf(bundleIDBuf, sizeof(bundleIDBuf), "%s", s);
+        }
+    }
+    if (bundleIDBuf[0] == '\0') {
+        (void)snprintf(bundleIDBuf, sizeof(bundleIDBuf), "com.mjorb.sealbox");
+    }
+    char suite[512];
+    if (snprintf(suite, sizeof(suite), "group.%s", bundleIDBuf) >= (int)sizeof(suite)) {
+        return 0;
+    }
+    id suiteStr = ((id (*)(id, SEL, const char *))objc_msgSend)(
+        (id)nsStringClass, sel_registerName("stringWithUTF8String:"), suite);
+    if (!suiteStr) {
+        return 0;
+    }
+    id fm = ((id (*)(id, SEL))objc_msgSend)((id)nsFileManagerClass,
+                                           sel_registerName("defaultManager"));
+    if (!fm) {
+        return 0;
+    }
+    id url = ((id (*)(id, SEL, id))objc_msgSend)(
+        fm, sel_registerName("containerURLForSecurityApplicationGroupIdentifier:"),
+        suiteStr);
+    if (!url) {
+        return 0;
+    }
+    const char *fsRep = ((const char *(*)(id, SEL))objc_msgSend)(
+        url, sel_registerName("fileSystemRepresentation"));
+    if (!fsRep || fsRep[0] == '\0') {
+        return 0;
+    }
+    char shared[PATH_MAX + 64];
+    if (snprintf(shared, sizeof(shared), "%s/SBDiag", fsRep) >= (int)sizeof(shared)) {
+        return 0;
+    }
+    (void)mkdir(shared, 0755);
+    if (access(shared, W_OK) != 0) {
+        return 0;
+    }
+    if (snprintf(out, outSize, "%s", shared) >= (int)outSize) {
+        return 0;
+    }
+    return 1;
+}
+#else
+static int SBDiagSharedDir(char *out, size_t outSize) {
+    (void)out;
+    (void)outSize;
+    return 0;
+}
+#endif
+
+/// 0.2.38：搬一个熔断记录文件（Logs → 共享区）。目标不存在直接 rename；
+/// 目标已存在时按 mtime 定：源更新就覆盖，否则删源的旧份（共享区为准）。
+/// 返回 1＝真搬过去了（rename 成功），0＝删旧份或无事可做（调用方计数用）。
+static int SBDiagMigrateOneFuseFile(const char *src, const char *dst) {
+    struct stat srcSt, dstSt;
+    if (stat(src, &srcSt) != 0) {
+        return 0;
+    }
+    if (stat(dst, &dstSt) == 0) {
+        if (srcSt.st_mtime > dstSt.st_mtime) {
+            return rename(src, dst) == 0;
+        }
+        (void)unlink(src);
+        return 0;
+    }
+    return rename(src, dst) == 0;
+}
+
+/// 0.2.38：把 Logs 里残留的熔断记录搬到共享区（0.2.37 升 0.2.38 不重装时，
+/// 彩云的拦截记录还在旧 Logs 里；不搬就丢了，下次点彩云会再死一次才重建）。
+/// 搬 willconnect-blocked-*.txt（拦截记录）与 willConnect 进入标记（单文件）。
+/// 只在共享区可用时搬；返回搬走的文件数（0＝无事可做）。假定调用方已持锁。
+static int SBDiagMigrateFuseFiles(void) {
+    if (!g_fuseDirIsShared || g_dir[0] == '\0' || g_fuseDir[0] == '\0') {
+        return 0;
+    }
+    if (strcmp(g_fuseDir, g_dir) == 0) {
+        return 0;
+    }
+    int moved = 0;
+    DIR *dir = opendir(g_dir);
+    if (dir) {
+        size_t prefixLen = strlen(SB_DIAG_WILLCONNECT_BLOCK_PREFIX);
+        size_t suffixLen = strlen(SB_DIAG_WILLCONNECT_BLOCK_SUFFIX);
+        struct dirent *ent;
+        while ((ent = readdir(dir)) != NULL) {
+            const char *name = ent->d_name;
+            size_t nlen = strlen(name);
+            if (strncmp(name, SB_DIAG_WILLCONNECT_BLOCK_PREFIX, prefixLen) != 0) {
+                continue;
+            }
+            if (nlen < suffixLen ||
+                strcmp(name + nlen - suffixLen, SB_DIAG_WILLCONNECT_BLOCK_SUFFIX) != 0) {
+                continue;
+            }
+            char src[PATH_MAX + 64], dst[PATH_MAX + 64];
+            if (snprintf(src, sizeof(src), "%s/%s", g_dir, name) >= (int)sizeof(src)) {
+                continue;
+            }
+            if (snprintf(dst, sizeof(dst), "%s/%s", g_fuseDir, name) >= (int)sizeof(dst)) {
+                continue;
+            }
+            moved += SBDiagMigrateOneFuseFile(src, dst);
+        }
+        closedir(dir);
+    }
+    {
+        char src[PATH_MAX + 64], dst[PATH_MAX + 64];
+        if (snprintf(src, sizeof(src), "%s/%s", g_dir, SB_DIAG_WILLCONNECT_MARKER_NAME) < (int)sizeof(src) &&
+            snprintf(dst, sizeof(dst), "%s/%s", g_fuseDir, SB_DIAG_WILLCONNECT_MARKER_NAME) < (int)sizeof(dst)) {
+            moved += SBDiagMigrateOneFuseFile(src, dst);
+        }
+    }
+    return moved;
+}
+
 void SBDiagLogBeginRun(void) {
+    int migratedFuseFiles = 0;
     pthread_mutex_lock(&g_lock);
     if (g_begun) {
         pthread_mutex_unlock(&g_lock);
@@ -429,8 +590,31 @@ void SBDiagLogBeginRun(void) {
         pthread_mutex_unlock(&g_lock);
         return;
     }
-    // 0.2.36：willConnect 标记路径与 dlopen 标记同款。
-    rc = snprintf(g_willConnectMarkerPath, sizeof(g_willConnectMarkerPath), "%s/%s", g_dir, SB_DIAG_WILLCONNECT_MARKER_NAME);
+    // 0.2.38：熔断记录生效目录——先试 App Group 共享区（重装宿主换容器也不丢），
+    // 不可用时回落到 Logs（与 0.2.37 一致，重装会丢）。dlopen 标记仍在 Logs
+    // （只作诊断，不拦启动；丢了不致再死一回，不搬）。
+    g_fuseDir[0] = '\0';
+    g_fuseDirIsShared = 0;
+    {
+        char shared[PATH_MAX + 64];
+        if (SBDiagSharedDir(shared, sizeof(shared))) {
+            size_t sl = strlen(shared);
+            if (sl < sizeof(g_fuseDir)) {
+                memcpy(g_fuseDir, shared, sl + 1);
+                g_fuseDirIsShared = 1;
+            }
+        }
+        if (!g_fuseDirIsShared) {
+            size_t dl = strlen(g_dir);
+            if (dl < sizeof(g_fuseDir)) {
+                memcpy(g_fuseDir, g_dir, dl + 1);
+            }
+        }
+    }
+    // 0.2.36：willConnect 标记路径与 dlopen 标记同款；0.2.38：改到熔断目录——
+    // 进入标记与拦截记录同病（重装丢标记→下次启动写不出拦截记录→再死一次），
+    // 一并挪到共享区。
+    rc = snprintf(g_willConnectMarkerPath, sizeof(g_willConnectMarkerPath), "%s/%s", g_fuseDir, SB_DIAG_WILLCONNECT_MARKER_NAME);
     if (rc < 0 || (size_t)rc >= sizeof(g_willConnectMarkerPath)) {
         pthread_mutex_unlock(&g_lock);
         return;
@@ -449,6 +633,9 @@ void SBDiagLogBeginRun(void) {
     // 改名加 -crashed；再开本次启动的新文件。
     SBDiagMigrateOldLogs(home);
     SBDiagRenameLatestIfCrashed();
+    // 0.2.38：Logs 里残留的熔断记录搬到共享区（须在读残留 willConnect 标记之前，
+    // 否则搬过来的标记读不到，本次启动写不出拦截记录）。
+    migratedFuseFiles = SBDiagMigrateFuseFiles();
     struct timeval nowTv;
     time_t now = time(NULL);
     if (gettimeofday(&nowTv, NULL) == 0) {
@@ -525,6 +712,26 @@ void SBDiagLogBeginRun(void) {
         int n = snprintf(fileLine, sizeof(fileLine), "日志文件：%s", g_currentName);
         if (n > 0) {
             SBDiagLogLine(fileLine);
+        }
+    }
+    // 0.2.38：熔断记录目录写进日志（共享区＝重装不丢；Logs＝共享区不可用、
+    // 重装会丢）＋本次迁移数（只在搬过文件时记一行）。
+    if (g_fuseDirIsShared) {
+        char fuseLine[PATH_MAX + 128];
+        int n = snprintf(fuseLine, sizeof(fuseLine),
+                         "熔断记录目录：共享区 %s（重装不丢）", g_fuseDir);
+        if (n > 0) {
+            SBDiagLogLine(fuseLine);
+        }
+    } else {
+        SBDiagLogLine("熔断记录目录：Logs（共享区不可用，重装会丢）");
+    }
+    if (migratedFuseFiles > 0) {
+        char migLine[128];
+        int n = snprintf(migLine, sizeof(migLine),
+                         "熔断记录已迁到共享区：%d 个", migratedFuseFiles);
+        if (n > 0) {
+            SBDiagLogLine(migLine);
         }
     }
     if (hasStaleDlopenMarker) {
@@ -646,6 +853,7 @@ void SBDiagLogClearDlopenEntry(void) {
 }
 
 // 0.2.36：willConnect 标记（与 dlopen 标记同款实现，只换路径）。
+// 0.2.38：路径已改到熔断目录（共享区，见 BeginRun）；写标记记一行日志。
 void SBDiagLogMarkWillConnectEntry(const char *guestBundleID) {
     pthread_mutex_lock(&g_lock);
     if (!g_begun || g_willConnectMarkerPath[0] == '\0') {
@@ -659,6 +867,7 @@ void SBDiagLogMarkWillConnectEntry(const char *guestBundleID) {
         return;
     }
     memcpy(path, g_willConnectMarkerPath, pathLen + 1);
+    int isShared = g_fuseDirIsShared;
     pthread_mutex_unlock(&g_lock);
     char content[512];
     int n = snprintf(content, sizeof(content), "%s\n",
@@ -667,6 +876,15 @@ void SBDiagLogMarkWillConnectEntry(const char *guestBundleID) {
         return;
     }
     SBDiagWriteFile(path, content, (size_t)n);
+    {
+        char line[512];
+        int ln = snprintf(line, sizeof(line), "willConnect 进入标记已写%s：%s",
+                          isShared ? "共享区" : "Logs",
+                          (guestBundleID && guestBundleID[0] != '\0') ? guestBundleID : "（未知）");
+        if (ln > 0) {
+            SBDiagLogLine(line);
+        }
+    }
 }
 
 void SBDiagLogClearWillConnectEntry(void) {
@@ -682,33 +900,55 @@ void SBDiagLogClearWillConnectEntry(void) {
         return;
     }
     memcpy(path, g_willConnectMarkerPath, pathLen + 1);
+    int isShared = g_fuseDirIsShared;
     pthread_mutex_unlock(&g_lock);
-    (void)unlink(path);
+    // 0.2.38：只在真删掉标记文件时记一行（willConnect 正常返回／抛异常都调
+    // 这里；文件本就不存在时不记，免得把“无标记”说成“已清”）。
+    if (unlink(path) == 0) {
+        char line[512];
+        int ln = snprintf(line, sizeof(line), "willConnect 进入标记已清（%s）",
+                          isShared ? "共享区" : "Logs");
+        if (ln > 0) {
+            SBDiagLogLine(line);
+        }
+    }
 }
 
 const char *SBDiagLogStaleWillConnectGuest(void) {
     return g_staleWillConnectGuest;
 }
 
-/// 0.2.37：willConnect 拦截记录路径（Logs/willconnect-blocked-<bundleID>.txt）。
-/// bundle ID 只留 [A-Za-z0-9.-]，其余字符变 '_'——文件名永不含 '/'，不被路径穿越。
-static int SBDiagWillConnectBlockPath(const char *guestBundleID, char *out, size_t outLen) {
+/// 0.2.37：willConnect 拦截记录路径（<熔断目录>/willconnect-blocked-<bundleID>.txt）。
+/// 0.2.38：熔断目录改存 App Group 共享区（g_fuseDir）；共享区不可用时回落到
+/// Logs（g_dir）。outIsShared 非空时写进目录是不是共享区（调用方记日志用，
+/// 与路径同一把锁下取，原子）。bundle ID 只留 [A-Za-z0-9.-]，其余字符变 '_'
+/// ——文件名永不含 '/'，不被路径穿越。
+static int SBDiagWillConnectBlockPath(const char *guestBundleID, char *out, size_t outLen, int *outIsShared) {
     if (!guestBundleID || guestBundleID[0] == '\0' || !out || outLen == 0) {
         return 0;
     }
     pthread_mutex_lock(&g_lock);
-    if (!g_begun || g_dir[0] == '\0') {
+    if (!g_begun) {
+        pthread_mutex_unlock(&g_lock);
+        return 0;
+    }
+    const char *fuseDir = g_fuseDir[0] != '\0' ? g_fuseDir : g_dir;
+    if (fuseDir[0] == '\0') {
         pthread_mutex_unlock(&g_lock);
         return 0;
     }
     char dir[PATH_MAX + 64];
-    size_t dirLen = strlen(g_dir);
+    size_t dirLen = strlen(fuseDir);
     if (dirLen >= sizeof(dir)) {
         pthread_mutex_unlock(&g_lock);
         return 0;
     }
-    memcpy(dir, g_dir, dirLen + 1);
+    memcpy(dir, fuseDir, dirLen + 1);
+    int isShared = g_fuseDirIsShared;
     pthread_mutex_unlock(&g_lock);
+    if (outIsShared) {
+        *outIsShared = isShared;
+    }
     char safe[256];
     size_t i = 0;
     for (; guestBundleID[i] != '\0' && i < sizeof(safe) - 1; i++) {
@@ -729,7 +969,8 @@ static int SBDiagWillConnectBlockPath(const char *guestBundleID, char *out, size
 
 void SBDiagLogBlockWillConnectForGuest(const char *guestBundleID, const char *fingerprint, const char *hostVersion) {
     char path[PATH_MAX + 64];
-    if (!SBDiagWillConnectBlockPath(guestBundleID, path, sizeof(path))) {
+    int isShared = 0;
+    if (!SBDiagWillConnectBlockPath(guestBundleID, path, sizeof(path), &isShared)) {
         return;
     }
     char content[1024];
@@ -740,43 +981,74 @@ void SBDiagLogBlockWillConnectForGuest(const char *guestBundleID, const char *fi
         return;
     }
     SBDiagWriteFile(path, content, (size_t)n);
+    // 0.2.38：写共享区记一行（写到哪、客是谁）。
+    {
+        char line[512];
+        int ln = snprintf(line, sizeof(line), "熔断记录已写%s：%s",
+                          isShared ? "共享区" : "Logs", guestBundleID);
+        if (ln > 0) {
+            SBDiagLogLine(line);
+        }
+    }
 }
 
 int SBDiagLogIsWillConnectBlockedForGuest(const char *guestBundleID, const char *fingerprint, const char *hostVersion) {
     char path[PATH_MAX + 64];
-    if (!SBDiagWillConnectBlockPath(guestBundleID, path, sizeof(path))) {
+    int isShared = 0;
+    if (!SBDiagWillConnectBlockPath(guestBundleID, path, sizeof(path), &isShared)) {
         return 0;
     }
     size_t len = 0;
     char *content = SBDiagReadFile(path, &len);
-    if (!content || len == 0) {
-        free(content);
-        return 0;
+    int blocked = 0;
+    const char *why = "无记录";
+    if (content && len > 0) {
+        // 两行：指纹、宿主版本——都对上才拦截；任一不符（重装/升级）即失效、自动重试。
+        char *nl1 = strchr(content, '\n');
+        if (!nl1) {
+            why = "记录损坏（不是两行）";
+        } else {
+            *nl1 = '\0';
+            char *line2 = nl1 + 1;
+            char *nl2 = strchr(line2, '\n');
+            if (nl2) {
+                *nl2 = '\0';
+            }
+            blocked = (fingerprint && strcmp(content, fingerprint) == 0 &&
+                       hostVersion && strcmp(line2, hostVersion) == 0);
+            why = blocked ? "指纹与宿主版本均对上" : "记录不符（指纹/版本已变）";
+        }
     }
-    // 两行：指纹、宿主版本——都对上才拦截；任一不符（重装/升级）即失效、自动重试。
-    char *nl1 = strchr(content, '\n');
-    if (!nl1) {
-        free(content);
-        return 0;
-    }
-    *nl1 = '\0';
-    char *line2 = nl1 + 1;
-    char *nl2 = strchr(line2, '\n');
-    if (nl2) {
-        *nl2 = '\0';
-    }
-    int blocked = (fingerprint && strcmp(content, fingerprint) == 0 &&
-                   hostVersion && strcmp(line2, hostVersion) == 0);
     free(content);
+    // 0.2.38：读共享区记一行（查到没有、拦截与否、为什么）。
+    {
+        char line[512];
+        int ln = snprintf(line, sizeof(line), "熔断记录检查：%s 拦截=%s（%s，%s）",
+                          guestBundleID, blocked ? "是" : "否",
+                          isShared ? "共享区" : "Logs", why);
+        if (ln > 0) {
+            SBDiagLogLine(line);
+        }
+    }
     return blocked;
 }
 
 void SBDiagLogClearWillConnectBlockForGuest(const char *guestBundleID) {
     char path[PATH_MAX + 64];
-    if (!SBDiagWillConnectBlockPath(guestBundleID, path, sizeof(path))) {
+    int isShared = 0;
+    if (!SBDiagWillConnectBlockPath(guestBundleID, path, sizeof(path), &isShared)) {
         return;
     }
-    (void)unlink(path);
+    // 0.2.38：只在真删掉记录文件时记一行（重装／willConnect 成功返回都调这里；
+    // 文件本就不存在时不记，免得把“无记录”说成“已清”）。
+    if (unlink(path) == 0) {
+        char line[512];
+        int ln = snprintf(line, sizeof(line), "熔断记录已清：%s（%s）",
+                          guestBundleID, isShared ? "共享区" : "Logs");
+        if (ln > 0) {
+            SBDiagLogLine(line);
+        }
+    }
 }
 
 char *SBDiagLogLatestText(void) {

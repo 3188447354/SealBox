@@ -44,17 +44,19 @@ struct HomeScreenView: View {
     /// page (vm.settings.wallpaper); it survives restarts via @AppStorage.
     private var wallpaperColors: [Color] { VMWallpapers.colors(for: selectedWallpaper) }
 
-    var body: some View {
+    /// 0.2.38：墙纸背景层——只做背景，不参与布局。`.background` 的内容
+    /// 按宿主（VStack）尺寸铺，绝不反向决定宿主大小；自选图用
+    /// scaledToFill 铺满并裁掉溢出，黑遮罩与渐变色块同理。换任何比例
+    /// 的图，图标网格／文字／Dock 的位置都与无墙纸时完全一致。
+    private var wallpaperBackground: some View {
         ZStack {
             // Wallpaper：有自选图时用用户自己的图（各页通用），没有时用选中的渐变。
             if let customWallpaperImage {
                 Image(uiImage: customWallpaperImage)
                     .resizable()
                     .scaledToFill()
-                    .ignoresSafeArea()
                 // 轻遮罩：白字标签/白圆点在亮图上仍可读，图本身只暗一点。
                 Color.black.opacity(0.12)
-                    .ignoresSafeArea()
             } else {
                 // Wallpaper: the selected option's gradient with soft color blobs.
                 LinearGradient(
@@ -62,7 +64,6 @@ struct HomeScreenView: View {
                     startPoint: .topLeading,
                     endPoint: .bottomTrailing
                 )
-                .ignoresSafeArea()
                 Circle()
                     .fill((wallpaperColors.first ?? .blue).opacity(0.55))
                     .frame(width: 340, height: 340)
@@ -74,81 +75,93 @@ struct HomeScreenView: View {
                     .blur(radius: 70)
                     .offset(x: 130, y: 140)
             }
+        }
+        .ignoresSafeArea()
+        .clipped()
+    }
 
-            VStack(spacing: 0) {
-                // Clear the real system status bar / Dynamic Island.
-                Spacer()
-                    .frame(height: 54)
+    var body: some View {
+        // 0.2.38：墙纸只做背景层，不参与布局尺寸——VStack 的 .background
+        // 内容按 VStack 自身尺寸铺，不反向决定 VStack 的大小；换任何
+        // 比例的自选图，图标网格／文字／Dock 的位置都与无墙纸时一致。
+        // （0.2.37 把图放在 ZStack 子层：可缩放图片的理想尺寸会把
+        // ZStack 撑大，VStack 在撑大的 ZStack 里居中，图标位置跟着移。）
+        VStack(spacing: 0) {
+            // Clear the real system status bar / Dynamic Island.
+            Spacer()
+                .frame(height: 54)
 
-                // Two pages, standard paging (0.2.3): TabView +
-                // PageTabViewStyle. The manual HStack+offset+drag pager
-                // failed on device twice (0.2.1 simultaneousGesture,
-                // 0.2.2 unchanged) — its gesture arbitration with the
-                // icon Buttons and page 2's vertical ScrollView is
-                // framework-internal and not provable from code.
-                // TabView paging is UIKit-native (UIScrollView-backed):
-                // horizontal paging, button taps, and the vertical list
-                // disambiguate by direction, as in every paged iOS UI.
-                // Selection is the single vm.homePage binding, so swiping
-                // and the dots below always agree; no switch, no custom
-                // gesture, nothing for a child gesture to outrank.
-                GeometryReader { geo in
-                    TabView(selection: $vm.homePage) {
-                        builtInPage(width: geo.size.width)
-                            .tag(0)
-                        installedPage(width: geo.size.width)
-                            .tag(1)
-                    }
-                    .tabViewStyle(.page(indexDisplayMode: .never))
+            // Two pages, standard paging (0.2.3): TabView +
+            // PageTabViewStyle. The manual HStack+offset+drag pager
+            // failed on device twice (0.2.1 simultaneousGesture,
+            // 0.2.2 unchanged) — its gesture arbitration with the
+            // icon Buttons and page 2's vertical ScrollView is
+            // framework-internal and not provable from code.
+            // TabView paging is UIKit-native (UIScrollView-backed):
+            // horizontal paging, button taps, and the vertical list
+            // disambiguate by direction, as in every paged iOS UI.
+            // Selection is the single vm.homePage binding, so swiping
+            // and the dots below always agree; no switch, no custom
+            // gesture, nothing for a child gesture to outrank.
+            GeometryReader { geo in
+                TabView(selection: $vm.homePage) {
+                    builtInPage(width: geo.size.width)
+                        .tag(0)
+                    installedPage(width: geo.size.width)
+                        .tag(1)
                 }
-
-                // Page dots: iOS standard position, just above the Dock.
-                // Always tappable, same as swiping.
-                HStack(spacing: 8) {
-                    ForEach(0..<2, id: \.self) { page in
-                        Button {
-                            vm.homePage = page
-                        } label: {
-                            Circle()
-                                .fill(page == vm.homePage ? Color.white : Color.white.opacity(0.4))
-                                .frame(width: 7, height: 7)
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
-                .padding(.bottom, 12)
-
-                // Dock: four working system apps.
-                HStack(spacing: 0) {
-                    Button { vm.openApp = .phone } label: {
-                        DockIcon(symbol: "phone.fill", gradient: dockPhoneGradient)
-                    }
-                    .buttonStyle(.plain)
-                    Spacer()
-                    Button { vm.openApp = .safari } label: {
-                        DockIcon(symbol: "safari",
-                                 gradient: dockSafariGradient,
-                                 symbolColor: dockSafariSymbolColor)
-                    }
-                    .buttonStyle(.plain)
-                    Spacer()
-                    Button { vm.openApp = .messages } label: {
-                        DockIcon(symbol: "message.fill", gradient: dockMessageGradient)
-                    }
-                    .buttonStyle(.plain)
-                    Spacer()
-                    Button { vm.openApp = .music } label: {
-                        DockIcon(symbol: "music.note", gradient: dockMusicGradient)
-                    }
-                    .buttonStyle(.plain)
-                }
-                .padding(.horizontal, 22)
-                .padding(.vertical, 12)
-                .background(.ultraThinMaterial)
-                .clipShape(RoundedRectangle(cornerRadius: 28))
-                .padding(.horizontal, 12)
-                .padding(.bottom, 8)
+                .tabViewStyle(.page(indexDisplayMode: .never))
             }
+
+            // Page dots: iOS standard position, just above the Dock.
+            // Always tappable, same as swiping.
+            HStack(spacing: 8) {
+                ForEach(0..<2, id: \.self) { page in
+                    Button {
+                        vm.homePage = page
+                    } label: {
+                        Circle()
+                            .fill(page == vm.homePage ? Color.white : Color.white.opacity(0.4))
+                            .frame(width: 7, height: 7)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.bottom, 12)
+
+            // Dock: four working system apps.
+            HStack(spacing: 0) {
+                Button { vm.openApp = .phone } label: {
+                    DockIcon(symbol: "phone.fill", gradient: dockPhoneGradient)
+                }
+                .buttonStyle(.plain)
+                Spacer()
+                Button { vm.openApp = .safari } label: {
+                    DockIcon(symbol: "safari",
+                             gradient: dockSafariGradient,
+                             symbolColor: dockSafariSymbolColor)
+                }
+                .buttonStyle(.plain)
+                Spacer()
+                Button { vm.openApp = .messages } label: {
+                    DockIcon(symbol: "message.fill", gradient: dockMessageGradient)
+                }
+                .buttonStyle(.plain)
+                Spacer()
+                Button { vm.openApp = .music } label: {
+                    DockIcon(symbol: "music.note", gradient: dockMusicGradient)
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.horizontal, 22)
+            .padding(.vertical, 12)
+            .background(.ultraThinMaterial)
+            .clipShape(RoundedRectangle(cornerRadius: 28))
+            .padding(.horizontal, 12)
+            .padding(.bottom, 8)
+        }
+        .background {
+            wallpaperBackground
         }
         .onAppear {
             // 0.2.37：进桌面（与从客回桌面）时重读自选墙纸——文件在即显示，

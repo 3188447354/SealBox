@@ -70,6 +70,8 @@ struct SettingsView: View {
     @AppStorage("vm.settings.wifiNetwork") private var wifiNetwork = "SealBox-5G"
     /// 0.2.37：账号卡片用的证书信息（叶子证书里取真实 Apple ID）与自选头像。
     @State private var certInfo: SBCertificate.SBCertificateInfo?
+    /// 0.2.38：证书版本号——虚拟机用户页导入／删除证书后 +1，设置页监听到即重读卡片。
+    @AppStorage("vm.settings.certificate.customVersion") private var certVersion = 0
     @AppStorage("vm.settings.avatar.customVersion") private var avatarVersion = 0
     @State private var avatarImage: UIImage?
 
@@ -110,6 +112,9 @@ struct SettingsView: View {
             }
             .onChange(of: avatarVersion) { _ in
                 avatarImage = VMUserAvatar.loadImage()
+            }
+            .onChange(of: certVersion) { _ in
+                Task { certInfo = await SBCertificate.certificateInfo() }
             }
         }
     }
@@ -189,9 +194,6 @@ struct SettingsView: View {
                     SettingsRow(destination: .privacy)
                 }
             }
-
-            // Certificate (container): status + real cert info + import/delete/self-test.
-            CertificateSettingsSection()
 
             // 启动诊断日志（0.2.4）：上次启动是否崩了 + 查看全文。
             StartupDiagLogSection()
@@ -718,16 +720,15 @@ private struct AboutSettingsView: View {
             } footer: {
                 Text("型号、系统版本与设备标识均取自本机真实系统；虚拟机版本为本 App 自身版本。")
             }
-            // 诚实边界（设计 §5.1/D4）：九条逐行在列，不合并、不藏、不加修饰。
+            // 诚实边界（设计 §5.1/D4）：六条逐行在列，不合并、不藏、不加修饰。
+            // 0.2.38：原九条里的三条证书说明已删（证书说明只在虚拟机用户页，
+            // 设置页不再放任何证书说明文案）。
             Section("诚实边界") {
                 Text("容器不隔离：客 App 能直接读宿主文件，隔离只是约定的目录分组。")
                 Text("权限全局共享：相机、定位等权限属于宿主进程，一次授权全客共享。")
                 Text("entitlement 只用宿主的：客 App 原有的推送、App Groups 等权限在重签后丢失。")
                 Text("远程推送不工作：客 App 没有推送 entitlement，收不到推送。")
                 Text("扩展不支持：Widget、Share 扩展等无处注册。")
-                Text("宿主须开发证书签名：客 App 靠宿主证书重签后运行，不是免签。")
-                Text("免费证书 7 天过期：到期后已装应用打不开，需重新导入证书并重新签名。")
-                Text("iOS 26+ 无证书启动不了：没有证书连启动入口都进不去。")
                 Text("不承诺所有 IPA 都能跑：加密包、32 位、非 arm64 等应用打不开或功能缺失。")
             }
         }
@@ -970,12 +971,19 @@ private struct WallpaperSettingsView: View {
 /// 大头像＋名字＋邮箱；以下全是证书里的真实值（Team ID/过期日/导入日期），
 /// 证书里没有的不编、不显示那行。头像可自选（相册/文件），只用用户自己挑的
 /// 真实图片，没选时默认头像，可恢复默认。
+/// 0.2.38：证书的显示与导入只在这页（导入／删除从设置页证书区搬来，
+/// 自测不搬；证书区不再放任何说明文案）。
 private struct AccountSettingsView: View {
     @AppStorage("vm.settings.avatar.customVersion") private var avatarVersion = 0
+    /// 0.2.38：证书版本号——本页导入／删除成功后 +1，设置页账号卡片监听到即重读。
+    @AppStorage("vm.settings.certificate.customVersion") private var certVersion = 0
     @State private var certInfo: SBCertificate.SBCertificateInfo?
     @State private var avatarImage: UIImage?
     @State private var photoPickerItem: PhotosPickerItem?
     @State private var showFileImporter = false
+    @State private var alertTitle = ""
+    @State private var alertMessage = ""
+    @State private var showingAlert = false
 
     private var displayName: String {
         certInfo?.accountName ?? certInfo?.accountEmail ?? "虚拟机用户"
@@ -1034,8 +1042,8 @@ private struct AccountSettingsView: View {
             } footer: {
                 Text("头像只用你自己挑的图片，不内置任何图片；换完各处头像同步变，重启后保持。")
             }
-            if let info = certInfo {
-                Section {
+            Section {
+                if let info = certInfo {
                     if let email = info.accountEmail {
                         LabeledRow(label: "Apple ID", value: email)
                     }
@@ -1051,16 +1059,54 @@ private struct AccountSettingsView: View {
                     if let imported = info.importedDate {
                         LabeledRow(label: "导入日期", value: Self.formattedDate(imported))
                     }
-                } header: {
-                    Text("证书")
-                } footer: {
-                    Text("名字与邮箱取自导入证书的叶子证书；免费号的证书名就是 Apple ID 邮箱。")
                 }
+                // 0.2.38：导入／删除从设置页证书区搬来——证书的显示与导入只在这页。
+                Button("导入证书") {
+                    Task {
+                        guard let presenter = Self.topViewController() else { return }
+                        do {
+                            try await SBCertificate.importP12(presenter: presenter)
+                            certInfo = await SBCertificate.certificateInfo()
+                            certVersion += 1
+                        } catch {
+                            if case SBError.cancelled = error { return }
+                            await MainActor.run {
+                                alertTitle = "导入证书失败"
+                                alertMessage = error.localizedDescription
+                                showingAlert = true
+                            }
+                        }
+                    }
+                }
+                if certInfo != nil {
+                    Button("删除证书", role: .destructive) {
+                        Task {
+                            do {
+                                try SBCertificate.deleteCertificate()
+                                certInfo = await SBCertificate.certificateInfo()
+                                certVersion += 1
+                            } catch {
+                                await MainActor.run {
+                                    alertTitle = "删除证书失败"
+                                    alertMessage = error.localizedDescription
+                                    showingAlert = true
+                                }
+                            }
+                        }
+                    }
+                }
+            } header: {
+                Text("证书")
             }
         }
         .navigationTitle("虚拟机用户")
         .navigationBarTitleDisplayMode(.inline)
         .safeAreaInset(edge: .bottom) { Color.clear.frame(height: 28) }
+        .alert(Text(alertTitle), isPresented: $showingAlert) {
+            Button("好", role: .cancel) {}
+        } message: {
+            Text(alertMessage)
+        }
         .task {
             certInfo = await SBCertificate.certificateInfo()
             avatarImage = VMUserAvatar.loadImage()
@@ -1094,6 +1140,20 @@ private struct AccountSettingsView: View {
     private func bumpAvatarVersion() {
         avatarVersion += 1
         avatarImage = VMUserAvatar.loadImage()
+    }
+
+    /// 顶层 presenter（证书导入的文件选择器 / 密码框用），做法与
+    /// SBAppCoordinator.topViewController 一致；0.2.38 从设置页证书区搬来。
+    private static func topViewController() -> UIViewController? {
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        let window = scenes.first(where: { $0.activationState == .foregroundActive })?
+            .windows.first(where: { $0.isKeyWindow })
+            ?? scenes.flatMap { $0.windows }.first(where: { $0.isKeyWindow })
+        guard var top = window?.rootViewController else { return nil }
+        while let presented = top.presentedViewController {
+            top = presented
+        }
+        return top
     }
 
     private static func formattedDate(_ date: Date) -> String {
@@ -1466,161 +1526,6 @@ private struct PrivacySettingsView: View {
         .navigationTitle("隐私与安全性")
         .navigationBarTitleDisplayMode(.inline)
         .safeAreaInset(edge: .bottom) { Color.clear.frame(height: 28) }
-    }
-}
-
-// MARK: - 证书（容器步骤 5）
-
-/// 设置页证书区：状态文案 + 真实证书信息（全部取自证书本身）+ 导入 / 删除 / 自测。
-/// 进页时调 refreshStatusText() 异步刷新；无证书只显示状态行，有证书才显示信息行。
-private struct CertificateSettingsSection: View {
-    @State private var statusText: String = SBCertificate.statusText
-    @State private var info: SBCertificate.SBCertificateInfo?
-    @State private var hasCertificate: Bool = SBCertificate.hasCertificate
-    @State private var selfTestResult: String?
-    @State private var selfTestPassed: Bool = false
-    @State private var selfTesting: Bool = false
-    @State private var alertTitle: String = ""
-    @State private var alertMessage: String = ""
-    @State private var showingAlert: Bool = false
-
-    /// 已过期时状态文案标红（设计 §4.4）。
-    private var isExpired: Bool {
-        if let expiration = info?.expirationDate {
-            return expiration < Date()
-        }
-        return false
-    }
-
-    var body: some View {
-        Section {
-            HStack {
-                Text("状态")
-                Spacer()
-                Text(statusText)
-                    .foregroundStyle(isExpired ? .red : .secondary)
-            }
-            if let info = info {
-                if let subject = info.subject {
-                    LabeledRow(label: "主体", value: subject)
-                }
-                if let issuer = info.issuer {
-                    LabeledRow(label: "颁发者", value: issuer)
-                }
-                if let expiration = info.expirationDate {
-                    LabeledRow(label: "过期日", value: Self.formattedDate(expiration))
-                }
-                if let teamID = info.teamID {
-                    LabeledRow(label: "Team ID", value: teamID)
-                }
-                if let imported = info.importedDate {
-                    LabeledRow(label: "导入日期", value: Self.formattedDate(imported))
-                }
-            }
-            Button("导入证书") {
-                Task {
-                    guard let presenter = Self.topViewController() else { return }
-                    do {
-                        try await SBCertificate.importP12(presenter: presenter)
-                        await refresh()
-                    } catch {
-                        if case SBError.cancelled = error { return }
-                        await MainActor.run {
-                            alertTitle = "导入证书失败"
-                            alertMessage = error.localizedDescription
-                            showingAlert = true
-                        }
-                    }
-                }
-            }
-            Button("删除证书", role: .destructive) {
-                Task {
-                    do {
-                        try SBCertificate.deleteCertificate()
-                        await refresh()
-                    } catch {
-                        await MainActor.run {
-                            alertTitle = "删除证书失败"
-                            alertMessage = error.localizedDescription
-                            showingAlert = true
-                        }
-                    }
-                }
-            }
-            .disabled(!hasCertificate)
-            Button("启动链自测") {
-                Task {
-                    await MainActor.run {
-                        selfTesting = true
-                        selfTestResult = nil
-                    }
-                    let result = await SBCertificate.runChainSelfTest()
-                    await MainActor.run {
-                        selfTesting = false
-                        switch result {
-                        case .success:
-                            selfTestPassed = true
-                            selfTestResult = "自测通过"
-                        case .failure(let error):
-                            selfTestPassed = false
-                            if case SBError.selfTestFailed(let stage, let reason) = error {
-                                selfTestResult = "\(stage)：\(reason)"
-                            } else {
-                                selfTestResult = error.localizedDescription
-                            }
-                        }
-                    }
-                }
-            }
-            .disabled(selfTesting)
-            if let result = selfTestResult {
-                Text(result)
-                    .foregroundStyle(selfTestPassed ? .green : .red)
-            }
-        } header: {
-            Text("证书")
-        } footer: {
-            Text("免费开发证书有效期 7 天，到期后需重新生成并重新导入，已装应用需重新签名。自测校验签名有效性，不把测试件加载进宿主进程。")
-        }
-        .task { await refresh() }
-        .alert(Text(alertTitle), isPresented: $showingAlert) {
-            Button("好", role: .cancel) {}
-        } message: {
-            Text(alertMessage)
-        }
-    }
-
-    private func refresh() async {
-        let text = await SBCertificate.refreshStatusText()
-        let fetched = await SBCertificate.certificateInfo()
-        let hasCert = SBCertificate.hasCertificate
-        await MainActor.run {
-            statusText = text
-            info = fetched
-            hasCertificate = hasCert
-        }
-    }
-
-    private static func formattedDate(_ date: Date) -> String {
-        let formatter = DateFormatter()
-        formatter.calendar = Calendar(identifier: .gregorian)
-        formatter.locale = Locale(identifier: "zh_CN")
-        formatter.dateFormat = "yyyy-MM-dd"
-        return formatter.string(from: date)
-    }
-
-    /// 顶层 presenter（文件选择器 / 密码框用），做法与
-    /// SBAppCoordinator.topViewController 一致。
-    private static func topViewController() -> UIViewController? {
-        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
-        let window = scenes.first(where: { $0.activationState == .foregroundActive })?
-            .windows.first(where: { $0.isKeyWindow })
-            ?? scenes.flatMap { $0.windows }.first(where: { $0.isKeyWindow })
-        guard var top = window?.rootViewController else { return nil }
-        while let presented = top.presentedViewController {
-            top = presented
-        }
-        return top
     }
 }
 
