@@ -108,7 +108,7 @@ struct SettingsView: View {
                 certInfo = await SBCertificate.certificateInfo()
                 avatarImage = VMUserAvatar.loadImage()
             }
-            .onChange(of: avatarVersion) { _, _ in
+            .onChange(of: avatarVersion) { _ in
                 avatarImage = VMUserAvatar.loadImage()
             }
         }
@@ -932,10 +932,10 @@ private struct WallpaperSettingsView: View {
         .navigationBarTitleDisplayMode(.inline)
         .safeAreaInset(edge: .bottom) { Color.clear.frame(height: 28) }
         .onAppear { customImage = VMCustomWallpaper.loadImage() }
-        .onChange(of: customVersion) { _, _ in
+        .onChange(of: customVersion) { _ in
             customImage = VMCustomWallpaper.loadImage()
         }
-        .onChange(of: photoPickerItem) { _, newItem in
+        .onChange(of: photoPickerItem) { newItem in
             guard let newItem else { return }
             Task {
                 if let data = try? await newItem.loadTransferable(type: Data.self),
@@ -1065,10 +1065,10 @@ private struct AccountSettingsView: View {
             certInfo = await SBCertificate.certificateInfo()
             avatarImage = VMUserAvatar.loadImage()
         }
-        .onChange(of: avatarVersion) { _, _ in
+        .onChange(of: avatarVersion) { _ in
             avatarImage = VMUserAvatar.loadImage()
         }
-        .onChange(of: photoPickerItem) { _, newItem in
+        .onChange(of: photoPickerItem) { newItem in
             guard let newItem else { return }
             Task {
                 if let data = try? await newItem.loadTransferable(type: Data.self),

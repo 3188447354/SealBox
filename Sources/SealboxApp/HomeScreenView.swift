@@ -155,7 +155,7 @@ struct HomeScreenView: View {
             // 文件没了（删了/没选过）即回渐变。
             customWallpaperImage = VMCustomWallpaper.loadImage()
         }
-        .onChange(of: customWallpaperVersion) { _, _ in
+        .onChange(of: customWallpaperVersion) { _ in
             customWallpaperImage = VMCustomWallpaper.loadImage()
         }
     }
