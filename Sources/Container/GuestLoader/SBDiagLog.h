@@ -47,6 +47,20 @@ void SBDiagLogClearDlopenEntry(void);
 void SBDiagLogMarkWillConnectEntry(const char *guestBundleID);
 void SBDiagLogClearWillConnectEntry(void);
 
+/// 0.2.37：上次启动死在 willConnect 里的客 bundle ID（BeginRun 从残留标记读出、
+/// 记在进程内静态区；没有残留标记时返回 ""）。driveSceneManually 用它在本次启动
+/// 跳过该客的 willConnect 调用（见下 willConnect 熔断）。
+const char *SBDiagLogStaleWillConnectGuest(void);
+
+/// 0.2.37：willConnect 熔断记录（Logs/willconnect-blocked-<bundleID>.txt，
+/// 内容两行：客可执行指纹、宿主版本）。死过一次 willConnect 的客写入此记录；
+/// 之后启动：指纹与宿主版本均未变 → 不再调 willConnect、干净失败；
+/// 重装/重导（指纹变）或宿主升级（版本变）→ 记录失效，自动重试一次。
+/// willConnect 成功返回与重装都会清掉记录。任何失败都静默丢弃。
+void SBDiagLogBlockWillConnectForGuest(const char *guestBundleID, const char *fingerprint, const char *hostVersion);
+int SBDiagLogIsWillConnectBlockedForGuest(const char *guestBundleID, const char *fingerprint, const char *hostVersion);
+void SBDiagLogClearWillConnectBlockForGuest(const char *guestBundleID);
+
 /// 最近一次启动日志全文：最新崩过的那份（-crashed）优先，其次最新一份；
 /// 都没有返回 NULL。返回的是 malloc 出来的 UTF-8 字符串，调用方用完 free。
 char *SBDiagLogLatestText(void);

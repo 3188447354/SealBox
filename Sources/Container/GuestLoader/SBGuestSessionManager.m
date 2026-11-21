@@ -77,6 +77,9 @@ static const NSTimeInterval SBGuestSceneSystemPathWaitSeconds = 0.4;
 
 /// 首次激活时保存宿主 delegate/窗口/scene（之后不再覆盖——宿主是同一个）。
 - (void)saveHostStateIfNeeded {
+    // 0.2.37：补丁在 main.m 里已装过一次；这里再调一次是兜底（main.m 时
+    // SwiftUI 类若尚未注册，dispatch_once 的重试只在这里发生一次）。
+    [SBGuestBootstrap installHostDelegateWindowGetter];
     if (self.hostAppDelegate && self.hostWindow) {
         return;
     }
@@ -300,10 +303,64 @@ static const NSTimeInterval SBGuestSceneSystemPathWaitSeconds = 0.4;
 /// @try/@catch 抓不住，只能靠前后两行定位）。
 /// 本方法只在主线程跑（0.4 秒补查经 dispatch_get_main_queue() 调度，
 /// activateGuestWithContext 入口亦有主线程守卫），willConnect 的线程无问题。
+/// 0.2.37：willConnect 熔断用的客可执行指纹——文件名＋大小＋修改时间。
+/// 重装/重导换了二进制即变指纹，拦截记录自动失效、重试一次。
+- (NSString *)willConnectFingerprintForSession:(SBGuestSession *)session {
+    NSDictionary *attrs = nil;
+    if (session.guestExecPath.length > 0) {
+        attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:session.guestExecPath error:nil];
+    }
+    NSNumber *size = attrs[NSFileSize];
+    NSDate *mtime = attrs[NSFileModificationDate];
+    return [NSString stringWithFormat:@"%@|%lld|%.0f",
+            session.guestExecPath.lastPathComponent ?: @"?",
+            size ? (long long)size.longLongValue : -1,
+            mtime ? mtime.timeIntervalSince1970 : -1];
+}
+
+/// 0.2.37：宿主版本（MARKETING_VERSION＋build）——宿主升级后拦截记录自动失效、重试一次。
+- (NSString *)willConnectHostVersion {
+    NSBundle *bundle = [NSBundle mainBundle];
+    NSString *marketing = [bundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"];
+    NSString *build = [bundle objectForInfoDictionaryKey:@"CFBundleVersion"];
+    return [NSString stringWithFormat:@"%@(%@)", marketing ?: @"?", build ?: @"?"];
+}
+
 - (void)driveSceneManuallyForSession:(SBGuestSession *)session {
     SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 手动 willConnect：入口（客窗已有=%@）",
                     session.bundleID, session.guestWindow ? @"是" : @"否"] UTF8String]);
     if (session.guestWindow) {
+        return;
+    }
+    // 0.2.37：willConnect 熔断（通用规则，不按应用名）——Swift trap 抓不住，
+    // 死过一次 willConnect 的客再调一次还是死。两档：
+    //  (1) 上次启动死在该客 willConnect 里（BeginRun 残留标记）：写拦截记录，干净失败；
+    //  (2) 拦截记录在位且客可执行指纹＋宿主版本均未变：跳过调用，干净失败。
+    // 背景：彩云 7.63.2 反汇编核实，willConnect 内两处 as! 式强转都是条件式
+    // （_swift_dynamicCastObjCClass 条件原语＋cbz 早退），不可能是死因；
+    // 死在强转之后的深层路径（detectLaunch 树 / 7.63.5 增量），离线无法再钉，
+    // 需真机 .ips——熔断是 0.2.37 能保证“不再闪退”的唯一办法。
+    NSString *fingerprint = [self willConnectFingerprintForSession:session];
+    NSString *hostVersion = [self willConnectHostVersion];
+    const char *staleGuest = SBDiagLogStaleWillConnectGuest();
+    if (staleGuest && staleGuest[0] != '\0' &&
+        [session.bundleID isEqualToString:[NSString stringWithUTF8String:staleGuest]]) {
+        SBDiagLogBlockWillConnectForGuest([session.bundleID UTF8String],
+                                         [fingerprint UTF8String],
+                                         [hostVersion UTF8String]);
+        SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 手动 willConnect：熔断——上次启动死在 willConnect 里，已写拦截记录，本次跳过调用",
+                        session.bundleID] UTF8String]);
+        [self failActivationForSession:session
+                               message:@"上次打开时闪退（死在客 App 启动步骤里），本次跳过该步骤以免再次闪退"];
+        return;
+    }
+    if (SBDiagLogIsWillConnectBlockedForGuest([session.bundleID UTF8String],
+                                             [fingerprint UTF8String],
+                                             [hostVersion UTF8String])) {
+        SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 手动 willConnect：熔断——拦截记录在位（指纹与宿主版本均未变），跳过调用",
+                        session.bundleID] UTF8String]);
+        [self failActivationForSession:session
+                               message:@"该应用的启动步骤上次导致闪退，已跳过；重新导入或升级后可再试"];
         return;
     }
     UIWindowScene *scene = self.hostScene;
@@ -379,6 +436,36 @@ static const NSTimeInterval SBGuestSceneSystemPathWaitSeconds = 0.4;
                             (unsigned long)options.userActivities.count,
                             app.keyWindow ? @"有" : @"无",
                             (unsigned long)app.connectedScenes.count] UTF8String]);
+            // 0.2.37：调用前先决条件（通用——任何 UIKit scene 客的 willConnect 都可能写
+            // `scene as! UIWindowScene` / `delegate as! AppDelegate` 无条件强转；
+            // Swift trap @try 抓不住，调前验不过就干净失败、不调）：
+            //  (1) scene 必须是 UIWindowScene；(2) app.delegate 必须是客 AppDelegate 类实例。
+            //  (2) 不满足时先把会话里存的客 delegate 实例重装上去再验一次——激活与
+            //  0.4 秒补查之间若有谁换了 delegate，重装能救回来；仍不满足才干净失败。
+            //  通过时记一行：下份日志若仍死在 willConnect 里，先决条件已排除、直指深层路径。
+            if (![scene isKindOfClass:[UIWindowScene class]]) {
+                [self failActivationForSession:session message:@"宿主 scene 不是 UIWindowScene，跳过客 willConnect（客内 as! 强转会闪退）"];
+                return;
+            }
+            id guestDelegate = session.guestAppDelegate;
+            if (!guestDelegate) {
+                [self failActivationForSession:session message:@"客 AppDelegate 未在会话里，无法核验 willConnect 先决条件，跳过调用"];
+                return;
+            }
+            if (![app.delegate isKindOfClass:[guestDelegate class]]) {
+                SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 手动 willConnect：先决条件不满足（app.delegate=%@，客 delegate 类=%@），重装客 delegate 再验",
+                                session.bundleID, NSStringFromClass([app.delegate class]), NSStringFromClass([guestDelegate class])] UTF8String]);
+                app.delegate = guestDelegate;
+                if (![app.delegate isKindOfClass:[guestDelegate class]]) {
+                    [self failActivationForSession:session message:@"客 AppDelegate 未在位（重装后仍不是客类），跳过客 willConnect（客内 as! 强转会闪退）"];
+                    return;
+                }
+                SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 手动 willConnect：客 delegate 已重装，先决条件通过",
+                                session.bundleID] UTF8String]);
+            } else {
+                SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 手动 willConnect：先决条件通过（scene 是 UIWindowScene，app.delegate 是客 %@ 实例）",
+                                session.bundleID, NSStringFromClass([guestDelegate class])] UTF8String]);
+            }
             SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 手动 willConnect：调用客 scene delegate willConnect（%@）",
                             session.bundleID, NSStringFromClass([sceneDelegate class])] UTF8String]);
             // 0.2.36：进入标记（SBDiagLog dlopen 标记同款）——Swift trap 抓不住，
@@ -388,6 +475,8 @@ static const NSTimeInterval SBGuestSceneSystemPathWaitSeconds = 0.4;
             SBDiagLogClearWillConnectEntry();
             SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 手动 willConnect：客 scene delegate willConnect 已返回",
                             session.bundleID] UTF8String]);
+            // 0.2.37：willConnect 成功返回——若曾有拦截记录（指纹/版本已变才走到这里），清掉。
+            SBDiagLogClearWillConnectBlockForGuest([session.bundleID UTF8String]);
         } else {
             SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 手动 willConnect：客 scene delegate 未实现 willConnect，跳过调用直接找窗",
                             session.bundleID] UTF8String]);

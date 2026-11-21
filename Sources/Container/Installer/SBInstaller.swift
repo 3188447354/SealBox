@@ -282,6 +282,9 @@ public enum SBInstaller {
             // 15 毫秒结束，安装到底走完没有，分型行之后无任何行可证；下次再有
             // 进程在安装附近结束，先看有没有这一行。
             SBDiagLog.log("安装完成：\(parsed.bundleID) \(destinationDir.lastPathComponent) 已入库")
+            // 0.2.37：重装/重导清 willConnect 拦截记录——新二进制指纹本就会让记录
+            // 失效，这里再显式清一次（mtime 保留的拷贝也不再被拦），下次启动重试 willConnect。
+            parsed.bundleID.withCString { SBDiagLogClearWillConnectBlockForGuest($0) }
             progress.completedUnitCount = progress.totalUnitCount
             return record
         } catch {

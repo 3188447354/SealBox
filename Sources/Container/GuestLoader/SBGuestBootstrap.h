@@ -49,6 +49,17 @@ NS_ASSUME_NONNULL_BEGIN
 /// “未改写过即空操作”守卫，重复调无害。
 + (void)restoreHostContext;
 
+/// 0.2.37：给宿主 delegate（SwiftUI.AppDelegate）补 window 属性——0.2.36 真机
+/// 启动时异常弹窗 -[SwiftUI.AppDelegate window]: unrecognized selector。
+/// 全仓查过：我们代码里没有任何一处直接发 delegate.window（0.2.36 的 storyboard
+/// 建窗路也是自己建 UIWindow、不读 delegate.window），发送方是 UIKit 的 scene
+/// 机制或客代码在宿主 delegate 在位时问它要 window；SwiftUI.AppDelegate 没有
+/// window 属性就直接抛异常杀进程。修法：运行时给该类补一个 window getter
+/// （返回当前 keyWindow）与 setter（收到的窗变 key 可见，即 legacy 语义），
+/// 类身份不变（isKindOfClass 照常），Apple 将来若补了该方法则 class_addMethod
+/// 返回 NO、不覆盖。幂等，多调无害。
++ (void)installHostDelegateWindowGetter;
+
 @end
 
 NS_ASSUME_NONNULL_END

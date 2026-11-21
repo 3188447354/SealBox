@@ -41,6 +41,8 @@
 #define SB_DIAG_FILE_PREFIX "SBStartupLog"
 #define SB_DIAG_DLOPEN_MARKER_NAME "SBStartupLog-dlopen-marker.txt"
 #define SB_DIAG_WILLCONNECT_MARKER_NAME "SBStartupLog-willconnect-marker.txt"
+#define SB_DIAG_WILLCONNECT_BLOCK_PREFIX "willconnect-blocked-"
+#define SB_DIAG_WILLCONNECT_BLOCK_SUFFIX ".txt"
 #define SB_DIAG_MAX_FILES 20
 #define SB_DIAG_MAX_TOTAL_BYTES (2 * 1024 * 1024)
 
@@ -54,6 +56,9 @@ static char g_currentPath[PATH_MAX + 64];
 static char g_currentName[256];
 static char g_dlopenMarkerPath[PATH_MAX + 64];
 static char g_willConnectMarkerPath[PATH_MAX + 64];
+/// 0.2.37：BeginRun 从残留 willConnect 标记读出的客 bundle ID（进程内静态区，
+/// 供本次启动的 driveSceneManually 熔断用；无残留标记时为空串）。
+static char g_staleWillConnectGuest[256];
 
 /// 读整个文件（上限 SB_DIAG_READ_CAP），NUL 结尾；失败返回 NULL。
 static char *SBDiagReadFile(const char *path, size_t *lenOut) {
@@ -500,6 +505,14 @@ void SBDiagLogBeginRun(void) {
             if (nl) {
                 *nl = '\0';
             }
+            // 0.2.37：记进程内静态区——本次启动的 driveSceneManually 靠它熔断
+            //（标记文件本身在这里删掉，只报一次；静态区留到进程结束）。
+            size_t staticLen = strlen(staleWillConnectGuest);
+            if (staticLen >= sizeof(g_staleWillConnectGuest)) {
+                staticLen = sizeof(g_staleWillConnectGuest) - 1;
+            }
+            memcpy(g_staleWillConnectGuest, staleWillConnectGuest, staticLen);
+            g_staleWillConnectGuest[staticLen] = '\0';
         }
         free(marker);
         (void)unlink(g_willConnectMarkerPath);
@@ -670,6 +683,99 @@ void SBDiagLogClearWillConnectEntry(void) {
     }
     memcpy(path, g_willConnectMarkerPath, pathLen + 1);
     pthread_mutex_unlock(&g_lock);
+    (void)unlink(path);
+}
+
+const char *SBDiagLogStaleWillConnectGuest(void) {
+    return g_staleWillConnectGuest;
+}
+
+/// 0.2.37：willConnect 拦截记录路径（Logs/willconnect-blocked-<bundleID>.txt）。
+/// bundle ID 只留 [A-Za-z0-9.-]，其余字符变 '_'——文件名永不含 '/'，不被路径穿越。
+static int SBDiagWillConnectBlockPath(const char *guestBundleID, char *out, size_t outLen) {
+    if (!guestBundleID || guestBundleID[0] == '\0' || !out || outLen == 0) {
+        return 0;
+    }
+    pthread_mutex_lock(&g_lock);
+    if (!g_begun || g_dir[0] == '\0') {
+        pthread_mutex_unlock(&g_lock);
+        return 0;
+    }
+    char dir[PATH_MAX + 64];
+    size_t dirLen = strlen(g_dir);
+    if (dirLen >= sizeof(dir)) {
+        pthread_mutex_unlock(&g_lock);
+        return 0;
+    }
+    memcpy(dir, g_dir, dirLen + 1);
+    pthread_mutex_unlock(&g_lock);
+    char safe[256];
+    size_t i = 0;
+    for (; guestBundleID[i] != '\0' && i < sizeof(safe) - 1; i++) {
+        char c = guestBundleID[i];
+        safe[i] = ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                   (c >= '0' && c <= '9') || c == '.' || c == '-' || c == '_')
+                      ? c : '_';
+    }
+    safe[i] = '\0';
+    if (i == 0) {
+        return 0;
+    }
+    int rc = snprintf(out, outLen, "%s/%s%s%s", dir,
+                      SB_DIAG_WILLCONNECT_BLOCK_PREFIX, safe,
+                      SB_DIAG_WILLCONNECT_BLOCK_SUFFIX);
+    return rc > 0 && (size_t)rc < outLen;
+}
+
+void SBDiagLogBlockWillConnectForGuest(const char *guestBundleID, const char *fingerprint, const char *hostVersion) {
+    char path[PATH_MAX + 64];
+    if (!SBDiagWillConnectBlockPath(guestBundleID, path, sizeof(path))) {
+        return;
+    }
+    char content[1024];
+    int n = snprintf(content, sizeof(content), "%s\n%s\n",
+                     (fingerprint && fingerprint[0] != '\0') ? fingerprint : "?",
+                     (hostVersion && hostVersion[0] != '\0') ? hostVersion : "?");
+    if (n <= 0) {
+        return;
+    }
+    SBDiagWriteFile(path, content, (size_t)n);
+}
+
+int SBDiagLogIsWillConnectBlockedForGuest(const char *guestBundleID, const char *fingerprint, const char *hostVersion) {
+    char path[PATH_MAX + 64];
+    if (!SBDiagWillConnectBlockPath(guestBundleID, path, sizeof(path))) {
+        return 0;
+    }
+    size_t len = 0;
+    char *content = SBDiagReadFile(path, &len);
+    if (!content || len == 0) {
+        free(content);
+        return 0;
+    }
+    // 两行：指纹、宿主版本——都对上才拦截；任一不符（重装/升级）即失效、自动重试。
+    char *nl1 = strchr(content, '\n');
+    if (!nl1) {
+        free(content);
+        return 0;
+    }
+    *nl1 = '\0';
+    char *line2 = nl1 + 1;
+    char *nl2 = strchr(line2, '\n');
+    if (nl2) {
+        *nl2 = '\0';
+    }
+    int blocked = (fingerprint && strcmp(content, fingerprint) == 0 &&
+                   hostVersion && strcmp(line2, hostVersion) == 0);
+    free(content);
+    return blocked;
+}
+
+void SBDiagLogClearWillConnectBlockForGuest(const char *guestBundleID) {
+    char path[PATH_MAX + 64];
+    if (!SBDiagWillConnectBlockPath(guestBundleID, path, sizeof(path))) {
+        return;
+    }
     (void)unlink(path);
 }
 

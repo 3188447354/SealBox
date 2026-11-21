@@ -26,6 +26,108 @@ enum VMWallpapers {
     }
 }
 
+/// 0.2.37：用户自选图片（墙纸与头像共用）：只存用户自己挑的真实图片，不内置
+/// 任何占位图。文件落在宿主 Documents 下（墙纸 Wallpaper/、头像 Avatar/），
+/// AppStorage 的 customVersion 计数作变更信号（HomeScreen 与设置页都监听它，
+/// 存/删时 +1，图片本身不走 UserDefaults）。
+enum VMUserImage {
+    /// 下采样后存 JPEG：长边不超过 maxDimension，质量 0.85——墙纸 2000、头像 512。
+    /// 返回 JPEG 数据；原图已是 JPEG 且够小也不直存原文件，统一经此路（尺寸可控）。
+    static func jpegData(_ image: UIImage, maxDimension: CGFloat, quality: CGFloat = 0.85) -> Data? {
+        let longest = max(image.size.width, image.size.height)
+        let scale = longest > maxDimension ? maxDimension / longest : 1
+        let target = CGSize(width: image.size.width * scale, height: image.size.height * scale)
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        let resized = UIGraphicsImageRenderer(size: target, format: format).image { _ in
+            image.draw(in: CGRect(origin: .zero, size: target))
+        }
+        return resized.jpegData(compressionQuality: quality)
+    }
+
+    static func directory(named name: String) throws -> URL {
+        guard let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else {
+            throw CocoaError(.fileNoSuchFile)
+        }
+        let dir = docs.appendingPathComponent(name, isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+}
+
+/// 0.2.37：自定义墙纸（MJ 22:39）：用户从相册/文件挑一张图，存
+/// Documents/Wallpaper/custom-wallpaper.jpg；没选时用渐变墙纸。
+enum VMCustomWallpaper {
+    static let fileName = "custom-wallpaper.jpg"
+    static var fileURL: URL? { try? VMUserImage.directory(named: "Wallpaper").appendingPathComponent(fileName) }
+
+    /// 当前是否有用户自选墙纸（文件在即有）。
+    static var hasCustom: Bool {
+        guard let url = fileURL else { return false }
+        return FileManager.default.fileExists(atPath: url.path)
+    }
+
+    static func loadImage() -> UIImage? {
+        guard let url = fileURL,
+              FileManager.default.fileExists(atPath: url.path) else { return nil }
+        return UIImage(contentsOfFile: url.path)
+    }
+
+    /// 存入用户挑的图片（下采样长边 ≤2000 后写盘）；成功返回 true。
+    @discardableResult
+    static func save(_ image: UIImage) -> Bool {
+        guard let url = fileURL,
+              let data = VMUserImage.jpegData(image, maxDimension: 2000) else { return false }
+        do {
+            try data.write(to: url, options: .atomic)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    /// 恢复默认墙纸：删掉自选图文件（没有也不报错）。
+    static func remove() {
+        guard let url = fileURL else { return }
+        try? FileManager.default.removeItem(at: url)
+    }
+}
+
+/// 0.2.37：自定义头像（MJ 22:40）：与墙纸同一套存法，文件在
+/// Documents/Avatar/custom-avatar.jpg，下采样长边 ≤512。
+enum VMUserAvatar {
+    static let fileName = "custom-avatar.jpg"
+    static var fileURL: URL? { try? VMUserImage.directory(named: "Avatar").appendingPathComponent(fileName) }
+
+    static var hasCustom: Bool {
+        guard let url = fileURL else { return false }
+        return FileManager.default.fileExists(atPath: url.path)
+    }
+
+    static func loadImage() -> UIImage? {
+        guard let url = fileURL,
+              FileManager.default.fileExists(atPath: url.path) else { return nil }
+        return UIImage(contentsOfFile: url.path)
+    }
+
+    @discardableResult
+    static func save(_ image: UIImage) -> Bool {
+        guard let url = fileURL,
+              let data = VMUserImage.jpegData(image, maxDimension: 512) else { return false }
+        do {
+            try data.write(to: url, options: .atomic)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    static func remove() {
+        guard let url = fileURL else { return }
+        try? FileManager.default.removeItem(at: url)
+    }
+}
+
 /// Real disk measurements, from FileManager — never invented numbers.
 enum VMFiles {
     /// Documents/IPAs, creating it on first use.

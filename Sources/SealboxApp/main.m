@@ -24,6 +24,7 @@
 #import <dlfcn.h>
 
 #import "SBGuestLoader.h"
+#import "SBGuestBootstrap.h"
 #import "SBDiagLog.h"
 #import "SealBox-Swift.h"
 
@@ -124,6 +125,11 @@ int main(int argc, char *argv[]) {
             SBDiagLogLine("Cookies 已还原（Cookies2 移回）");
         }
     }
+
+    // 0.2.37：宿主 delegate window 补丁——SwiftUI.AppDelegate 没有 window 属性，
+    // UIKit scene 机制或客代码问它要 window 时会抛 unrecognized selector 杀进程
+    //（0.2.36 真机启动时异常弹窗）。须在 SwiftUI 启动前装好。
+    [SBGuestBootstrap installHostDelegateWindowGetter];
 
     SBHostAppMain();
     return 0;

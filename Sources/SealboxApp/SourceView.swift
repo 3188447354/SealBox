@@ -33,13 +33,13 @@ final class DownloadManager: NSObject, URLSessionDownloadDelegate, ObservableObj
     private weak var coordinator: SBAppCoordinator?
 
     /// Start downloading an app's IPA. No-op if it is already downloading
-    /// or already installed; installing in progress is refused with an alert.
+    /// or already installed; installing in progress is refused silently
+    ///（0.2.37：导入不弹提示，桌面安装 pill 已在显示进度）。
     func download(_ app: SourceApp, coordinator: SBAppCoordinator) {
         guard !downloading.contains(app.name) else { return }
         self.coordinator = coordinator
         if coordinator.isInstalling {
-            coordinator.activeAlert = SBAppCoordinator.CoordinatorAlert(
-                title: "正在安装", message: "正在安装，请稍候")
+            SBDiagLog.log("软件源下载：正在安装，忽略 \(app.name) 的下载请求")
             return
         }
         if Self.isInstalled(app) { return }
@@ -86,10 +86,10 @@ final class DownloadManager: NSObject, URLSessionDownloadDelegate, ObservableObj
     ) {
         guard let name = downloadTask.taskDescription,
               let app = SourceCatalog.all.first(where: { $0.name == name }) else {
-            // 0.2.1：之前这里静默 return，下载完了却什么都没发生。
-            Task { @MainActor [weak self] in
-                self?.coordinator?.activeAlert = SBAppCoordinator.CoordinatorAlert(
-                    title: "下载失败", message: "下载完成但找不到对应的应用，请重试")
+            // 0.2.37：下载完了却找不到对应应用，只记日志不弹错（按钮变回“获取”，
+            // 用户可重试；导入全程不弹提示，MJ 22:35）。
+            Task { @MainActor in
+                SBDiagLog.log("软件源下载失败：下载完成但找不到对应的应用")
             }
             return
         }
@@ -110,25 +110,24 @@ final class DownloadManager: NSObject, URLSessionDownloadDelegate, ObservableObj
                 await self.coordinator?.installIPA(at: destination, displayNameHint: name)
             }
         } catch {
-            // 0.2.1：之前这里只清进度不弹错，下载完了文件没落位，
-            // 按钮悄悄变回“获取”，用户根本不知道下载失败了。
+            // 0.2.37：下载完了文件没落位，只记日志不弹错（按钮变回“获取”，
+            // 用户可重试；导入全程不弹提示，MJ 22:35）。
             Task { @MainActor [weak self] in
                 self?.downloading.remove(name)
                 self?.progress.removeValue(forKey: name)
-                self?.coordinator?.activeAlert = SBAppCoordinator.CoordinatorAlert(
-                    title: "下载失败", message: "下载完成，保存文件失败，请重试")
+                SBDiagLog.log("软件源下载失败：下载完成，保存文件失败")
             }
         }
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
         guard let error = error, let name = task.taskDescription else { return }
-        // 0.2.1：之前网络失败也只清进度不弹错，按钮悄悄变回“获取”。
+        // 0.2.37：网络失败只记日志不弹错（按钮变回“获取”，用户可重试；
+        // 导入全程不弹提示，MJ 22:35）。
         Task { @MainActor [weak self] in
             self?.downloading.remove(name)
             self?.progress.removeValue(forKey: name)
-            self?.coordinator?.activeAlert = SBAppCoordinator.CoordinatorAlert(
-                title: "下载失败", message: error.localizedDescription)
+            SBDiagLog.log("软件源下载失败：\(name) \(error.localizedDescription)")
         }
     }
 

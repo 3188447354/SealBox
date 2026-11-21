@@ -54,7 +54,7 @@ enum SBDiagLog {
 }
 
 /// 日志文件夹里的一份日志文件。
-struct SBDiagLogFile: Identifiable {
+struct SBDiagLogFile: Identifiable, Hashable {
     let name: String       // 文件名，如 SBStartupLog-2026-11-21-010321-9021-crashed.txt
     let crashed: Bool      // 上次启动没完成就崩了
     let bytes: Int

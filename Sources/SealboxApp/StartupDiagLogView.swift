@@ -43,12 +43,16 @@ struct StartupDiagLogSection: View {
 
 /// 日志文件列表（最新在前）：崩溃徽章＋大小，点进看全文。
 /// 0.2.31：原来只读最新一份全文，现在列出 Logs 文件夹里的全部文件。
+/// 0.2.37：点一次就开——之前是旧式 destination-NavigationLink 放在 sheet 内
+/// 的 List 里，首点只选中行（List 行选择把点吞了）、第二点才导航；改 value-based
+///（NavigationLink(value:) + navigationDestination），首点即导航。
 private struct StartupDiagLogListView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var files: [SBDiagLogFile] = []
+    @State private var path = NavigationPath()
 
     var body: some View {
-        NavigationStack {
+        NavigationStack(path: $path) {
             Group {
                 if files.isEmpty {
                     Text("暂无日志")
@@ -56,9 +60,7 @@ private struct StartupDiagLogListView: View {
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
                     List(files) { file in
-                        NavigationLink {
-                            StartupDiagLogDetailView(file: file)
-                        } label: {
+                        NavigationLink(value: file) {
                             HStack {
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text(file.displayName)
@@ -84,6 +86,9 @@ private struct StartupDiagLogListView: View {
             }
             .navigationTitle("启动日志")
             .navigationBarTitleDisplayMode(.inline)
+            .navigationDestination(for: SBDiagLogFile.self) { file in
+                StartupDiagLogDetailView(file: file)
+            }
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("关闭") { dismiss() }

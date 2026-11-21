@@ -1,6 +1,8 @@
 import SwiftUI
 import AVFoundation
 import AudioToolbox
+import PhotosUI
+import UniformTypeIdentifiers
 
 // Settings app (0.1.4): full settings page with 12 real sub-pages.
 // Navigation: NavigationStack with large title + search; no back button
@@ -22,6 +24,8 @@ private enum SettingsDestination: String, Hashable, CaseIterable {
     case faceID = "面容 ID 与密码"
     case battery = "电池"
     case privacy = "隐私与安全性"
+    /// 0.2.37：虚拟机用户（Apple ID 卡片样式）——点设置页顶部的账号卡片进入。
+    case account = "虚拟机用户"
 
     var icon: String {
         switch self {
@@ -37,6 +41,7 @@ private enum SettingsDestination: String, Hashable, CaseIterable {
         case .faceID: return "faceid"
         case .battery: return "battery.100"
         case .privacy: return "hand.raised.fill"
+        case .account: return "person.crop.circle.fill"
         }
     }
 
@@ -54,6 +59,7 @@ private enum SettingsDestination: String, Hashable, CaseIterable {
         case .faceID: return .green
         case .battery: return .green
         case .privacy: return .blue
+        case .account: return .gray
         }
     }
 }
@@ -62,6 +68,10 @@ struct SettingsView: View {
     @EnvironmentObject private var vm: VMState
     @State private var searchText = ""
     @AppStorage("vm.settings.wifiNetwork") private var wifiNetwork = "SealBox-5G"
+    /// 0.2.37：账号卡片用的证书信息（叶子证书里取真实 Apple ID）与自选头像。
+    @State private var certInfo: SBCertificate.SBCertificateInfo?
+    @AppStorage("vm.settings.avatar.customVersion") private var avatarVersion = 0
+    @State private var avatarImage: UIImage?
 
     private var isSearching: Bool { !searchText.trimmingCharacters(in: .whitespaces).isEmpty }
 
@@ -92,6 +102,15 @@ struct SettingsView: View {
             .navigationDestination(for: SettingsDestination.self) { destination in
                 subPage(destination)
             }
+            // 0.2.37：账号卡片的数据（证书里的真实 Apple ID）与自选头像进页时读一次；
+            // 头像在账号页换完后版本号变，这里重读、卡片同步换。
+            .task {
+                certInfo = await SBCertificate.certificateInfo()
+                avatarImage = VMUserAvatar.loadImage()
+            }
+            .onChange(of: avatarVersion) { _, _ in
+                avatarImage = VMUserAvatar.loadImage()
+            }
         }
     }
 
@@ -99,22 +118,35 @@ struct SettingsView: View {
 
     private var groupedList: some View {
         List {
-            // Account card
+            // Account card — 0.2.37：按 iOS 设置页 Apple ID 卡片的样子显示：
+            // 名字＋邮箱取自导入证书的叶子证书（免费号 CN 就是 Apple ID 邮箱），
+            // 取不到的不编、如实显示已有的；头像是用户自选图、没选时默认头像。
+            // 点卡片进“虚拟机用户”页（换头像/恢复默认都在那页）。
             Section {
-                HStack(spacing: 14) {
-                    Image(systemName: "person.crop.circle.fill")
-                        .resizable()
-                        .frame(width: 56, height: 56)
-                        .foregroundStyle(.gray)
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text("虚拟机用户")
-                            .font(.title3)
-                        Text("未登录")
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
+                NavigationLink(value: SettingsDestination.account) {
+                    HStack(spacing: 14) {
+                        if let avatarImage {
+                            Image(uiImage: avatarImage)
+                                .resizable()
+                                .scaledToFill()
+                                .frame(width: 56, height: 56)
+                                .clipShape(Circle())
+                        } else {
+                            Image(systemName: "person.crop.circle.fill")
+                                .resizable()
+                                .frame(width: 56, height: 56)
+                                .foregroundStyle(.gray)
+                        }
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(accountDisplayName)
+                                .font(.title3)
+                            Text(accountSecondaryLine)
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                        }
                     }
+                    .padding(.vertical, 6)
                 }
-                .padding(.vertical, 6)
             }
 
             // Group 1: connectivity
@@ -177,6 +209,23 @@ struct SettingsView: View {
         .safeAreaInset(edge: .bottom) { Color.clear.frame(height: 28) }
     }
 
+    /// 账号卡片主行：证书里的人名（付费号）→ 邮箱（免费号 CN 即邮箱）→ 默认“虚拟机用户”。
+    private var accountDisplayName: String {
+        certInfo?.accountName ?? certInfo?.accountEmail ?? "虚拟机用户"
+    }
+
+    /// 账号卡片副行：有人名时显示邮箱；只有邮箱时显示 Team ID；无证书时“未登录”。
+    private var accountSecondaryLine: String {
+        if certInfo?.accountName != nil {
+            return certInfo?.accountEmail
+                ?? (certInfo?.teamID.map { "Team ID \($0)" } ?? "已导入证书")
+        }
+        if certInfo?.accountEmail != nil {
+            return certInfo?.teamID.map { "Team ID \($0)" } ?? "已导入证书"
+        }
+        return certInfo == nil ? "未登录" : "已导入证书"
+    }
+
     /// Flat results while searching; tapping one opens its sub-page.
     private var searchList: some View {
         List {
@@ -220,6 +269,7 @@ struct SettingsView: View {
         case .faceID: FaceIDSettingsView()
         case .battery: BatterySettingsView()
         case .privacy: PrivacySettingsView()
+        case .account: AccountSettingsView()
         }
     }
 }
@@ -788,14 +838,70 @@ private struct DisplaySettingsView: View {
 
 /// The options live in VMWallpapers (VMHelpers.swift), shared with the
 /// home screen — picking one here changes the home screen immediately.
+/// 0.2.37：自选图片（MJ 22:39）——从相册/文件挑一张用户自己的图作墙纸，
+/// 存盘持久化、重启与回桌面都还在、各页通用；没选时用下面的渐变。
+/// 同一时间只一种墙纸生效：点渐变即清掉自选图，“恢复默认”也是清掉自选图。
 private struct WallpaperSettingsView: View {
     @AppStorage("vm.settings.wallpaper") private var selectedWallpaper = 0
+    @AppStorage("vm.settings.wallpaper.customVersion") private var customVersion = 0
+    @State private var photoPickerItem: PhotosPickerItem?
+    @State private var showFileImporter = false
+    @State private var customImage: UIImage?
 
     var body: some View {
         List {
             Section {
+                HStack(spacing: 14) {
+                    if let customImage {
+                        Image(uiImage: customImage)
+                            .resizable()
+                            .scaledToFill()
+                            .frame(width: 56, height: 100)
+                            .clipShape(RoundedRectangle(cornerRadius: 10))
+                    } else {
+                        RoundedRectangle(cornerRadius: 10)
+                            .fill(Color.secondary.opacity(0.25))
+                            .frame(width: 56, height: 100)
+                            .overlay {
+                                Image(systemName: "photo")
+                                    .foregroundStyle(.secondary)
+                            }
+                    }
+                    Text(customImage == nil ? "未选用自选图片" : "已选用自选图片")
+                        .foregroundStyle(.primary)
+                    Spacer()
+                    if customImage != nil {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundStyle(.blue)
+                    }
+                }
+                PhotosPicker(selection: $photoPickerItem, matching: .images) {
+                    Label("从相册选择", systemImage: "photo.on.rectangle")
+                }
+                Button {
+                    showFileImporter = true
+                } label: {
+                    Label("从文件选择", systemImage: "folder")
+                }
+                if customImage != nil {
+                    Button("恢复默认墙纸", role: .destructive) {
+                        VMCustomWallpaper.remove()
+                        bumpCustomVersion()
+                    }
+                }
+            } header: {
+                Text("自选图片")
+            } footer: {
+                Text("只用你自己挑的图片，不内置任何图片；选完立即换到主屏幕，重启后保持。")
+            }
+            Section {
                 ForEach(VMWallpapers.options.indices, id: \.self) { index in
                     Button {
+                        // 点渐变即清掉自选图：同一时间只一种墙纸生效。
+                        if VMCustomWallpaper.hasCustom {
+                            VMCustomWallpaper.remove()
+                            bumpCustomVersion()
+                        }
                         selectedWallpaper = index
                     } label: {
                         HStack(spacing: 14) {
@@ -809,7 +915,7 @@ private struct WallpaperSettingsView: View {
                             Text(VMWallpapers.options[index].name)
                                 .foregroundStyle(.primary)
                             Spacer()
-                            if index == selectedWallpaper {
+                            if index == selectedWallpaper && customImage == nil {
                                 Image(systemName: "checkmark.circle.fill")
                                     .foregroundStyle(.blue)
                             }
@@ -825,6 +931,177 @@ private struct WallpaperSettingsView: View {
         .navigationTitle("墙纸")
         .navigationBarTitleDisplayMode(.inline)
         .safeAreaInset(edge: .bottom) { Color.clear.frame(height: 28) }
+        .onAppear { customImage = VMCustomWallpaper.loadImage() }
+        .onChange(of: customVersion) { _, _ in
+            customImage = VMCustomWallpaper.loadImage()
+        }
+        .onChange(of: photoPickerItem) { _, newItem in
+            guard let newItem else { return }
+            Task {
+                if let data = try? await newItem.loadTransferable(type: Data.self),
+                   let image = UIImage(data: data),
+                   VMCustomWallpaper.save(image) {
+                    bumpCustomVersion()
+                }
+                photoPickerItem = nil
+            }
+        }
+        .fileImporter(isPresented: $showFileImporter, allowedContentTypes: [.image], allowsMultipleSelection: false) { result in
+            guard case .success(let urls) = result, let url = urls.first else { return }
+            let accessing = url.startAccessingSecurityScopedResource()
+            defer { if accessing { url.stopAccessingSecurityScopedResource() } }
+            if let data = try? Data(contentsOf: url),
+               let image = UIImage(data: data),
+               VMCustomWallpaper.save(image) {
+                bumpCustomVersion()
+            }
+        }
+    }
+
+    private func bumpCustomVersion() {
+        customVersion += 1
+        customImage = VMCustomWallpaper.loadImage()
+    }
+}
+
+// MARK: - 8b. 虚拟机用户（Apple ID 卡片）
+
+/// 0.2.37：虚拟机用户页（MJ 22:40）——按 iOS 设置页 Apple ID 账号页的样子：
+/// 大头像＋名字＋邮箱；以下全是证书里的真实值（Team ID/过期日/导入日期），
+/// 证书里没有的不编、不显示那行。头像可自选（相册/文件），只用用户自己挑的
+/// 真实图片，没选时默认头像，可恢复默认。
+private struct AccountSettingsView: View {
+    @AppStorage("vm.settings.avatar.customVersion") private var avatarVersion = 0
+    @State private var certInfo: SBCertificate.SBCertificateInfo?
+    @State private var avatarImage: UIImage?
+    @State private var photoPickerItem: PhotosPickerItem?
+    @State private var showFileImporter = false
+
+    private var displayName: String {
+        certInfo?.accountName ?? certInfo?.accountEmail ?? "虚拟机用户"
+    }
+
+    private var secondaryLine: String {
+        if certInfo?.accountName != nil {
+            return certInfo?.accountEmail
+                ?? (certInfo?.teamID.map { "Team ID \($0)" } ?? "已导入证书")
+        }
+        if certInfo?.accountEmail != nil {
+            return certInfo?.teamID.map { "Team ID \($0)" } ?? "已导入证书"
+        }
+        return certInfo == nil ? "未登录" : "已导入证书"
+    }
+
+    var body: some View {
+        List {
+            Section {
+                HStack(spacing: 14) {
+                    if let avatarImage {
+                        Image(uiImage: avatarImage)
+                            .resizable()
+                            .scaledToFill()
+                            .frame(width: 72, height: 72)
+                            .clipShape(Circle())
+                    } else {
+                        Image(systemName: "person.crop.circle.fill")
+                            .resizable()
+                            .frame(width: 72, height: 72)
+                            .foregroundStyle(.gray)
+                    }
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(displayName)
+                            .font(.title3)
+                        Text(secondaryLine)
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .padding(.vertical, 6)
+                PhotosPicker(selection: $photoPickerItem, matching: .images) {
+                    Label("更换头像", systemImage: "photo")
+                }
+                Button {
+                    showFileImporter = true
+                } label: {
+                    Label("从文件选择头像", systemImage: "folder")
+                }
+                if avatarImage != nil {
+                    Button("恢复默认头像", role: .destructive) {
+                        VMUserAvatar.remove()
+                        bumpAvatarVersion()
+                    }
+                }
+            } footer: {
+                Text("头像只用你自己挑的图片，不内置任何图片；换完各处头像同步变，重启后保持。")
+            }
+            if let info = certInfo {
+                Section {
+                    if let email = info.accountEmail {
+                        LabeledRow(label: "Apple ID", value: email)
+                    }
+                    if let name = info.accountName {
+                        LabeledRow(label: "姓名", value: name)
+                    }
+                    if let teamID = info.teamID {
+                        LabeledRow(label: "Team ID", value: teamID)
+                    }
+                    if let expiration = info.expirationDate {
+                        LabeledRow(label: "过期日", value: Self.formattedDate(expiration))
+                    }
+                    if let imported = info.importedDate {
+                        LabeledRow(label: "导入日期", value: Self.formattedDate(imported))
+                    }
+                } header: {
+                    Text("证书")
+                } footer: {
+                    Text("名字与邮箱取自导入证书的叶子证书；免费号的证书名就是 Apple ID 邮箱。")
+                }
+            }
+        }
+        .navigationTitle("虚拟机用户")
+        .navigationBarTitleDisplayMode(.inline)
+        .safeAreaInset(edge: .bottom) { Color.clear.frame(height: 28) }
+        .task {
+            certInfo = await SBCertificate.certificateInfo()
+            avatarImage = VMUserAvatar.loadImage()
+        }
+        .onChange(of: avatarVersion) { _, _ in
+            avatarImage = VMUserAvatar.loadImage()
+        }
+        .onChange(of: photoPickerItem) { _, newItem in
+            guard let newItem else { return }
+            Task {
+                if let data = try? await newItem.loadTransferable(type: Data.self),
+                   let image = UIImage(data: data),
+                   VMUserAvatar.save(image) {
+                    bumpAvatarVersion()
+                }
+                photoPickerItem = nil
+            }
+        }
+        .fileImporter(isPresented: $showFileImporter, allowedContentTypes: [.image], allowsMultipleSelection: false) { result in
+            guard case .success(let urls) = result, let url = urls.first else { return }
+            let accessing = url.startAccessingSecurityScopedResource()
+            defer { if accessing { url.stopAccessingSecurityScopedResource() } }
+            if let data = try? Data(contentsOf: url),
+               let image = UIImage(data: data),
+               VMUserAvatar.save(image) {
+                bumpAvatarVersion()
+            }
+        }
+    }
+
+    private func bumpAvatarVersion() {
+        avatarVersion += 1
+        avatarImage = VMUserAvatar.loadImage()
+    }
+
+    private static func formattedDate(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter.string(from: date)
     }
 }
 

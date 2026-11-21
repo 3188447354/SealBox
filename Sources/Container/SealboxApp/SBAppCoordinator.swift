@@ -1,6 +1,12 @@
 import SwiftUI
 import UIKit
 
+extension Notification.Name {
+    /// 0.2.37：安装完成——导入不再弹“已安装到桌面”（MJ 22:35）。根视图接到后
+    /// 回桌面第 2 页，新图标直接落在眼前（coordinator 不持有 VMState，用通知接线）。
+    static let SBInstallCompleted = Notification.Name("SBInstallCompleted")
+}
+
 /// 桌面与各模块之间的接线：导入、启动、删除、设置、证书、收据弹错。
 /// 桌面只管 UI 与手势，真实动作都在这里；GuestLoader 的证书门与看门狗在 ObjC 侧。
 final class SBAppCoordinator: ObservableObject {
@@ -53,9 +59,11 @@ final class SBAppCoordinator: ObservableObject {
     // MARK: - 导入（A3 / C1–C5）
 
     /// 导入入口：安装中不排队（C4），直接提示。
+    /// 0.2.37：导入全程不弹任何提示（MJ 22:35）——安装中再次点导入只静默忽略
+    ///（桌面安装 pill 已在显示进度），失败只记日志；成功也不弹，见 runInstall。
     func importIPA() {
         if isInstalling {
-            activeAlert = CoordinatorAlert(title: "正在安装", message: "正在安装，请稍候")
+            SBDiagLog.log("导入 IPA：正在安装，忽略重复导入请求")
             return
         }
         guard let presenter = topViewController else { return }
@@ -64,11 +72,9 @@ final class SBAppCoordinator: ObservableObject {
                 let url = try await SBImporter.pickIPA(presenter: presenter)
                 await installIPA(at: url)
             } catch {
-                // 用户取消静默处理（C1 的一部分），其余弹错。
+                // 用户取消静默处理（C1 的一部分），其余只记日志，不弹错。
                 if case SBError.cancelled = error { return }
-                await MainActor.run {
-                    activeAlert = CoordinatorAlert(title: "导入失败", message: error.localizedDescription)
-                }
+                SBDiagLog.log("导入 IPA 失败：\(error.localizedDescription)")
             }
         }
     }
@@ -79,9 +85,7 @@ final class SBAppCoordinator: ObservableObject {
     ///   - displayNameHint: 软件源目录名；解析出的显示名与它不一致时仍以它标安装行。
     func installIPA(at url: URL, displayNameHint: String? = nil) async {
         if isInstalling {
-            await MainActor.run {
-                activeAlert = CoordinatorAlert(title: "正在安装", message: "正在安装，请稍候")
-            }
+            SBDiagLog.log("安装 IPA：正在安装，忽略重复安装请求")
             return
         }
         do {
@@ -97,8 +101,9 @@ final class SBAppCoordinator: ObservableObject {
             if case SBError.cancelled = error { return }
             await MainActor.run {
                 installingDisplayName = nil
-                activeAlert = CoordinatorAlert(title: "导入失败", message: error.localizedDescription)
             }
+            // 0.2.37：导入失败不弹错，只记日志（MJ 22:35）。
+            SBDiagLog.log("安装 IPA 失败：\(error.localizedDescription)")
         }
     }
 
@@ -108,7 +113,7 @@ final class SBAppCoordinator: ObservableObject {
     /// 原始 IPA 文件不在了，改走文件选择器导入。
     func reinstallApp(_ app: SBInstalledApp) {
         if isInstalling {
-            activeAlert = CoordinatorAlert(title: "正在安装", message: "正在安装，请稍候")
+            SBDiagLog.log("重新安装：正在安装，忽略重复安装请求")
             return
         }
         guard let fileName = app.sourceIPAFileName, !fileName.isEmpty else {
@@ -119,9 +124,10 @@ final class SBAppCoordinator: ObservableObject {
             .appendingPathComponent("IPAs", isDirectory: true)
             .appendingPathComponent(fileName)
         guard FileManager.default.fileExists(atPath: ipaURL.path) else {
-            activeAlert = CoordinatorAlert(
-                title: "找不到原始 IPA",
-                message: "Documents/IPAs 里没有该应用的原始 IPA 文件，请重新导入")
+            // 0.2.37：原始 IPA 不在了不弹错，直接走文件选择器让用户重新挑
+            //（与本方法文档注释一致；以前这里弹“找不到原始 IPA”）。
+            SBDiagLog.log("重新安装：Documents/IPAs 里没有 \(fileName)，走文件选择器重新导入")
+            importIPA()
             return
         }
         Task {
@@ -144,8 +150,11 @@ final class SBAppCoordinator: ObservableObject {
                 }
             } catch {
                 if case SBError.cancelled = error { return }
+                // 0.2.37：重装失败不弹错，只记日志；有旧记录的标需重新导入，
+                // 桌面上灰显、详情页可重新导入（MJ 22:35：导入不要弹窗）。
+                SBDiagLog.log("重新安装失败：\(error.localizedDescription)")
                 await MainActor.run {
-                    activeAlert = CoordinatorAlert(title: "安装失败", message: error.localizedDescription)
+                    markRecordNeedsReimport(app)
                 }
             }
         }
@@ -212,13 +221,11 @@ final class SBAppCoordinator: ObservableObject {
                 installingDisplayName = nil
                 isInstalling = false
                 onInstalled?()
-                // 安装成功必须有明确信号（0.2.1）：之前只在软件源那行把
-                // 按钮翻成“已安装”，用户离开页面就看不到，装好的应用又
-                // 在桌面第 2 页——不弹这一下，用户根本不知道装完了。
-                activeAlert = CoordinatorAlert(
-                    title: "已安装到桌面",
-                    message: "“\(record.displayName)”已安装到桌面。",
-                    goToDesktop: true)
+                // 0.2.37：安装成功不再弹“已安装到桌面”（MJ 22:35：导入不要弹窗）。
+                // 明确信号改为直接回桌面第 2 页——新图标就落在眼前；通知由根视图
+                // 接（coordinator 不持有 VMState，见 VMRootView 的 onReceive）。
+                SBDiagLog.log("安装完成：\(record.displayName) 已安装到桌面")
+                NotificationCenter.default.post(name: .SBInstallCompleted, object: nil)
             }
         } catch {
             poll.cancel()
@@ -227,9 +234,25 @@ final class SBAppCoordinator: ObservableObject {
                 installingDisplayName = nil
                 isInstalling = false
                 if case SBError.cancelled = error { return }
-                activeAlert = CoordinatorAlert(title: "安装失败", message: error.localizedDescription)
+                // 0.2.37：安装失败不弹错，只记日志；有旧记录（重装/替换）的标
+                // 需重新导入，桌面灰显、详情页可重新导入（MJ 22:35）。
+                SBDiagLog.log("安装失败：\(error.localizedDescription)")
+                if let existing {
+                    markRecordNeedsReimport(existing)
+                }
             }
         }
+    }
+
+    /// 把一条已装记录标为需重新导入（安装/重装失败时用）：桌面灰显，详情页给
+    /// “重新安装 / 删除此应用”。无该记录时静默无操作。
+    private func markRecordNeedsReimport(_ record: SBInstalledApp) {
+        var apps = SBStore.shared.loadInstalledApps()
+        guard let index = apps.firstIndex(where: { $0.recordID == record.recordID }) else { return }
+        apps[index].needsReimport = true
+        SBStore.shared.saveInstalledApps(apps)
+        SBStore.shared.loadInstalledApps()
+        SBDiagLog.log("安装失败：\(record.displayName) 已标需重新导入")
     }
 
     // MARK: - 启动（A4 / B1–B4）

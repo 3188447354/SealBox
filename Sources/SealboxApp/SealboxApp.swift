@@ -73,6 +73,12 @@ struct VMRootView: View {
         .preferredColorScheme(appearanceDark ? .dark : .light)
         .statusBar(hidden: statusBarFancy)
         .overlay(alignment: .bottom) { homeSwipeZone }
+        // 0.2.37：安装完成不弹提示，改为直接回桌面第 2 页看新图标
+        //（通知来自 SBAppCoordinator.runInstall 成功路）。
+        .onReceive(NotificationCenter.default.publisher(for: .SBInstallCompleted)) { _ in
+            vm.homePage = 1
+            vm.openApp = nil
+        }
         .onAppear {
             // 0.2.1：删掉的“自定义手势”开关在旧手机上还留着一个死值，清掉。
             UserDefaults.standard.removeObject(forKey: "vm.plugin.customGestures")

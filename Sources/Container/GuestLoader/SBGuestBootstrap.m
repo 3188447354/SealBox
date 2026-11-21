@@ -487,6 +487,39 @@ static void SBDiagLogGuestFail(SBGuestLoaderErrorCode code, NSString *bundleID, 
 
 /// 把进程上下文还原成宿主自己的（伪装/路径/身份/HOME/env）。各还原函数自带
 /// “未改写过即空操作”守卫，重复调无害。
++ (void)installHostDelegateWindowGetter {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        Class cls = NSClassFromString(@"SwiftUI.AppDelegate");
+        if (!cls) {
+            SBDiagLogLine("宿主 delegate window 补丁：SwiftUI.AppDelegate 类未找到，不装");
+            return;
+        }
+        if ([cls instancesRespondToSelector:@selector(window)]) {
+            SBDiagLogLine("宿主 delegate window 补丁：SwiftUI.AppDelegate 已有 window，不装");
+            return;
+        }
+        // 用 block 作 IMP：getter 返回当前 keyWindow；setter 把收到的窗变 key 可见
+        //（legacy delegate.window 语义：delegate 的 window 就是 key window）。
+        // 类型编码 "@@:"（getter）与 "v@:@"（setter）。类上已有 window 时不动。
+        id getterBlock = ^id(id _self) {
+            return [UIApplication sharedApplication].keyWindow;
+        };
+        IMP getterIMP = imp_implementationWithBlock(getterBlock);
+        BOOL getterAdded = class_addMethod(cls, @selector(window), getterIMP, "@@:");
+        id setterBlock = ^(id _self, UIWindow *window) {
+            if (window) {
+                window.hidden = NO;
+                [window makeKeyAndVisible];
+            }
+        };
+        IMP setterIMP = imp_implementationWithBlock(setterBlock);
+        BOOL setterAdded = class_addMethod(cls, @selector(setWindow:), setterIMP, "v@:@");
+        SBDiagLogLine([[NSString stringWithFormat:@"宿主 delegate window 补丁：SwiftUI.AppDelegate 已补 window（getter=%@ setter=%@）",
+                        getterAdded ? @"是" : @"否", setterAdded ? @"是" : @"否"] UTF8String]);
+    });
+}
+
 + (void)restoreHostContext {
     restoreMainCFBundle();
     restoreMainNSBundle();

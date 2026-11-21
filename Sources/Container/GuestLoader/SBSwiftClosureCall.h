@@ -30,6 +30,10 @@
 //    签名的，C 层裸调会崩，故一律不用。
 //  - 拒绝只留给真正搬不出的情形：非 bitwise-takable、alignment>16、
 //    size>4096；拒绝行须写清判定依据（size/align/flags）。
+//  - 0.2.37：捕获型闭包（Swift 约定且 ctx 非空）一律拒绝——体内部可能读
+//    SwiftUI 图状态（StateObject/LazyState/environmentStores），图外直调
+//    即陷阱；能用的 Husk/Asspp 的 ctx 都是 0x0，Locus 的 ctx 非空即死因。
+//    Thin 闭包无上下文，不受此限。
 #import <Foundation/Foundation.h>
 
 NS_ASSUME_NONNULL_BEGIN

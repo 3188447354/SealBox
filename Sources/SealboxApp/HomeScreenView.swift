@@ -18,6 +18,10 @@ struct HomeScreenView: View {
     @ObservedObject private var store = SBStore.shared
     @AppStorage("vm.plugin.iconThemeDark") private var iconThemeDark = false
     @AppStorage("vm.settings.wallpaper") private var selectedWallpaper = 0
+    /// 0.2.37：自选墙纸版本号（存/删时 +1；HomeScreen 与墙纸页都监听它）。
+    @AppStorage("vm.settings.wallpaper.customVersion") private var customWallpaperVersion = 0
+    /// 当前自选墙纸图（无则 nil，走渐变墙纸）；进桌面与版本号变时重读文件。
+    @State private var customWallpaperImage: UIImage?
     @State private var pendingDelete: SBInstalledApp? = nil
     @State private var showDeleteConfirm = false
 
@@ -42,23 +46,34 @@ struct HomeScreenView: View {
 
     var body: some View {
         ZStack {
-            // Wallpaper: the selected option's gradient with soft color blobs.
-            LinearGradient(
-                colors: wallpaperColors,
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
-            .ignoresSafeArea()
-            Circle()
-                .fill((wallpaperColors.first ?? .blue).opacity(0.55))
-                .frame(width: 340, height: 340)
-                .blur(radius: 60)
-                .offset(x: -110, y: -260)
-            Circle()
-                .fill((wallpaperColors.last ?? .pink).opacity(0.45))
-                .frame(width: 300, height: 300)
-                .blur(radius: 70)
-                .offset(x: 130, y: 140)
+            // Wallpaper：有自选图时用用户自己的图（各页通用），没有时用选中的渐变。
+            if let customWallpaperImage {
+                Image(uiImage: customWallpaperImage)
+                    .resizable()
+                    .scaledToFill()
+                    .ignoresSafeArea()
+                // 轻遮罩：白字标签/白圆点在亮图上仍可读，图本身只暗一点。
+                Color.black.opacity(0.12)
+                    .ignoresSafeArea()
+            } else {
+                // Wallpaper: the selected option's gradient with soft color blobs.
+                LinearGradient(
+                    colors: wallpaperColors,
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+                .ignoresSafeArea()
+                Circle()
+                    .fill((wallpaperColors.first ?? .blue).opacity(0.55))
+                    .frame(width: 340, height: 340)
+                    .blur(radius: 60)
+                    .offset(x: -110, y: -260)
+                Circle()
+                    .fill((wallpaperColors.last ?? .pink).opacity(0.45))
+                    .frame(width: 300, height: 300)
+                    .blur(radius: 70)
+                    .offset(x: 130, y: 140)
+            }
 
             VStack(spacing: 0) {
                 // Clear the real system status bar / Dynamic Island.
@@ -134,6 +149,14 @@ struct HomeScreenView: View {
                 .padding(.horizontal, 12)
                 .padding(.bottom, 8)
             }
+        }
+        .onAppear {
+            // 0.2.37：进桌面（与从客回桌面）时重读自选墙纸——文件在即显示，
+            // 文件没了（删了/没选过）即回渐变。
+            customWallpaperImage = VMCustomWallpaper.loadImage()
+        }
+        .onChange(of: customWallpaperVersion) { _, _ in
+            customWallpaperImage = VMCustomWallpaper.loadImage()
         }
     }
 

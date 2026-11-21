@@ -24,5 +24,22 @@ enum VMApp: Hashable {
 /// standard UserDefaults directly — nothing here depends on it anymore.
 final class VMState: ObservableObject {
     @Published var openApp: VMApp?
-    @Published var homePage: Int = 0
+    /// 0.2.37：桌面页码持久化（MJ 22:35：每次进 SealBox 都默认第一页，改成有记忆的）。
+    /// 桌面只有 0/1 两页，越界值钳到 0；每次翻页/点圆点都写盘，进 SealBox 与从客回
+    /// 桌面都恢复上次所在页。UserDefaults 标准域（桌面状态只属宿主，不进 App Group）。
+    @Published var homePage: Int {
+        didSet {
+            let clamped = (homePage == 1) ? 1 : 0
+            if clamped != homePage {
+                homePage = clamped
+                return
+            }
+            UserDefaults.standard.set(homePage, forKey: "vm.homePage")
+        }
+    }
+
+    init() {
+        let stored = UserDefaults.standard.integer(forKey: "vm.homePage")
+        homePage = (stored == 1) ? 1 : 0
+    }
 }

@@ -155,6 +155,14 @@ public enum SBCertificate {
     public struct SBCertificateInfo {
         /// 主体（SecCertificateCopySubjectSummary），如 "iPhone Developer: xxx (TEAMID)"。
         public let subject: String?
+        /// 0.2.37：叶子证书里的账号名——主体去掉 "iPhone Developer: " 前缀与
+        /// 末尾 " (TEAMID)" 后的部分；免费号的 CN 就是 Apple ID 邮箱时它进
+        /// accountEmail 不进这里，付费/企业号的 CN 是人名或公司名时进这里。
+        /// 取不到即 nil，不编。
+        public let accountName: String?
+        /// 0.2.37：叶子证书里的 Apple ID 邮箱——免费号的 CN 本身就是邮箱
+        ///（如 mjorb@foxmail.com）；付费号的 CN 是人名、证书里没有邮箱时为 nil。
+        public let accountEmail: String?
         /// 颁发者：证书 DER 里 issuer 的 CN（如
         /// "Apple Worldwide Developer Relations Certification Authority"）。
         /// iOS SDK 不暴露 SecCertificateCopyValues（macOS 才有），改从 DER 解析。
@@ -167,6 +175,25 @@ public enum SBCertificate {
         public let teamID: String?
         /// 导入日期（App Group UserDefaults 的 SBCertificateImportedDate）。
         public let importedDate: Date?
+    }
+
+    /// 从主体摘要里拆账号名/邮箱：去前缀 "iPhone Developer: "（或
+    /// "iPhone Distribution: "）与后缀 " (TEAMID)"；剩下的含 @ 即 Apple ID
+    /// 邮箱（免费号），否则是人名/公司名（付费号，证书里没有邮箱）。
+    /// 拆不出（格式不对）返回 (nil, nil)，调用方不显示，不编。
+    public static func accountFromSubjectSummary(_ summary: String) -> (name: String?, email: String?) {
+        var text = summary
+        if let colon = text.firstIndex(of: ":") {
+            text = String(text[text.index(after: colon)...]).trimmingCharacters(in: .whitespaces)
+        }
+        if text.hasSuffix(")"), let paren = text.lastIndex(of: "(") {
+            text = String(text[..<paren]).trimmingCharacters(in: .whitespaces)
+        }
+        guard !text.isEmpty else { return (nil, nil) }
+        if text.contains("@") {
+            return (nil, text)
+        }
+        return (text, nil)
     }
 
     /// 读当前证书的真实信息。无证书、读不到文件、钥匙串无密码、p12 解不开
@@ -210,8 +237,11 @@ public enum SBCertificate {
             teamID = teamIDFromSubjectSummary(summary)
         }
         let imported = sharedDefaults?.object(forKey: importedDateKey) as? Date
+        let account = subject.map { Self.accountFromSubjectSummary($0) } ?? (name: nil, email: nil)
         return SBCertificateInfo(
             subject: subject,
+            accountName: account.name,
+            accountEmail: account.email,
             issuer: issuer,
             expirationDate: expiration,
             teamID: teamID,
