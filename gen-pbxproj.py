@@ -17,7 +17,7 @@ Transformations applied to the base (0.2.0 step 1: container skeleton):
      owns its own home screen / settings UI) with every reference to them.
   3. IPHONEOS_DEPLOYMENT_TARGET 15.0 -> 16.0 (project + all 3 targets,
      Debug + Release).
-  4. App target: MARKETING_VERSION 0.2.34, CURRENT_PROJECT_VERSION 44,
+  4. App target: MARKETING_VERSION 0.2.35, CURRENT_PROJECT_VERSION 45,
      INFOPLIST_KEY_CFBundleDisplayName "虚拟机" (quoted, as the shell had
      it), iPhone orientations back to portrait-only
      (the 0.1.1 base allowed iPhone landscape; the shell does not).
@@ -152,9 +152,9 @@ def transform_pbxproj(base):
         end += len("\n\t\t};")
         block = text[start:end]
         block = replace_once(block, "MARKETING_VERSION = 0.1.1;",
-                             "MARKETING_VERSION = 0.2.34;", cfg)
+                             "MARKETING_VERSION = 0.2.35;", cfg)
         block = replace_once(block, "CURRENT_PROJECT_VERSION = 2;",
-                             "CURRENT_PROJECT_VERSION = 44;", cfg)
+                             "CURRENT_PROJECT_VERSION = 45;", cfg)
         block = replace_once(block,
                              "INFOPLIST_KEY_CFBundleDisplayName = Sealbox;",
                              "INFOPLIST_KEY_CFBundleDisplayName = \"虚拟机\";",
@@ -321,10 +321,10 @@ def self_check(pbxproj, scheme):
         errors.append("Via IPA not in Resources build phase files")
 
     # Version / target markers.
-    if pbxproj.count("MARKETING_VERSION = 0.2.34;") != 2:
-        errors.append("MARKETING_VERSION 0.2.34 not in both app configs")
-    if pbxproj.count("CURRENT_PROJECT_VERSION = 44;") != 2:
-        errors.append("CURRENT_PROJECT_VERSION 44 not in both app configs")
+    if pbxproj.count("MARKETING_VERSION = 0.2.35;") != 2:
+        errors.append("MARKETING_VERSION 0.2.35 not in both app configs")
+    if pbxproj.count("CURRENT_PROJECT_VERSION = 45;") != 2:
+        errors.append("CURRENT_PROJECT_VERSION 45 not in both app configs")
     if pbxproj.count("IPHONEOS_DEPLOYMENT_TARGET = 16.0;") != 8:
         errors.append("deployment target 16.0 not x8")
     if "IPHONEOS_DEPLOYMENT_TARGET = 15.0;" in pbxproj:

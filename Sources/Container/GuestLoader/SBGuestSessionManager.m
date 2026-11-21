@@ -255,7 +255,16 @@ static const NSTimeInterval SBGuestSceneSystemPathWaitSeconds = 0.4;
 }
 
 /// 手动路：在宿主 scene 上换入客 scene delegate、调 willConnect，让客建窗。
+/// 0.2.35：全程记日志——0.2.34 真机 MediaStormCamera 两回都在“走手动
+/// willConnect”后断住、进程以 -crashed 结尾，本方法入口无日志，死在哪一步
+/// 无从判断。下份日志必须能证明窗出没出：每一步都有行；死在 willConnect 内
+/// 的特征是“调用…”行之后无“已返回”行（Swift trap 不是 NSException，
+/// @try/@catch 抓不住，只能靠前后两行定位）。
+/// 本方法只在主线程跑（0.4 秒补查经 dispatch_get_main_queue() 调度，
+/// activateGuestWithContext 入口亦有主线程守卫），willConnect 的线程无问题。
 - (void)driveSceneManuallyForSession:(SBGuestSession *)session {
+    SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 手动 willConnect：入口（客窗已有=%@）",
+                    session.bundleID, session.guestWindow ? @"是" : @"否"] UTF8String]);
     if (session.guestWindow) {
         return;
     }
@@ -265,6 +274,14 @@ static const NSTimeInterval SBGuestSceneSystemPathWaitSeconds = 0.4;
         return;
     }
     UISceneSession *sceneSession = scene.session;
+    if (!sceneSession) {
+        // 0.2.35：nil session 传给 Swift 写的 scene delegate，若其强解会陷阱
+        // 杀进程，且 @try 抓不住——宁可干净失败，不传 nil 进去。
+        [self failActivationForSession:session message:@"宿主 scene 无会话，无法为客 App 创建窗口（scene.session 为空）"];
+        return;
+    }
+    SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 手动 willConnect：宿主 scene 与 session 就绪",
+                    session.bundleID] UTF8String]);
     // 空 options：UISceneConnectionOptions 的 -init 被标 NS_UNAVAILABLE
     //（只有系统才造它），但实现仍在——NS_UNAVAILABLE 只是编译期标记，
     // 用 objc_msgSend 绕过它直接调运行时 -init（0.2.27 fixup 5，
@@ -299,6 +316,8 @@ static const NSTimeInterval SBGuestSceneSystemPathWaitSeconds = 0.4;
                                message:@"客 App 未提供 scene 配置，无法创建窗口"];
         return;
     }
+    SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 手动 willConnect：scene 配置已取（delegate 类 %@）",
+                    session.bundleID, NSStringFromClass(config.delegateClass)] UTF8String]);
     id sceneDelegate = [[config.delegateClass alloc] init];
     if (!sceneDelegate) {
         [self failActivationForSession:session message:@"客 scene delegate 创建失败"];
@@ -306,9 +325,18 @@ static const NSTimeInterval SBGuestSceneSystemPathWaitSeconds = 0.4;
     }
     session.guestSceneDelegate = sceneDelegate;
     scene.delegate = sceneDelegate;
+    SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 手动 willConnect：客 scene delegate 已创建并挂到宿主 scene",
+                    session.bundleID] UTF8String]);
     @try {
         if ([sceneDelegate respondsToSelector:@selector(scene:willConnectToSession:options:)]) {
+            SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 手动 willConnect：调用客 scene delegate willConnect（%@）",
+                            session.bundleID, NSStringFromClass([sceneDelegate class])] UTF8String]);
             [sceneDelegate scene:scene willConnectToSession:sceneSession options:options];
+            SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 手动 willConnect：客 scene delegate willConnect 已返回",
+                            session.bundleID] UTF8String]);
+        } else {
+            SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 手动 willConnect：客 scene delegate 未实现 willConnect，跳过调用直接找窗",
+                            session.bundleID] UTF8String]);
         }
     } @catch (NSException *exception) {
         SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ scene willConnect 抛异常（%@）",
@@ -317,6 +345,8 @@ static const NSTimeInterval SBGuestSceneSystemPathWaitSeconds = 0.4;
                                message:[NSString stringWithFormat:@"客 App 创建窗口失败（%@）", exception.reason ?: @"未知原因"]];
         return;
     }
+    SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 手动 willConnect：willConnect 结束，开始找客窗",
+                    session.bundleID] UTF8String]);
     UIWindow *guestWindow = [self findGuestWindowForSession:session];
     if (guestWindow) {
         [self completeActivationForSession:session];
