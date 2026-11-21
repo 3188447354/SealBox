@@ -375,7 +375,7 @@ static const NSTimeInterval SBGuestSceneSystemPathWaitSeconds = 0.4;
                             NSStringFromClass([app.delegate class]),
                             sceneSession.configuration.name ?: @"无",
                             sceneSession.configuration.delegateClass ? NSStringFromClass(sceneSession.configuration.delegateClass) : @"无",
-                            (unsigned long)options.urlContexts.count,
+                            (unsigned long)options.URLContexts.count,
                             (unsigned long)options.userActivities.count,
                             app.keyWindow ? @"有" : @"无",
                             (unsigned long)app.connectedScenes.count] UTF8String]);
