@@ -55,13 +55,38 @@ func buildDelegateFromAdaptorTypeName(_ adaptorTypeName: String, appType: Any.Ty
     return nil
 }
 
-/// 在一个值里递归找根视图：本身是 View 即取；否则 Mirror 钻子项——闭包调后
-/// 是 View 即取，或继续钻；深度 ≤3。title 之类已在上层跳过。
+/// 在一个值里递归找根视图：本身是 View 即取；闭包经 C 层调后是 View 即取；
+/// 否则 Mirror 钻子项；深度 ≤3。title 之类已在上层跳过。
 /// 找不到返回 nil（调用方按失败处理，不抛异常）。
 func findRootView(in value: Any, depth: Int, path: String) -> (any View)? {
     if let view = value as? any View {
         SBDiagLog.log("SwiftUI 嵌客：\(path) 本身是 View（\(String(describing: type(of: value)))），当根视图")
         return view
+    }
+    // 0.2.34：闭包值本身——Mirror 在闭包值上不显示子项（0.2.33 真机：
+    // content.lazy 是 () -> SceneBridgeReader<...>，下一行却是“无子项，
+    // 不是 View/闭包”），且 `as? () -> Any` 对具体返回类型的闭包强转失败
+    // （函数类型强转要求精确匹配，无协变）。故按类型串识别函数值（类型串含
+    // "->"）并经 C 层（SBSwiftClosureCall）按 Swift ABI 调用；调后验结果是 View。
+    // 闭包分支放在“无子项”守卫之前：闭包值本身就是目标，不是钻取的死角。
+    let typeName = String(describing: type(of: value))
+    if typeName.contains("->") {
+        SBDiagLog.log("SwiftUI 嵌客：\(path) 是闭包（\(typeName)），经 C 层调用")
+        var result: Any = 0
+        var errBuf = [CChar](repeating: 0, count: 256)
+        let ok = withUnsafePointer(to: value) { ptr in
+            SBCallSwiftClosure(UnsafeRawPointer(ptr), &result, &errBuf, errBuf.count)
+        }
+        if ok {
+            if let view = result as? any View {
+                SBDiagLog.log("SwiftUI 嵌客：闭包调用得 View（\(path)，结果 \(String(describing: type(of: result)))）")
+                return view
+            }
+            SBDiagLog.log("SwiftUI 嵌客：闭包调用结果不是 View（\(path)，结果 \(String(describing: type(of: result)))）")
+            return nil
+        }
+        SBDiagLog.log("SwiftUI 嵌客：闭包调用被拒（\(path)：\(String(cString: errBuf))）")
+        return nil
     }
     guard depth < 3 else {
         SBDiagLog.log("SwiftUI 嵌客：\(path) 钻取到深度上限，停")
@@ -77,14 +102,6 @@ func findRootView(in value: Any, depth: Int, path: String) -> (any View)? {
         let childPath = "\(path).\(label)"
         let childTypeName = String(describing: type(of: child.value))
         SBDiagLog.log("SwiftUI 嵌客：钻取 \(childPath)：\(childTypeName)")
-        if let contentFn = child.value as? () -> Any {
-            if let view = contentFn() as? any View {
-                SBDiagLog.log("SwiftUI 嵌客：闭包调用得 View（\(childPath)）")
-                return view
-            }
-            SBDiagLog.log("SwiftUI 嵌客：闭包调用结果不是 View（\(childPath)）")
-            continue
-        }
         if let view = findRootView(in: child.value, depth: depth + 1, path: childPath) {
             return view
         }

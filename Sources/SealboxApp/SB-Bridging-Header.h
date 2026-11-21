@@ -7,6 +7,7 @@
 
 #import "SBGuestLoader.h"
 #import "SBGuestMainHook.h"
+#import "SBSwiftClosureCall.h"
 #import "SBGuestSessionManager.h"
 #import "SBGuestUIClassifier.h"
 #import "SBSigner.h"
