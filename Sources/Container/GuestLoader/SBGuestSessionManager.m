@@ -691,11 +691,11 @@ static Class SBGuestClassNamedForSession(NSString *className, SBGuestSession *se
         if (config && plistConfig && plistConfig.delegateClass) {
             config.delegateClass = plistConfig.delegateClass;
             SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ scene 配置合并（delegate 给了空壳配置，delegate 类 %@ 取自 Info.plist）",
-                            context.bundleID, NSStringFromClass(plistConfig.delegateClass)] UTF8String]);
+                            session.bundleID, NSStringFromClass(plistConfig.delegateClass)] UTF8String]);
         } else if (!config && plistConfig) {
             config = plistConfig;
             SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ scene 配置已取（plist，delegate 类 %@）",
-                            context.bundleID, NSStringFromClass(plistConfig.delegateClass)] UTF8String]);
+                            session.bundleID, NSStringFromClass(plistConfig.delegateClass)] UTF8String]);
         }
     }
     if (!config || !config.delegateClass) {
@@ -709,12 +709,12 @@ static Class SBGuestClassNamedForSession(NSString *className, SBGuestSession *se
         id guestDelegate = session.guestAppDelegate;
         if (guestDelegate && [guestDelegate respondsToSelector:@selector(applicationDidBecomeActive:)]) {
             SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 回退链(c)：无窗且无配置，补调 applicationDidBecomeActive: 一次",
-                            context.bundleID] UTF8String]);
+                            session.bundleID] UTF8String]);
             @try {
                 [guestDelegate applicationDidBecomeActive:[UIApplication sharedApplication]];
             } @catch (NSException *exception) {
                 SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 回退链(c) 补调异常（%@），停",
-                                context.bundleID, exception.name] UTF8String]);
+                                session.bundleID, exception.name] UTF8String]);
             }
             if ([self adoptGuestWindowForSession:session]) {
                 return;
