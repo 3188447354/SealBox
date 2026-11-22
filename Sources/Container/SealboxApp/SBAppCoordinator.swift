@@ -388,9 +388,14 @@ final class SBAppCoordinator: ObservableObject {
                 // 不是期望唯一名（0.2.43 及以前装的包是裸 basename，Guoguo
                 // 碰撞的根因）。patchRevision 已是当前值、但安装名仍是旧
                 // 的包（例如 0.2.44 装完又被外部改过）同样触发重打补丁。
+                // 0.2.45：再扩 rev 4 损坏指纹——主程序引用仍含
+                // "@rpath/<bundleID>/" 前缀的包（0.2.44 打坏的 4 个客：
+                // patchRevision 已是 4、主程序 ID 也是正确的唯一名，上面
+                // 两道门都看不见），触发重打补丁＋逆向修复＋重签。
                 if SBCertificate.hasCertificate,
                    app.patchRevision < SBConstants.patchRevision
-                   || SBInstaller.installNameNeedsRepair(app) {
+                   || SBInstaller.installNameNeedsRepair(app)
+                   || SBInstaller.namespaceNeedsRepair(app) {
                     appToLaunch = try await SBInstaller.repatchInstalledApp(app)
                 }
                 // 0.2.8：启动前签名修复门。patchRevision 已是当前值也不等于

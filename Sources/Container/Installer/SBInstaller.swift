@@ -131,11 +131,29 @@ public enum SBInstaller {
                     reason: "可执行文件没有足够空间插入 LC_ID_DYLIB，装了也打不开")
             }
             // 0.2.44（B-2）：整包命名空间——只修主程序不够，framework 的
-            // 安装名与引用也要同步改唯一名，否则 App.framework 还会串味。
-            // 在重签之前跑（改加载命令会使签名失效）。
+            // 安装名也要改唯一名，否则 App.framework 还会串味。
+            // 0.2.45 修正：只改 LC_ID_DYLIB，引用绝不能改（引用是路径模板；
+            // 0.2.44 把引用同步改唯一名却没改磁盘布局，4 个客 dlopen 当场
+            // 失败）。在重签之前跑（改加载命令会使签名失效）。
             var namespaceWarnings: Int32 = 0
             let namespaceChanged = SBLCPatchBundleNamespace(destinationDir.path, executablePath, parsed.bundleID, &namespaceWarnings)
             SBDiagLog.log("安装命名空间改写：\(parsed.bundleID) 改写 \(namespaceChanged) 个文件\(namespaceWarnings > 0 ? "，\(namespaceWarnings) 处改不了（已记警告，原样留着）" : "")")
+            // 0.2.45：离线断言——改写后逐条 framework 引用按 LC_RPATH 展开
+            // 必须在包内存在，否则安装拒绝。0.2.44 的警告机制对“改成功了
+            // 但改错了”完全失明（全部改写成功、零警告，包却是坏的）。
+            var firstBadRef = [CChar](repeating: 0, count: 512)
+            let unresolvedRefs = firstBadRef.withUnsafeMutableBufferPointer { buf in
+                SBLCVerifyFrameworkReferences(destinationDir.path, executablePath, buf.baseAddress, buf.count)
+            }
+            if unresolvedRefs > 0 {
+                let badRef = firstBadRef.withUnsafeBufferPointer { buf in
+                    buf.baseAddress.map { String(cString: $0) } ?? ""
+                }
+                SBDiagLog.log("安装拒绝：\(parsed.bundleID) 改写后 \(unresolvedRefs) 条 framework 引用按 LC_RPATH 展开在包内不存在（首条：\(badRef)）")
+                throw SBError.patchFailed(reason: "改写后 \(unresolvedRefs) 条 framework 引用在包内找不到文件（首条：\(badRef)），安装已拒绝")
+            } else if unresolvedRefs < 0 {
+                SBDiagLog.log("安装引用校验失败：\(parsed.bundleID) 读 Mach-O 失败（仅记日志，不拦安装）")
+            }
             // 0.2.17：全包 arm64e 修正改用 LC 原样函数
             // （LCPatchAppBundleFixupARM64eSlice，见 SBLCPatcher.m）。
             // 尽力而为：某文件失败不阻塞安装。
@@ -343,8 +361,8 @@ public enum SBInstaller {
     /// 重签 + 主程序 / appex 各用自己的 entitlements 再签一次（与安装
     /// 同款）。成功后把记录的 patchRevision 升到当前值并入库。
     ///
-    /// 失败时把主可执行文件从备份还原（打补丁改过的文件原样还原），
-    /// 记录不动，调用方按错误提示用户，不启动。
+    /// 失败时把整个 .app 目录从备份还原（逆向修复动全部 framework 二进制，
+    /// 只备份主程序没有还原路），记录不动，调用方按错误提示用户，不启动。
     /// - Returns: 更新后的安装记录。
     static func repatchInstalledApp(_ record: SBInstalledApp) async throws -> SBInstalledApp {
         let fileManager = FileManager.default
@@ -382,15 +400,16 @@ public enum SBInstaller {
                 throw SBError.teamMismatch(guestTeam: certTeamID, hostTeam: nil)
             }
         }
-        // 先备份主可执行文件：打补丁会使原签名失效，之后任一步失败都把
-        // 备份还原，应用回到重打补丁前的状态（而不是留一个签坏的包）。
+        // 0.2.45：先备份整个 .app 目录——逆向修复动全部 framework 二进制，
+        // 只备份主程序没有还原路。打补丁会使原签名失效，之后任一步失败都把
+        // 整包还原，应用回到重打补丁前的状态（而不是留一个签坏的包）。
         let backupURL = fileManager.temporaryDirectory
-            .appendingPathComponent("SBRepatchBackup-\(UUID().uuidString)")
+            .appendingPathComponent("SBRepatchBackup-\(UUID().uuidString).app", isDirectory: true)
         do {
-            try fileManager.copyItem(atPath: executablePath, toPath: backupURL.path)
+            try fileManager.copyItem(atPath: appPath, toPath: backupURL.path)
         } catch {
-            SBDiagLog.log("重打补丁备份失败：[code=\(Self.errorCode(of: error))] \(record.bundleID) \(executablePath) 错误：\(error.localizedDescription)")
-            throw SBError.patchFailed(reason: "备份可执行文件失败")
+            SBDiagLog.log("重打补丁备份失败：[code=\(Self.errorCode(of: error))] \(record.bundleID) \(appPath) 错误：\(error.localizedDescription)")
+            throw SBError.patchFailed(reason: "备份应用包失败")
         }
         defer { try? fileManager.removeItem(at: backupURL) }
 
@@ -413,6 +432,10 @@ public enum SBInstaller {
             // 0.2.44（B-1/B-2）：重打补丁也带客 bundleID（唯一安装名），
             // 再跑整包命名空间（已装旧包的 LC_ID_DYLIB 是裸 basename，
             // 命名空间改写把它改成唯一名——B-3 修复门就靠这个触发条件）。
+            // 0.2.45：顺序关键——先跑修正后的命名空间（只改 ID），再跑
+            // rev 4 逆向修复（把 "@rpath/<bundleID>/<Fw>.framework/<Fw>"
+            // 引用改回原样），绝不能反过来；逆向后走同一套重签＋复验。
+            // 客数据容器与钥匙串不动（只动 .app 包内二进制）。
             let patchResult = SBLCPatchExecutableForGuest(executablePath, 1, &segMismatch, record.bundleID)
             guard patchResult == SB_LC_PATCH_OK else {
                 throw patchError(for: patchResult)
@@ -425,6 +448,24 @@ public enum SBInstaller {
             var namespaceWarnings: Int32 = 0
             let namespaceChanged = SBLCPatchBundleNamespace(appPath, executablePath, record.bundleID, &namespaceWarnings)
             SBDiagLog.log("重打补丁命名空间改写：\(record.bundleID) 改写 \(namespaceChanged) 个文件\(namespaceWarnings > 0 ? "，\(namespaceWarnings) 处改不了（已记警告，原样留着）" : "")")
+            var repairWarnings: Int32 = 0
+            let repairChanged = SBLCRepairRev4Namespace(appPath, executablePath, record.bundleID, &repairWarnings)
+            SBDiagLog.log("重打补丁 rev 4 逆向修复：\(record.bundleID) 改写 \(repairChanged) 个文件\(repairWarnings > 0 ? "，\(repairWarnings) 处改不了（已记警告）" : "（0 个文件 = 本包未被 rev 4 打坏）")")
+            // 0.2.45：离线断言——逆向修复后逐条 framework 引用按 LC_RPATH
+            // 展开必须在包内存在，否则重打补丁拒绝（外层 catch 整包还原）。
+            var firstBadRef = [CChar](repeating: 0, count: 512)
+            let unresolvedRefs = firstBadRef.withUnsafeMutableBufferPointer { buf in
+                SBLCVerifyFrameworkReferences(appPath, executablePath, buf.baseAddress, buf.count)
+            }
+            if unresolvedRefs > 0 {
+                let badRef = firstBadRef.withUnsafeBufferPointer { buf in
+                    buf.baseAddress.map { String(cString: $0) } ?? ""
+                }
+                SBDiagLog.log("重打补丁拒绝：\(record.bundleID) 修复后仍有 \(unresolvedRefs) 条 framework 引用在包内找不到文件（首条：\(badRef)）")
+                throw SBError.patchFailed(reason: "修复后仍有 \(unresolvedRefs) 条 framework 引用在包内找不到文件（首条：\(badRef)），重打补丁已拒绝")
+            } else if unresolvedRefs < 0 {
+                SBDiagLog.log("重打补丁引用校验失败：\(record.bundleID) 读 Mach-O 失败（仅记日志，不拦重打补丁）")
+            }
             SBLCFixupBundleARM64e(appPath)
             // 0.2.17：appex 也按 LC 的方法打补丁（同安装路径，doInject=false）。
             for appexPath in appexExecutablePaths(appPath: appPath) {
@@ -468,24 +509,22 @@ public enum SBInstaller {
             // verifyExecutableSignature 注释）。
             try verifyExecutableSignature(executablePath, bundleID: record.bundleID, checkTeam: true)
         } catch {
-            // 任一步失败：主可执行文件还原，记录不动。
+            // 任一步失败：整个 .app 目录还原，记录不动。
             // 还原本身也是尽力而为：先做再记，日志里的“已还原/还原失败”
             // 按实际结果写，不许先报成功。
             var restored = false
             do {
-                if fileManager.fileExists(atPath: executablePath) {
-                    _ = try fileManager.replaceItemAt(
-                        URL(fileURLWithPath: executablePath), withItemAt: backupURL)
-                } else {
-                    try fileManager.copyItem(atPath: backupURL.path, toPath: executablePath)
+                if fileManager.fileExists(atPath: appPath) {
+                    try fileManager.removeItem(atPath: appPath)
                 }
+                try fileManager.copyItem(atPath: backupURL.path, toPath: appPath)
                 restored = true
             } catch {
                 restored = false
             }
             // 0.2.10 报错日志：打补丁/重签/验签任一步失败都在这里记
             // 一行（错误码 + bundle ID + 路径 + 原因 + 还原结果）。
-            SBDiagLog.log("重打补丁失败：[code=\(Self.errorCode(of: error))] \(record.bundleID) \(executablePath) 错误：\(error.localizedDescription)（备份\(restored ? "已还原" : "还原失败")，记录不动）")
+            SBDiagLog.log("重打补丁失败：[code=\(Self.errorCode(of: error))] \(record.bundleID) \(appPath) 错误：\(error.localizedDescription)（整包备份\(restored ? "已还原" : "还原失败")，记录不动）")
             throw error
         }
 
@@ -891,6 +930,16 @@ public enum SBInstaller {
                 SBDiagLog.log("签名修复门：\(record.bundleID) \(executablePath) 内核验签通过但安装名不是期望唯一名，走重打补丁")
                 return try await repatchInstalledApp(record)
             }
+            // 0.2.45：rev 4 损坏指纹——主程序引用仍含 "@rpath/<bundleID>/"
+            // 前缀（0.2.44 打坏的 4 个客：内核验签通过、主程序 ID 也是正确的
+            // 唯一名，B-3 门看不见，必须靠这道指纹触发重打补丁＋逆向修复）。
+            if namespaceNeedsRepair(record) {
+                guard canRepair else {
+                    throw SBError.patchFailed(reason: "主程序仍有 rev 4 改坏的 framework 引用，且未导入证书，无法重打补丁修复")
+                }
+                SBDiagLog.log("签名修复门：\(record.bundleID) \(executablePath) 内核验签通过但主程序仍有 rev 4 损坏引用，走重打补丁")
+                return try await repatchInstalledApp(record)
+            }
             return clearedSignatureFailure(record)
         }
         // 内核不认，或上次实测死在 dlopen 签名失败（守卫②）：重签。
@@ -1006,6 +1055,14 @@ public enum SBInstaller {
             SBDiagLog.log("签名修复门：\(record.bundleID) 安装名不是期望唯一名（当前=\(current)），触发重打补丁")
         }
         return needsRepair
+    }
+
+    /// 0.2.45：rev 4 损坏的直接指纹——主程序仍有含 "@rpath/<bundleID>/"
+    /// 前缀的 framework 引用（0.2.44 的命名空间改写把引用改成唯一名却没改
+    /// 磁盘布局）。launchApp 门与签名修复门都认它；逆向修复成功后指纹消失，
+    /// 门自动不再触发。读不到主程序时返回 false（不以此为由触发）。
+    static func namespaceNeedsRepair(_ record: SBInstalledApp) -> Bool {
+        SBLCNamespaceNeedsRepair(record.executableURL.path, record.bundleID) != 0
     }
 
     // MARK: - 0.2.44（F2）：熔断前置检查

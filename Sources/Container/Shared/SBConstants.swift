@@ -45,7 +45,11 @@ enum SBConstants {
     /// 每客唯一名（主程序 "<bundleID>/<basename>"，framework
     /// "@rpath/<bundleID>/<Fw>.framework/<Fw>"）；已装旧包下次点图标
     /// 触发重打补丁＋命名空间改写＋重签（见 launchApp／签名修复门）。
-    static let patchRevision = 4
+    /// 0.2.45：B-2 的引用改写是错的（引用是路径模板，改了却没改磁盘布局，
+    /// 4 个客 dlopen 当场失败）——命名空间只改 ID、不改引用；rev 4 已打坏
+    /// 的客下次点图标触发重打补丁＋逆向修复＋重签（见 repatchInstalledApp，
+    /// 顺序：先 ID 改写、后逆向修复，绝不能反）。
+    static let patchRevision = 5
 
     /// 钥匙串半隔离组数（与 entitlements.xml 的 128 组一致）。
     static let keychainGroupCount = 128

@@ -50,18 +50,27 @@ int32_t SBLCPatchExecutableForGuest(const char *path, int doInject,
 /// - Returns: 读到时返回 1 并写 *nameOut（NUL 结尾）；否则返回 0。
 int SBMachOIDDylibName(const char *path, char *nameOut, size_t nameOutSize);
 
-/// 整包命名空间改写（0.2.44 B-2）：只修主程序不够——Guoguo 的
+/// 整包命名空间改写（0.2.44 B-2，0.2.45 修正）：只修主程序不够——Guoguo 的
 /// App.framework 与 OmoFun 的 App.framework 安装名同为
 /// "@rpath/App.framework/App"，dyld 按安装名去重会串味。本函数把包内
-/// 全部 framework 的 LC_ID_DYLIB 改写为每客唯一名，并把主程序与各
-/// framework 之间的 LC_LOAD_DYLIB／WEAK／REEXPORT 引用同步改写。
+/// 全部 framework 的 LC_ID_DYLIB 改写为每客唯一名；主程序 ID 由 B-1
+///（SBLCPatchExecutableForGuest）写唯一名。
 /// 唯一名：主程序 "<bundleID>/<basename>"；framework
 /// "@rpath/<bundleID>/<Fw>.framework/<Fw>"。
+/// 引用绝不能改（0.2.45）：LC_LOAD_DYLIB／WEAK／REEXPORT 的 @rpath 引用
+/// 是路径模板，只决定“去哪找文件”，不决定身份；去重靠 LC_ID_DYLIB。
+/// 0.2.44 曾把引用同步改成 "@rpath/<bundleID>/<Fw>.framework/<Fw>"，
+/// 却既没在磁盘上建 Frameworks/<bundleID>/ 子目录、没移动任何 framework
+/// 文件，也没加任何 LC_RPATH——已改的引用按未变的 LC_RPATH 展开永远找
+/// 不到文件，4 个客当场 dlopen 失败（Library not loaded；OmoFun 离线
+/// 实证：改写前 35/35 引用可解析，改写后 0/35）。引用保持原样
+/// "@rpath/<Fw>.framework/<Fw>" 时 dyld 从磁盘正确加载本客文件；另一客
+/// 引用同一 framework 名时，按安装名查不到本客的唯一 ID，便按自己的
+/// 路径加载，不串味。
 /// 改写规则：新串塞得进原命令名域就地写；塞不进且命令表后有空闲（到
 /// __text 的空隙）就扩命令、后移命令表；实在改不了就原样留着并记一条
-/// 警告（不报错——dyld 按安装名匹配已加载镜像，未改的 @rpath 引用永远
-/// 匹配不到别客的唯一名，只会从磁盘正确加载本客文件；主程序 ID 实在
-/// 写不进完整唯一名时退到 6 位 djb2 短名就地写，仍是每客唯一）。
+/// 警告（不报错；主程序 ID 实在写不进完整唯一名时退到 6 位 djb2 短名
+/// 就地写，仍是每客唯一）。
 /// 在主程序打补丁之后、重签之前调（安装与重打补丁两路都要调）。
 /// - Parameters:
 ///   - bundlePath: .app 包路径；execPath: 主可执行文件路径；bundleID: 客 bundleID。
@@ -69,6 +78,34 @@ int SBMachOIDDylibName(const char *path, char *nameOut, size_t nameOutSize);
 /// - Returns: 改写过的文件数；<0 表示致命 I/O 错误（包目录读不出）。
 int SBLCPatchBundleNamespace(const char *bundlePath, const char *execPath,
                              const char *bundleID, int *warningsOut);
+
+/// 逆向修复 0.2.44 rev 4 的引用改写（0.2.45）：把包内主程序＋全部
+/// framework 二进制里所有 "@rpath/<bundleID>/<Fw>.framework/<Fw>" 形式的
+/// LC_LOAD_DYLIB／WEAK／REEXPORT 引用改回 "@rpath/<Fw>.framework/<Fw>"；
+/// framework 的 LC_ID_DYLIB 保持唯一名不动（修法 A 的终态）。
+/// 逆向只缩短字符串，走就地写。调用顺序关键：先跑修正后的
+/// SBLCPatchBundleNamespace（只改 ID），再跑本函数。
+/// - Returns: 改写过的文件数；<0 表示致命 I/O 错误。
+int SBLCRepairRev4Namespace(const char *bundlePath, const char *execPath,
+                            const char *bundleID, int *warningsOut);
+
+/// rev 4 损坏的直接指纹（0.2.45）：主程序是否仍有含
+/// "@rpath/<bundleID>/" 前缀的 framework 引用。launchApp 门与签名修复门
+/// 都认它；逆向修复成功后指纹消失，门自动不再触发。
+/// - Returns: 有损坏引用返回 1，否则返回 0（读不到主程序时也返回 0）。
+int SBLCNamespaceNeedsRepair(const char *execPath, const char *bundleID);
+
+/// 离线断言（0.2.45）：改写后逐条 "@rpath/<Fw>.framework/<Fw>" 形式的
+/// 引用按引用文件的 LC_RPATH 展开必须在包内存在，否则安装／重打补丁拒绝。
+/// @rpath/*.dylib 系统库引用不在包内，不查；WEAK 引用只在引用的 framework
+/// 随包发布时查（弱引用缺件是 dyld 容忍的合法情形）。
+/// 展开用引用文件自己的 LC_RPATH ＋主程序的 LC_RPATH（dyld 解析 framework
+/// 引用时主程序 LC_RPATH 也兜底；只用引用文件自己的会把 0.2.43 能开的包误判）。
+/// - Parameters:
+///   - firstBadOut: 可为 NULL；非 NULL 时写首条未解析引用的原串。
+/// - Returns: 未解析的引用条数；0 = 全过；<0 表示致命 I/O 错误。
+int SBLCVerifyFrameworkReferences(const char *bundlePath, const char *execPath,
+                                  char *firstBadOut, size_t firstBadOutSize);
 
 /// 对一个 Mach-O 可执行文件打补丁（原地修改），做法与 LC 的
 /// patchExecAndSignIfNeedWithCompletionHandler（LCAppInfo.m:326-340）一致：
