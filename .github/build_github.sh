@@ -1,3 +1,156 @@
+# CI code signing (self-signed identity, SealBox flow)
+# ------------------------------------------------------
+# The archive Xcode produces is only ad-hoc signed (empty CMS slot), so
+# the plain IPA cannot be installed as-is. Re-sign the app with a CI-only
+# self-signed certificate here, inside this script, because this script
+# owns both packaging points: the plain "$scheme.ipa" zip below, and the
+# "$scheme+SideStore.ipa" zip at the end (the SideStore surgery in between
+# rewrites Info.plist and adds new code, which invalidates the first
+# signature, so the app is signed twice: once before each zip).
+# MJ re-signs the IPA with his own certificate (3432ZHJUF9) via Seal
+# afterwards; this CI signature only has to be a real CMS signature.
+#
+# TeamIdentifier: codesign takes it from the signing certificate's OU
+# field. The certificate below is created with OU=LIVE2026CI, and every
+# entitlements file is expanded with that same value, so
+# application-identifier, team-identifier and keychain-access-groups all
+# match the real signing team (no AAAAA11111 placeholder survives).
+# App Groups are the upstream Release values from xcconfigs/Global.xcconfig
+# (DEVELOPMENT_TEAM_SUFFIX is empty in Release):
+#   group.com.SideStore.SideStore, group.com.rileytestut.AltStore
+# Bundle ID stays com.kdt.livecontainer. Each target is signed with its
+# own source entitlements file, exactly as Xcode embeds them (verified
+# against the unsigned build: appex entitlements carry no
+# application-identifier / team-identifier keys, only the main app does).
+# $archive_path and $scheme come from the workflow environment.
+# Runs under `sh` (POSIX); no `set -e` here on purpose, the pre-existing
+# lines below rely on non-fatal failures, so every signing step checks its
+# own exit code and aborts explicitly.
+
+CI_CN="LiveContainer CI"
+CI_TEAM="LIVE2026CI"
+CI_KEYCHAIN="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/lc-ci.keychain-db"
+CI_CERT_DIR="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/lc-ci-cert"
+LC_REPO_ROOT=$(pwd)
+
+setup_ci_signing_identity() {
+  mkdir -p "$CI_CERT_DIR" || exit 1
+  printf '%s\n' '[req]' 'distinguished_name=dn' 'prompt=no' 'x509_extensions=v3' '[dn]' "CN=$CI_CN" "OU=$CI_TEAM" '[v3]' 'basicConstraints=critical,CA:FALSE' 'keyUsage=critical,digitalSignature' 'extendedKeyUsage=critical,codeSigning' > "$CI_CERT_DIR/ci-cert.cnf"
+  openssl req -x509 -newkey rsa:2048 -keyout "$CI_CERT_DIR/ci-key.pem" -out "$CI_CERT_DIR/ci-cert.pem" -days 365 -nodes -config "$CI_CERT_DIR/ci-cert.cnf" || exit 1
+  openssl pkcs12 -export -out "$CI_CERT_DIR/ci-cert.p12" -inkey "$CI_CERT_DIR/ci-key.pem" -in "$CI_CERT_DIR/ci-cert.pem" -passout pass:lc-ci -certpbe PBE-SHA1-3DES -keypbe PBE-SHA1-3DES -macalg sha1 || exit 1
+  security delete-keychain "$CI_KEYCHAIN" 2>/dev/null || true
+  security create-keychain -p "lc-ci" "$CI_KEYCHAIN" || exit 1
+  security set-keychain-settings -lut 21600 "$CI_KEYCHAIN"
+  security unlock-keychain -p "lc-ci" "$CI_KEYCHAIN" || exit 1
+  security import "$CI_CERT_DIR/ci-cert.p12" -k "$CI_KEYCHAIN" -P "lc-ci" -T /usr/bin/codesign || exit 1
+  security set-key-partition-list -S apple-tool:,apple: -s -k "lc-ci" "$CI_KEYCHAIN" || exit 1
+  security list-keychains -d user -s "$CI_KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+  security find-identity -v -p codesigning "$CI_KEYCHAIN" | grep -q "$CI_CN" || { echo "ERROR: signing identity $CI_CN not found in keychain"; exit 1; }
+}
+
+# expand_entitlements <source> <dest> [bundle-id]
+# Expand Xcode build variables in an entitlements source file. The
+# bundle-id is only needed for the main app (entitlements.xml uses
+# $(PRODUCT_BUNDLE_IDENTIFIER)); extension sources do not use it.
+expand_entitlements() {
+  E_SRC="$1"
+  E_DST="$2"
+  E_BID="$3"
+  if [ -n "$E_BID" ]; then
+    sed -e "s/\$(DEVELOPMENT_TEAM)/$CI_TEAM/g" \
+        -e "s/\$(APP_GROUP_SIDESTORE)/group.com.SideStore.SideStore/g" \
+        -e "s/\$(APP_GROUP_ALTSTORE)/group.com.rileytestut.AltStore/g" \
+        -e "s/\$(PRODUCT_BUNDLE_IDENTIFIER)/$E_BID/g" \
+        -e "s/\$(AppIdentifierPrefix)/$CI_TEAM./g" \
+        -e "s/AAAAA11111/$CI_TEAM/g" \
+        "$E_SRC" > "$E_DST" || exit 1
+  else
+    sed -e "s/\$(DEVELOPMENT_TEAM)/$CI_TEAM/g" \
+        -e "s/\$(APP_GROUP_SIDESTORE)/group.com.SideStore.SideStore/g" \
+        -e "s/\$(APP_GROUP_ALTSTORE)/group.com.rileytestut.AltStore/g" \
+        -e "s/\$(AppIdentifierPrefix)/$CI_TEAM./g" \
+        -e "s/AAAAA11111/$CI_TEAM/g" \
+        "$E_SRC" > "$E_DST" || exit 1
+  fi
+  # Fail loudly on any variable left unexpanded, or any placeholder left.
+  grep -q '\$(' "$E_DST" && { echo "ERROR: unexpanded variable in $E_DST"; exit 1; }
+  grep -q 'AAAAA11111' "$E_DST" && { echo "ERROR: placeholder team left in $E_DST"; exit 1; }
+  /usr/bin/plutil -lint "$E_DST" >/dev/null || { echo "ERROR: $E_DST is not a valid plist"; exit 1; }
+}
+
+# sign_bundle <path> [entitlements]
+sign_bundle() {
+  if [ -n "$2" ]; then
+    /usr/bin/codesign --force --sign "$CI_CN" --entitlements "$2" --timestamp=none "$1" || exit 1
+  else
+    /usr/bin/codesign --force --sign "$CI_CN" --timestamp=none "$1" || exit 1
+  fi
+}
+
+# sign_app <app-path>
+# Sign nested code deepest-first, then the app itself. Each app extension
+# gets its own source entitlements file; frameworks and loose dylibs are
+# signed without entitlements. Call once before each zip that packages
+# this Payload.
+sign_app() {
+  S_APP="$1"
+  S_ENT_DIR="$CI_CERT_DIR/entitlements"
+  mkdir -p "$S_ENT_DIR" || exit 1
+  # App extensions (with their own entitlements; nested frameworks inside
+  # an appex, e.g. the SideStore widget's, are signed before the appex).
+  for S_APPEX in "$S_APP"/PlugIns/*.appex; do
+    [ -d "$S_APPEX" ] || continue
+    S_NAME=$(basename "$S_APPEX" .appex)
+    case "$S_NAME" in
+      LiveProcess) S_SRC="LiveProcess/LiveProcess.entitlements" ;;
+      ShareExtension) S_SRC="ShareExtension/ShareExtension.entitlements" ;;
+      LaunchAppExtension) S_SRC="LaunchAppExtension/LaunchAppExtension.entitlements" ;;
+      LiveWidgetExtension) S_SRC=".github/sidelc/LiveWidgetExtension_adhoc.xml" ;;
+      *) S_SRC="" ;;
+    esac
+    if [ -d "$S_APPEX/Frameworks" ]; then
+      for S_FW in "$S_APPEX"/Frameworks/*.framework; do
+        [ -d "$S_FW" ] || continue
+        sign_bundle "$S_FW"
+      done
+    fi
+    if [ -n "$S_SRC" ]; then
+      expand_entitlements "$LC_REPO_ROOT/$S_SRC" "$S_ENT_DIR/$S_NAME.plist"
+      sign_bundle "$S_APPEX" "$S_ENT_DIR/$S_NAME.plist"
+    else
+      echo "warning: no entitlements source for $S_NAME, signing without entitlements"
+      sign_bundle "$S_APPEX"
+    fi
+  done
+  # Frameworks, then loose dylibs.
+  for S_FW in "$S_APP"/Frameworks/*.framework; do
+    [ -d "$S_FW" ] || continue
+    sign_bundle "$S_FW"
+  done
+  for S_DYLIB in "$S_APP"/Frameworks/*.dylib; do
+    [ -f "$S_DYLIB" ] || continue
+    sign_bundle "$S_DYLIB"
+  done
+  # Main app last, with the main entitlements.
+  S_BID=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$S_APP/Info.plist") || exit 1
+  expand_entitlements "$LC_REPO_ROOT/entitlements.xml" "$S_ENT_DIR/LiveContainer.plist" "$S_BID"
+  sign_bundle "$S_APP" "$S_ENT_DIR/LiveContainer.plist"
+  /usr/bin/codesign --verify --deep "$S_APP" || { echo "ERROR: codesign --verify --deep failed for $S_APP"; exit 1; }
+  echo "--- signature summary for $S_APP ---"
+  for S_TARGET in "$S_APP" "$S_APP"/PlugIns/*.appex; do
+    [ -e "$S_TARGET" ] || continue
+    echo "--- $(basename "$S_TARGET") ---"
+    /usr/bin/codesign -dvvv "$S_TARGET" 2>&1 | grep -E "Identifier=|TeamIdentifier=|Signature size=|Authority=" || true
+  done
+  # The signature's TeamIdentifier must be the real CI team, and the
+  # embedded entitlements must carry it as the application-identifier
+  # prefix (not the AAAAA11111 placeholder).
+  /usr/bin/codesign -dvvv "$S_APP" 2>&1 | grep -q "TeamIdentifier=$CI_TEAM" || { echo "ERROR: TeamIdentifier is not $CI_TEAM"; exit 1; }
+  /usr/bin/codesign -d --entitlements :- "$S_APP" 2>/dev/null | grep -q "$CI_TEAM.$S_BID" || { echo "ERROR: application-identifier prefix is not $CI_TEAM"; exit 1; }
+}
+
+setup_ci_signing_identity
+
 # copy lc
 wget https://github.com/LiveContainer/dylibify/releases/download/1.0/dylibify
 chmod +x dylibify
@@ -9,6 +162,9 @@ mv "$archive_path.xcarchive/Products/Applications" Payload
 # temporarily move sidestore support framrwork to tmp before zip
 mkdir tmp
 mv Payload/LiveContainer.app/Frameworks/SideStoreSupport.framework ./tmp
+
+# Sign the plain IPA payload (real CMS signature; replaces Xcode ad-hoc).
+sign_app "Payload/$scheme.app"
 
 zip -r "$scheme.ipa" "Payload" -x "._*" -x ".DS_Store" -x "__MACOSX"
 
@@ -72,6 +228,12 @@ rm -r .zsign_cache
 find payloadlc/Payload -type d -name "_CodeSignature" -exec rm -r {} +
 
 ldid -S.github/sidelc/LiveWidgetExtension_adhoc.xml ./Payload/LiveContainer.app/PlugIns/LiveWidgetExtension.appex/LiveWidgetExtension
+
+# Re-sign after the SideStore surgery: it rewrote Info.plist and added
+# new code (SideStoreApp.framework, LiveWidgetExtension.appex), which
+# invalidated the first signature. The ldid lines above are kept as-is;
+# codesign --force below replaces their ad-hoc signatures.
+sign_app "Payload/$scheme.app"
 
 # package
 zip -r "$scheme+SideStore.ipa" "Payload" -x "._*" -x ".DS_Store" -x "__MACOSX"
