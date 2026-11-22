@@ -10,6 +10,11 @@
 
 #import <objc/message.h>
 #import <objc/runtime.h>
+#import <mach-o/dyld.h> // 0.2.43：miss 缓存 key 追加 _dyld_image_count()
+
+#include <limits.h> // PATH_MAX（归属验证 realpath 用）
+#include <stdlib.h> // realpath
+#include <string.h>
 
 #import "SBGuestBootstrap.h"
 #import "SBGuestLoader.h"
@@ -45,11 +50,13 @@ static const NSTimeInterval SBGuestSceneSystemPathWaitSeconds = 0.4;
 // 问题随之消失）。0.2.41 的两处必错（根因 A 路径前缀、根因 B 全局首个）
 // 在此修法下都不存在：读表只认客镜像自己的类表，同名类分属不同镜像
 // 时各取各的；宿主同名类根本不在扫描范围里。
-// 点开流程里取类只走读表：objc_getClassList／NSClassFromString 不得
-// 作为取类依据；NSClassFromString 全文件只剩 1 处，仅用于诊断行
-// （说明“全局查到的是谁家的类”），绝不回落全局查找。
-// 读表失败（客镜像未加载／无 __objc_classlist 段／类名未安装等）只许
-// 干净失败写明原因（见 SBGuestLastClassTableFailure），不许回落运行时枚举。
+// 0.2.43（REPORT-0.2.43-investigation.md）：读表器本身再修——Swift 混淆名
+// 反混淆后双比对（根因 A）、RW 分支删回退＋堆 ro 结构校验后接受（根因 B）、
+// 补扫 __objc_nlclslist、分项统计＋原因串只陈述事实、realpath 缓存；
+// 读表仍未命中时走已拍板的有界后备（单名 NSClassFromString＋归属验证，
+// 见 SBGuestFallbackClassByName——不是 0.2.41 的全量枚举）；诊断行改为
+// 真路径比对（缺陷 C）；miss 缓存 key 追加 dyld 镜像数。
+// 点开流程里取类只走读表＋上述有界后备：objc_getClassList 全量枚举仍禁用。
 static NSString *SBGuestExecFingerprint(NSString *guestExecPath) {
     NSDictionary *attrs = nil;
     if (guestExecPath.length > 0) {
@@ -103,13 +110,76 @@ static Class SBGuestClassNamedInGuestImage(NSString *className, NSString *guestA
     return found;
 }
 
+/// 0.2.43：把路径 realpath 后判是否属于本客（等于客可执行，或在客 .app
+/// 包内）。归属验证与诊断行共用——只认解析后的真实路径，不认 raw 串
+/// （/var 与 /private/var 在此归一）。
+static BOOL SBGuestPathIsInGuest(const char *path, NSString *guestAppPath, NSString *guestExecPath) {
+    if (!path || path[0] == '\0') {
+        return NO;
+    }
+    char resolved[PATH_MAX];
+    if (realpath(path, resolved) == NULL) {
+        (void)snprintf(resolved, sizeof(resolved), "%s", path);
+    }
+    if (guestExecPath.length > 0) {
+        char execReal[PATH_MAX];
+        if (realpath([guestExecPath UTF8String], execReal) != NULL &&
+            strcmp(resolved, execReal) == 0) {
+            return YES;
+        }
+    }
+    if (guestAppPath.length > 0) {
+        char appReal[PATH_MAX];
+        if (realpath([guestAppPath UTF8String], appReal) != NULL) {
+            size_t appLen = strlen(appReal);
+            if (strncmp(resolved, appReal, appLen) == 0 && resolved[appLen] == '/') {
+                return YES;
+            }
+        }
+    }
+    return NO;
+}
+
+/// 0.2.43（已拍板的安全后备）：仅当读表仍未命中时，才调一次单名
+/// NSClassFromString（不是 0.2.41 的 objc_getClassList 全量枚举；调用点在
+/// 主线程激活流程内，不持任何运行时锁），并以 class_getImageName 验归属——
+/// 须在客包内才用，否则丢弃（防 0.2.40 根因 B 的跨客同名污染）。
+/// 命中记一行诊断；未命中或归属不符返回 Nil，调用方按原流程干净失败。
+/// *globalOut（可空）回传这次单名查找的原始结果，供诊断行复用，免得
+/// 再调一次 NSClassFromString。看门狗不动（后备在 class-resolve 步的
+/// 2s 阈值内）。若实现中发现它仍有持锁风险，删本函数、保留干净失败。
+static Class SBGuestFallbackClassByName(NSString *className, NSString *bundleID,
+                                        NSString *guestAppPath, NSString *guestExecPath,
+                                        Class *globalOut) {
+    Class global = NSClassFromString(className);
+    if (globalOut) {
+        *globalOut = global;
+    }
+    if (!global) {
+        return Nil;
+    }
+    const char *imageName = class_getImageName(global);
+    if (!imageName || !SBGuestPathIsInGuest(imageName, guestAppPath, guestExecPath)) {
+        SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 后备单名查找 %@ 全局查到但不在客包内（%@），丢弃",
+                        bundleID, className,
+                        imageName ? [NSString stringWithUTF8String:imageName] : @"?"] UTF8String]);
+        return Nil;
+    }
+    SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 读表未命中，后备单名查找命中 %@（归属已验：客镜像内 %@）",
+                    bundleID, className,
+                    [NSString stringWithUTF8String:imageName]] UTF8String]);
+    return global;
+}
+
 static Class SBGuestClassNamedInGuest(NSString *className, NSString *bundleID,
                                       NSString *guestAppPath, NSString *guestExecPath) {
     // 看门狗“类解析”步：每次取类（显式名／探测一／探测二／最终解析／
     // scene delegate）都是一步，阈值 2s——读表应为毫秒级，2s 即异常。
     SBDiagLogWatchdogStepBegin("class-resolve", 2.0);
     NSString *fingerprint = SBGuestExecFingerprint(guestExecPath);
-    NSString *cacheKey = [NSString stringWithFormat:@"%@|%@|%@", bundleID, fingerprint, className];
+    // 0.2.43：miss 缓存 key 追加 dyld 镜像数——同一进程内后加载的
+    // framework 可能使旧 miss 过时（旧 key 不含镜像数，见调查报告 §5.2-9）。
+    NSString *cacheKey = [NSString stringWithFormat:@"%@|%@|%@|%u", bundleID, fingerprint, className, _dyld_image_count()];
     NSMutableDictionary<NSString *, id> *cache = SBGuestClassCache();
     id cached = cache[cacheKey];
     Class cls = Nil;
@@ -119,6 +189,11 @@ static Class SBGuestClassNamedInGuest(NSString *className, NSString *bundleID,
         return cls;
     }
     cls = SBGuestClassNamedInGuestImage(className, guestAppPath, guestExecPath);
+    Class globalDiag = Nil;
+    if (!cls) {
+        // 0.2.43：读表未命中才走有界后备（单名查找＋归属验证，见上）。
+        cls = SBGuestFallbackClassByName(className, bundleID, guestAppPath, guestExecPath, &globalDiag);
+    }
     if (cls) {
         cache[cacheKey] = [NSValue valueWithPointer:(__bridge void *)cls];
         SBDiagLogWatchdogStepEnd("class-resolve");
@@ -126,14 +201,20 @@ static Class SBGuestClassNamedInGuest(NSString *className, NSString *bundleID,
     }
     // 客镜像内没有该名类：只记诊断行（全局查到的是谁家的类），不回落全局查找——
     // 回落会把先加载的另一客的同名类误认成本客的类（0.2.40 根因 B）。
-    // NSClassFromString 在此仅作诊断，绝不作为取类依据（0.2.42 点开流程
-    // 取类只走 Mach-O 读表；全文件仅剩这一处 NSClassFromString）。
-    Class global = NSClassFromString(className);
-    if (global) {
-        const char *imageName = class_getImageName(global);
+    // 诊断用的是后备那次单名查找的结果（globalDiag），不再另调一次。
+    // 0.2.43（缺陷 C）：诊断行改为真路径比对——全局查到的类在客包内时，
+    // 写“在客镜像内找到，但读表未命中”，只有确实在客包外才写“在另一镜像”
+    // （0.2.42 的文案无条件写“在另一镜像”，括号里恰恰是客自己的镜像）。
+    if (globalDiag) {
+        const char *imageName = class_getImageName(globalDiag);
         NSString *imagePath = imageName ? [NSString stringWithUTF8String:imageName] : @"?";
-        SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 按名找到的 %@ 在另一镜像（%@），不是本客的类，不用",
-                        bundleID, className, imagePath] UTF8String]);
+        if (imageName && SBGuestPathIsInGuest(imageName, guestAppPath, guestExecPath)) {
+            SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 按名找到的 %@ 在客镜像内（%@），但读表未命中（读表未覆盖该类，见分项统计），不用",
+                            bundleID, className, imagePath] UTF8String]);
+        } else {
+            SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 按名找到的 %@ 在另一镜像（%@），不是本客的类，不用",
+                            bundleID, className, imagePath] UTF8String]);
+        }
     }
     cache[cacheKey] = (id)[NSNull null];
     SBDiagLogWatchdogStepEnd("class-resolve");

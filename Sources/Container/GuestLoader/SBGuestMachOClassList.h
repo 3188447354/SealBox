@@ -1,4 +1,4 @@
-// SBGuestMachOClassList.h — 直接读客 Mach-O 的 __objc_classlist 找类，不走 ObjC 运行时（0.2.42）。
+// SBGuestMachOClassList.h — 直接读客 Mach-O 的 __objc_classlist 找类，不走 ObjC 运行时（0.2.43）。
 //
 // 背景（调查报告 REPORT-0.2.42-investigation.md §4）：0.2.41 的
 // objc_getClassList 枚举在真实调用链里虽被证伪会自死锁，但它每次点图标
@@ -8,8 +8,10 @@
 // dyld 加载后类指针已由链式修正重定向，直接读 __objc_classlist，
 // 逐项读 class_ro_t 的 name 比对；归属按“只读客镜像自己的类表”判定，
 // 连运行时都不碰，/var vs /private/var 路径比对问题随之消失。
-// 读表失败（非常规 Mach-O 布局等）只许干净失败写明原因，绝不回落到
-// 运行时枚举（objc_getClassList / NSClassFromString 不得作为取类依据）。
+// 读表失败（非常规 Mach-O 布局等）只许干净失败写明原因；唯一例外是
+// 0.2.43 批准的有界后备：读表仍未命中时，SessionManager 可调一次单名
+// NSClassFromString 并以 class_getImageName 验归属（须在客包内才用），
+// 全量枚举 objc_getClassList 仍禁用。
 #ifndef SB_GUEST_MACHO_CLASS_LIST_H
 #define SB_GUEST_MACHO_CLASS_LIST_H
 
@@ -27,8 +29,14 @@ extern "C" {
 typedef struct {
     unsigned int classesScanned; // 扫过的类表项数
     unsigned int nullNameCount;  // 名为空的项（lazily named Swift 泛型类）
-    unsigned int corruptCount;   // 越界／损坏而跳过的项
+    unsigned int corruptCount;   // 越界／损坏而跳过的项（下述分项之和）
     int foundClassList;          // 该镜像确有 __objc_classlist 段
+    // 0.2.43：corruptCount 分项（真机定性用；只陈述事实，不作归因）：
+    unsigned int corruptClsRange;       // 类指针为 0 或越界（逐项第 8 条）
+    unsigned int corruptRwPath;         // RW 分支读 rw_t／ro_or_rw_ext 失败（第 11／13 条）
+    unsigned int corruptRoRange;        // ro 越界或堆 ro 副本结构校验失败（第 15 条）
+    unsigned int corruptNameRange;      // 名指针越界（第 16 条）
+    unsigned int corruptBitsUnreadable; // 类对象头（bits 槽）不可读（第 9 条）
 } SBGuestMachOClassScanStats;
 
 void *SBGuestMachOClassScanImage(const void *imageBase, long slide,
