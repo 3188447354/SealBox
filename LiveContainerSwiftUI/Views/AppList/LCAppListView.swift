@@ -1239,7 +1239,12 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
                     // window mode); the host UI underneath shows again. In
                     // native-window mode the main scene coming to the
                     // foreground is enough and the guest scenes stay alive.
-                    MultitaskDockManager.shared.minimizeAllWindows()
+                    // MultitaskDockManager is iOS 16+ only (deployment
+                    // target is iOS 15); on iOS 15 there is no multitask
+                    // guest to hide anyway.
+                    if #available(iOS 16.0, *) {
+                        MultitaskDockManager.shared.minimizeAllWindows()
+                    }
                 }
             }
         } else if url.host == "livecontainer-relaunch" {
@@ -1262,8 +1267,15 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
                         if let containerName {
                             // Must run on MainActor: it reads the dock's
                             // @Published apps and touches UIKit.
-                            let closed = await MainActor.run {
-                                MultitaskDockManager.shared.closeMultitaskWindow(uuid: containerName)
+                            // MultitaskDockManager is iOS 16+ only
+                            // (deployment target is iOS 15); on iOS 15 there
+                            // is no multitask window to close, so skip
+                            // straight to the relaunch below.
+                            var closed = false
+                            if #available(iOS 16.0, *) {
+                                closed = await MainActor.run {
+                                    MultitaskDockManager.shared.closeMultitaskWindow(uuid: containerName)
+                                }
                             }
                             if closed {
                                 try? await Task.sleep(nanoseconds: 600_000_000)
