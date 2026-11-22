@@ -45,7 +45,12 @@ setup_ci_signing_identity() {
   security import "$CI_CERT_DIR/ci-cert.p12" -k "$CI_KEYCHAIN" -P "lc-ci" -T /usr/bin/codesign || exit 1
   security set-key-partition-list -S apple-tool:,apple: -s -k "lc-ci" "$CI_KEYCHAIN" || exit 1
   security list-keychains -d user -s "$CI_KEYCHAIN" $(security list-keychains -d user | tr -d '"')
-  security find-identity -v -p codesigning "$CI_KEYCHAIN" | grep -q "$CI_CN" || { echo "ERROR: signing identity $CI_CN not found in keychain"; exit 1; }
+  # No `security find-identity -p codesigning` check here on purpose: it
+  # does not reliably list a fresh self-signed identity (run 45050128145
+  # failed exactly on that check although `security import` had just
+  # reported "1 identity imported"). codesign itself is the gate: it
+  # fails loudly if the identity is missing, and sign_app asserts the
+  # resulting TeamIdentifier and entitlements afterwards.
 }
 
 # expand_entitlements <source> <dest> [bundle-id]
