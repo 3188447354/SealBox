@@ -103,16 +103,30 @@ void SBDiagLogWatchdogSetGuestFingerprint(const char *fingerprint, const char *h
 /// entry/exit 各写一行（带单调时钟毫秒耗时），死在哪步日志即断在哪步。
 void SBDiagLogWatchdogStepBegin(const char *step, double timeoutSeconds);
 void SBDiagLogWatchdogStepEnd(const char *step);
+/// 0.2.44：主线程消费 slow 标志位——本流程里某步曾超时（慢）时返回 1，
+/// 调用后清零（只消费一次）。dlopen 返回后调：置位即干净失败“加载超时，
+/// 请重试”，不跳 main、不 exit。看门狗判定顺序亦改：有步阈值时步超时
+/// 优先，停摆只在无步时触发；步超时后心跳仍死满 5s 宽限才升级为真卡死。
+int SBDiagLogWatchdogConsumeSlowTimeout(void);
+/// 0.2.44：主线程消费 slow 标志位——本流程里某步曾超时（慢）时返回 1，
+/// 调用后清零（只消费一次）。dlopen 返回后调：置位即干净失败“加载超时，
+/// 请重试”，不跳 main、不 exit。看门狗判定顺序亦改：有步阈值时步超时
+/// 优先，停摆只在无步时触发；步超时后心跳仍死满 5s 宽限才升级为真卡死。
 
-/// 0.2.42：看门狗卡死熔断记录（内容四行：步名、步耗时秒、客指纹、宿主版本）。
-/// 超时时写进熔断目录（与 willConnect 拦截记录同目录，App Group 共享区；
-/// 共享区不可用时回落 Logs）。下次点该客前先查：指纹与宿主版本均未变 →
-/// 干净失败、不再重进（SBGuestBootstrap 入口处查）；重装／升级（指纹或
-/// 版本已变）→ 记录失效、自动重试一次；成功激活一次即清掉记录。
-/// 文件名只留 [A-Za-z0-9.-]，其余字符变 '_'，永不含 '/'。
+/// 0.2.42：看门狗卡死熔断记录；0.2.44 起内容六行（步名、步耗时秒、客指纹、
+/// 宿主版本、kind（slow | stuck）、计数/时间戳）。旧四行记录读时按 slow
+/// 计一次（可重试）。分级：步超时只写 slow 记录——本次干净失败、可立即
+/// 重试，不 exit；slow 连续 3 次或过期（>24h）前未升级即升级为 stuck；
+/// stuck 才永久拦。超时时写进熔断目录（与 willConnect 拦截记录同目录，
+/// App Group 共享区；共享区不可用时回落 Logs）。下次点该客前先查：指纹与
+/// 宿主版本均未变且 kind=stuck → 干净失败、不再重进（SBGuestBootstrap
+/// 入口处查）；重装／升级（指纹或版本已变）→ 记录失效、自动重试一次；
+/// 成功激活一次即清掉记录。文件名只留 [A-Za-z0-9.-]，其余字符变 '_'，永不含 '/'。
 void SBDiagLogMarkStuckGuest(const char *guestBundleID, const char *step, double elapsedSeconds, const char *fingerprint, const char *hostVersion);
-/// 该客是否在卡死熔断中（记录在位且指纹与宿主版本均对上）。stepOut 非空时
-/// 写进熔断的步名（供干净失败文案用）。查不到／不符返回 0。
+/// 该客是否在卡死熔断中（记录在位、指纹与宿主版本均对上、且 kind=stuck
+/// 或 slow 计数已达 3 次）。slow 记录（计数 <3 且未过期）与旧四行记录
+/// 均不拦、可重试。stepOut 非空时写进熔断的步名（供干净失败文案用）。
+/// 查不到／不符返回 0。
 int SBDiagLogIsGuestStuckForGuest(const char *guestBundleID, const char *fingerprint, const char *hostVersion, char *stepOut, size_t stepOutSize);
 void SBDiagLogClearStuckGuestForGuest(const char *guestBundleID);
 /// 上次启动读到的卡死熔断（BeginRun 从熔断目录扫 stuck-*.txt 读出、

@@ -20,6 +20,9 @@ extern NSString * const SBGuestDidEnterBackgroundNotification;
 extern NSString * const SBGuestDidEnterForegroundNotification;
 extern NSString * const SBGuestActivationFailedNotification;
 extern NSString * const SBGuestActivationFailedMessageKey;
+/// 0.2.44：客内横杠长按／双击／上滑停顿 → 打开切换器（SBHomeBarOverlay 发，
+/// 宿主 VMRootView 接）。与上面四个通知同款做法。
+extern NSString * const SBGuestSwitcherRequestedNotification;
 
 /// 客加载时传给 hook 的上下文（bootstrap 在 dlopen 后、跳 main 前装好；
 /// 会话保留它，供恢复时重上客上下文用）。
@@ -60,6 +63,8 @@ extern NSString * const SBGuestActivationFailedMessageKey;
 @property (nonatomic, strong, nullable) NSSet<UIWindow *> *windowsBeforeActivation;
 @property (nonatomic, assign) BOOL loaded;
 @property (nonatomic, assign) BOOL active;
+/// 0.2.44：上次活跃时间（激活完成与回后台时更新；切换器卡片显示用）。
+@property (nonatomic, strong, nullable) NSDate *lastActiveAt;
 @end
 
 @interface SBGuestSessionManager : NSObject
@@ -87,7 +92,18 @@ extern NSString * const SBGuestActivationFailedMessageKey;
 
 /// 当前前台客回后台：藏客窗、换出客 delegate、恢复宿主 delegate/窗口/环境；
 // 会话保留在注册表里，收据/selected 不清除。无前台客时空操作。
+// 0.2.44：回后台前先补发客生命周期后台回调（让客自停／落盘）。
 - (void)backgroundCurrentGuest;
+
+/// 关闭一客（0.2.44，切换器用）：前台客先回后台（后台回调让客自停／落盘）
+/// → 去激活共享音频会话 → 清会话 → 释窗口。下次点图标走冷启动（签名门
+/// 重跑）。不 dlclose、不删容器、不清钥匙串（关 ≠ 删）。无此会话时空操作。
+- (void)closeGuestWithBundleID:(NSString *)bundleID;
+
+/// 后台会话只读快照（切换器数据源）：每项 bundleID／containerUUID／
+/// lastActiveAt（NSDate，可空），按上次活跃倒序；displayName 由 Swift 侧
+/// 查 SBStore 拼。卡片以 containerUUID 为键（与上游 LC 对齐）。
+- (NSArray<NSDictionary *> *)activeSessions;
 
 /// hook 激活入口（SBGuestMainHook 调）：建会话、保存宿主 delegate/窗口、
 // 换上客 delegate、调 didFinishLaunching、驱动 scene 创建。

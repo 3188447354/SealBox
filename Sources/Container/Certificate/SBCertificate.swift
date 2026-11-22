@@ -494,6 +494,15 @@ public enum SBCertificate {
             SBDiagLog.log("注入件签名检查失败：注入件不在磁盘 \(tweaksURL.path)")
             return false
         }
+        // 0.2.44（F5）：注入件验签成功结果缓存——件与证书均未变时，第二次
+        // 点图标直接放行，不再重跑整套验签＋重签检查。只缓存成功；失败不
+        // 缓存（证书刚导入的情形不被旧失败卡住）。HooksSignGate 已把并发
+        // 调用合并成一次，perform 同一时间只跑一个，静态缓存无竞态。
+        if let cacheKey = hooksCacheKey(tweaksURL: tweaksURL, certFingerprint: fingerprint),
+           hooksValidCacheKey == cacheKey, hooksValidCacheResult {
+            SBDiagLog.log("注入件签名检查：缓存命中（件与证书均未变），直接放行")
+            return true
+        }
         // 0.2.23：逐项日志（与客验签同款格式），下一份日志直接分出 Seal 件
         // 还是 ZSign 件：identifier、超块尺寸、CD ver/flags/哈希类型都在里面。
         let hooksDetail = SBCodesignCheck.signatureDetail(atPath: tweaksURL.path)
@@ -522,7 +531,7 @@ public enum SBCertificate {
         // （hooksNeedsResign）。放行判据不变（静态验签＋Team），重签只是
         // 修复手段，不是放行条件。
         let needsResign = freshlySeeded || hooksNeedsResign(detail: hooksDetail, bundleID: hooksBundleID)
-        if hooksStaticValid(at: tweaksURL, teamID: certTeamID) && !needsResign {
+        if hooksStaticValid(detail: hooksDetail, teamID: certTeamID) && !needsResign {
             if firstGate.passed {
                 SBDiagLog.log("注入件签名检查：内核验签通过 Team=\(certTeamID)（\(tweaksURL.path)，未重签）")
             } else {
@@ -531,6 +540,8 @@ public enum SBCertificate {
                     tweaksURL: tweaksURL, bundleID: hooksBundleID,
                     certData: data, password: password, teamID: certTeamID)
             }
+            // 0.2.44（F5）：放行即记缓存——下次点图标件与证书未变时直接放行。
+            storeHooksValidCache(tweaksURL: tweaksURL, certFingerprint: fingerprint)
             return true
         }
         if needsResign {
@@ -552,7 +563,10 @@ public enum SBCertificate {
             return false
         }
         let afterGate = kernelGateDetail(path: tweaksURL.path)
-        if hooksStaticValid(at: tweaksURL, teamID: certTeamID) {
+        // 0.2.44（F5）：重签后件的逐项只读一次（下面失败日志复用同一份，
+        // 不再各读一次全文件）。
+        let afterDetail = SBInstaller.cachedSignatureDetail(atPath: tweaksURL.path)
+        if hooksStaticValid(detail: afterDetail, teamID: certTeamID) {
             if afterGate.passed {
                 SBDiagLog.log("注入件签名检查：重签后内核验签通过 Team=\(certTeamID)（\(tweaksURL.path)）")
             } else {
@@ -561,6 +575,8 @@ public enum SBCertificate {
                     tweaksURL: tweaksURL, bundleID: hooksBundleID,
                     certData: data, password: password, teamID: certTeamID)
             }
+            // 0.2.44（F5）：重签后放行也记缓存（key 按重签后文件现算）。
+            storeHooksValidCache(tweaksURL: tweaksURL, certFingerprint: fingerprint)
             return true
         }
         // 静态仍不通过：记重签后件的完整逐项 + 内核门自检 + 门现场。
@@ -571,19 +587,39 @@ public enum SBCertificate {
         // 签名器同空 entitlements，客过、件不过”的差别。
         // 0.2.20：再加失败现场（步骤/errno/内核原话）——三者齐全，
         // 下一份日志直接定夺，不用再猜。
-        let detail = SBCodesignCheck.signatureDetail(atPath: tweaksURL.path)
         let hostSelfCheck = Bundle.main.executableURL.map { SBLCCheckCodeSignature($0.path) != 0 } ?? false
-        SBDiagLog.log("注入件签名检查失败：重签后静态验签仍不通过 \(tweaksURL.path) 证书 Team=\(certTeamID) \(afterGate.scene) 重签后件：\(SBInstaller.signatureDetailFields(detail: detail)) 内核门自检宿主主程序=\(hostSelfCheck ? "通过" : "不通过")")
+        SBDiagLog.log("注入件签名检查失败：重签后静态验签仍不通过 \(tweaksURL.path) 证书 Team=\(certTeamID) \(afterGate.scene) 重签后件：\(SBInstaller.signatureDetailFields(detail: afterDetail)) 内核门自检宿主主程序=\(hostSelfCheck ? "通过" : "不通过")")
         return false
     }
 
     /// 0.2.21：注入件静态验签＋Team（放行判据）。逐项 valid=YES 且 Team 与当前
     /// 证书一致即放行；内核门的结果只记诊断。SBCodesignCheck 的 valid 覆盖
     /// CMS 链、页哈希、特殊槽、备用 CD、execSeg 相容性（LC_MAIN 不进公式）。
-    private static func hooksStaticValid(at url: URL, teamID: String) -> Bool {
-        let detail = SBCodesignCheck.signatureDetail(atPath: url.path)
+    /// 0.2.44（F5）：改成接已算好的 detail——Team 直接读 detail 里的 teamID
+    /// 键（SBCodesignCheck.m:1769-1771 已含），不再调 teamIDOfSignedMachO
+    ///（那又是一次全文件读）。调用方传的 detail 须是同一文件的当次结果。
+    private static func hooksStaticValid(detail: [AnyHashable: Any], teamID: String) -> Bool {
         let valid = (detail["valid"] as? NSNumber)?.boolValue ?? false
-        return valid && teamIDOfSignedMachO(at: url) == teamID
+        return valid && (detail["teamID"] as? String) == teamID
+    }
+
+    /// 0.2.44（F5）：注入件验签成功结果缓存。key = 件路径＋大小＋mtime＋
+    /// 证书叶子指纹；重签改写文件即失效，换证书即失效。只缓存成功。
+    private static var hooksValidCacheKey: String?
+    private static var hooksValidCacheResult = false
+
+    private static func hooksCacheKey(tweaksURL: URL, certFingerprint: String?) -> String? {
+        guard let fingerprint = certFingerprint else { return nil }
+        let attrs = try? FileManager.default.attributesOfItem(atPath: tweaksURL.path)
+        let size = (attrs?[.size] as? NSNumber)?.int64Value ?? -1
+        let mtime = (attrs?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? -1
+        return "\(tweaksURL.path)|\(size)|\(mtime)|\(fingerprint)"
+    }
+
+    private static func storeHooksValidCache(tweaksURL: URL, certFingerprint: String?) {
+        guard let key = hooksCacheKey(tweaksURL: tweaksURL, certFingerprint: certFingerprint) else { return }
+        hooksValidCacheKey = key
+        hooksValidCacheResult = true
     }
 
     /// 0.2.23：Tweaks 件是不是 ZSign 签的形。ZSign 一定把 identifier 写成
@@ -766,14 +802,6 @@ public enum SBCertificate {
     /// 任意数据的 SHA-256 hex（证书文件字节指纹用）。
     private static func sha256Hex(_ data: Data) -> String {
         SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
-    }
-
-    /// 读一个已签名 Mach-O 的 Team ID（SBCodesignCheck 手动解析 CodeDirectory；
-    /// 无签名返回 nil）。读不到不抛错，只返回 nil，调用方按“未签名”处理。
-    /// 不用 SecStaticCode*：那是 macOS-only API，iOS SDK 里没有
-    /// （0.2.2 第一轮 CI 实证：cannot find in scope）。
-    static func teamIDOfSignedMachO(at url: URL) -> String? {
-        SBCodesignCheck.teamIdentifier(atPath: url.path)
     }
 
     /// 用给定证书签单个 Mach-O（SBSigner 转发 ZSign）；ZSign 回调在全局队列，

@@ -44,6 +44,12 @@ struct VMRootView: View {
     @State private var didEnsureHooks = false
     @State private var showLock = false
     @State private var unlocked = false
+    /// 0.2.44（问题 3）：切换器呈现——桌面按钮与客内横杠长按都发
+    /// SBGuestSwitcherRequested 通知，VMRootView 接到即弹切换器。
+    @State private var showSwitcher = false
+    /// 0.2.44（问题 1）：左边缘手势单次触发旗标（onChanged 会连发，
+    /// 触发一次后置真、onEnded 复位）。
+    @State private var edgeSwipeFired = false
 
     var body: some View {
         ZStack {
@@ -75,13 +81,32 @@ struct VMRootView: View {
         .preferredColorScheme(appearanceDark ? .dark : .light)
         .statusBar(hidden: statusBarFancy)
         .overlay(alignment: .bottom) { homeSwipeZone }
+        // 0.2.44（问题 1）：宿主侧左边缘手势——与客内同口径（16pt 宽 ×
+        // 底部 160pt 高，右滑 ≥40pt 或 predictedEnd ≥40pt 即回桌面）。
+        // 只在宿主页面打开时挂（桌面时不挂，不抢 TabView 的翻页手势）。
+        .overlay(alignment: .bottomLeading) {
+            if vm.openApp != nil {
+                leftEdgeSwipeZone
+            }
+        }
         // 0.2.37：安装完成不弹提示，改为直接回桌面第 2 页看新图标
         //（通知来自 SBAppCoordinator.runInstall 成功路）。
         .onReceive(NotificationCenter.default.publisher(for: .SBInstallCompleted)) { _ in
             vm.homePage = 1
             vm.openApp = nil
         }
+        // 0.2.44（问题 3）：切换器请求（桌面“切换器”按钮／客内横杠长按）
+        // → 弹切换器。无后台客时切换器只显示空态，不弹错。
+        .onReceive(NotificationCenter.default.publisher(for: Notification.Name(SBGuestSwitcherRequestedNotification))) { _ in
+            showSwitcher = true
+        }
+        .sheet(isPresented: $showSwitcher) {
+            GuestSwitcherView()
+        }
         .onAppear {
+            // 0.2.44（F3 计量）：首帧行——VMRootView 出现即首帧已上屏；
+            // 与“进 SealboxApp”行相减即启动空白段耗时。
+            SBDiagLog.log("首帧：VMRootView 出现")
             // 0.2.1：删掉的“自定义手势”开关在旧手机上还留着一个死值，清掉。
             UserDefaults.standard.removeObject(forKey: "vm.plugin.customGestures")
             // 密码锁的决定必须在启动路由之前做：路由会消费重起收据，
@@ -251,16 +276,42 @@ struct VMRootView: View {
 
     /// Bottom 28pt strip: swipe up returns to the home screen.
     /// No tappable control may sit in the bottom 28pt of any app page.
+    /// 0.2.44（问题 1）：阈值与客内横杠对齐——上滑 ≥32pt 或 predictedEnd
+    /// < −32pt（快滑的速度代理）即触发，onChanged 即时触发，不等手指抬起。
+    /// 旧阈值是抬起后 translation < −60pt（慢滑、长滑才回得去）。
     private var homeSwipeZone: some View {
         Color.clear
             .frame(height: 28)
             .contentShape(Rectangle())
             .gesture(
                 DragGesture(minimumDistance: 20)
-                    .onEnded { value in
-                        if value.translation.height < -60 {
+                    .onChanged { value in
+                        if value.translation.height <= -32 || value.predictedEndTranslation.height <= -32 {
                             vm.openApp = nil
                         }
+                    }
+            )
+    }
+
+    /// 0.2.44（问题 1）：宿主侧左边缘手势——16pt 宽 × 底部 160pt 高，
+    /// 与客内 SBHomeBarOverlay 的左边缘区同口径（右滑 ≥40pt 或
+    /// predictedEnd ≥40pt；SwiftUI DragGesture 没有速度值，predictedEnd
+    /// 是速度推导的近似代理）。单次触发（onChanged 连发时只触发一次）。
+    private var leftEdgeSwipeZone: some View {
+        Color.clear
+            .frame(width: 16, height: 160)
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 20)
+                    .onChanged { value in
+                        guard !edgeSwipeFired else { return }
+                        if value.translation.width >= 40 || value.predictedEndTranslation.width >= 40 {
+                            edgeSwipeFired = true
+                            vm.openApp = nil
+                        }
+                    }
+                    .onEnded { _ in
+                        edgeSwipeFired = false
                     }
             )
     }

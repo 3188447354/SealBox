@@ -38,6 +38,38 @@ extern "C" {
 // 非 arm64 / arm64e 架构（如只有 x86_64 切片的 fat 包）。
 #define SB_LC_PATCH_ERR_UNSUPPORTED_ARCH 7
 
+/// 0.2.44（B-1）：与 SBLCPatchExecutable 同款，但打补丁前把客 bundleID
+/// 置进打补丁器（LCSetPatchGuestBundleID），使 LC_ID_DYLIB 写唯一名
+/// "<bundleID>/<basename>"；打完清掉。主程序用它；appex 继续用旧函数
+///（不置 bundleID，行为不变——appex 从不被 dlopen，裸名无碰撞）。
+int32_t SBLCPatchExecutableForGuest(const char *path, int doInject,
+                                    int *seg_mismatch_out,
+                                    const char *bundleID);
+
+/// 读 Mach-O 首个 arm64 切片的 LC_ID_DYLIB 安装名（B-3 签名修复门用）。
+/// - Returns: 读到时返回 1 并写 *nameOut（NUL 结尾）；否则返回 0。
+int SBMachOIDDylibName(const char *path, char *nameOut, size_t nameOutSize);
+
+/// 整包命名空间改写（0.2.44 B-2）：只修主程序不够——Guoguo 的
+/// App.framework 与 OmoFun 的 App.framework 安装名同为
+/// "@rpath/App.framework/App"，dyld 按安装名去重会串味。本函数把包内
+/// 全部 framework 的 LC_ID_DYLIB 改写为每客唯一名，并把主程序与各
+/// framework 之间的 LC_LOAD_DYLIB／WEAK／REEXPORT 引用同步改写。
+/// 唯一名：主程序 "<bundleID>/<basename>"；framework
+/// "@rpath/<bundleID>/<Fw>.framework/<Fw>"。
+/// 改写规则：新串塞得进原命令名域就地写；塞不进且命令表后有空闲（到
+/// __text 的空隙）就扩命令、后移命令表；实在改不了就原样留着并记一条
+/// 警告（不报错——dyld 按安装名匹配已加载镜像，未改的 @rpath 引用永远
+/// 匹配不到别客的唯一名，只会从磁盘正确加载本客文件；主程序 ID 实在
+/// 写不进完整唯一名时退到 6 位 djb2 短名就地写，仍是每客唯一）。
+/// 在主程序打补丁之后、重签之前调（安装与重打补丁两路都要调）。
+/// - Parameters:
+///   - bundlePath: .app 包路径；execPath: 主可执行文件路径；bundleID: 客 bundleID。
+///   - warningsOut: 可为 NULL；非 NULL 时写改不了的命令数（>0 只记日志，不拦安装）。
+/// - Returns: 改写过的文件数；<0 表示致命 I/O 错误（包目录读不出）。
+int SBLCPatchBundleNamespace(const char *bundlePath, const char *execPath,
+                             const char *bundleID, int *warningsOut);
+
 /// 对一个 Mach-O 可执行文件打补丁（原地修改），做法与 LC 的
 /// patchExecAndSignIfNeedWithCompletionHandler（LCAppInfo.m:326-340）一致：
 /// 逐个 arm64 切片调 LCPatchExecSlice；doInject 为真时注入启动件

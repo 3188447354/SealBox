@@ -1,8 +1,8 @@
 // SBHomeBarOverlay.m — 客 App 内底部横杠 + 左下角侧滑：
 //   上滑 ≥32pt 或快滑（速度 >140pt/s）→ 回宿主（0.2.27：发通知，不再 exit(0)）；
 //   左下角左边缘右滑 ≥40pt 或速度 >300pt/s → 回宿主（0.2.27 新增，MJ 要求）；
-//   按住 0.42s / 双击 / 上滑后停顿 0.35s → toast「切换器 v1 未提供」
-//   （v1 不做切换器，只提示，不静默吞手势）。
+//   按住 0.42s / 双击 / 上滑后停顿 0.35s → 发 SBGuestSwitcherRequested
+//   通知，宿主 VMRootView 接到即弹切换器（0.2.44：三处 toast 占位已兑现）。
 // 实现：一只高层级透明 UIWindow，只在底部 28pt 的横杠条与左下角 16×160pt 的
 // 左边缘区上接手势，其余区域 hitTest 返回 nil，触摸原样透给客 App。
 // 回宿主 = 发通知给宿主会话管理器（当前客回后台，会话保留、收据不清除），
@@ -37,10 +37,9 @@ static NSString * const SBGuestReturnToHostRequestedNotification = @"SBGuestRetu
 static NSString * const SBGuestDidEnterBackgroundNotification = @"SBGuestDidEnterBackground";
 static NSString * const SBGuestDidEnterForegroundNotification = @"SBGuestDidEnterForeground";
 static NSString * const SBGuestActivationFailedNotification = @"SBGuestActivationFailed";
+static NSString * const SBGuestSwitcherRequestedNotification = @"SBGuestSwitcherRequested";
 
 static UIWindow *g_overlayWindow = nil;
-static UILabel *g_toastLabel = nil;
-static NSUInteger g_toastGeneration = 0;
 static BOOL g_overlayInstalled = NO;
 
 /// 除横杠条与左边缘区外不拦截触摸的容器视图。
@@ -96,51 +95,17 @@ static BOOL g_overlayInstalled = NO;
 
 @end
 
-static void SBHomeBarShowToast(NSString *text) {
-    if (!g_overlayWindow) {
-        return;
-    }
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if (!g_toastLabel) {
-            UILabel *label = [[UILabel alloc] init];
-            label.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.75];
-            label.textColor = [UIColor whiteColor];
-            label.font = [UIFont systemFontOfSize:14.0];
-            label.textAlignment = NSTextAlignmentCenter;
-            label.numberOfLines = 1;
-            label.layer.cornerRadius = 17.0;
-            label.layer.masksToBounds = YES;
-            label.alpha = 0.0;
-            [g_overlayWindow addSubview:label];
-            g_toastLabel = label;
-        }
-        g_toastLabel.text = text;
-        CGSize textSize = [text sizeWithAttributes:@{ NSFontAttributeName: g_toastLabel.font }];
-        CGFloat width = MIN(textSize.width + 32.0, CGRectGetWidth(g_overlayWindow.bounds) - 48.0);
-        g_toastLabel.frame = CGRectMake((CGRectGetWidth(g_overlayWindow.bounds) - width) / 2.0,
-                                        CGRectGetHeight(g_overlayWindow.bounds) - 120.0,
-                                        width, 34.0);
-        [g_overlayWindow bringSubviewToFront:g_toastLabel];
-        NSUInteger generation = ++g_toastGeneration;
-        [UIView animateWithDuration:0.2 animations:^{
-            g_toastLabel.alpha = 1.0;
-        }];
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.6 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            if (generation != g_toastGeneration) {
-                return;
-            }
-            [UIView animateWithDuration:0.3 animations:^{
-                g_toastLabel.alpha = 0.0;
-            }];
-        });
-    });
-}
-
 #pragma mark - 回桌面
 
 /// 回桌面（0.2.27 进程内）：发通知给宿主会话管理器——当前客回后台
 ///（会话保留、收据不清除），宿主界面恢复。不再清启动标记、不再退出进程。
+/// 0.2.44：请求打开切换器——发通知给宿主 VMRootView（与桌面“切换器”
+/// 按钮同一通知）。阈值不变（长按 0.42s／双击／上滑停顿 0.35s）。
+static void SBHomeBarRequestSwitcher(void) {
+    [[NSNotificationCenter defaultCenter] postNotificationName:SBGuestSwitcherRequestedNotification
+                                                        object:nil];
+}
+
 static void SBHomeBarGoHome(void) {
     [[NSNotificationCenter defaultCenter] postNotificationName:SBGuestReturnToHostRequestedNotification
                                                         object:nil];
@@ -226,14 +191,14 @@ void SBHomeBarOverlaySetHidden(BOOL hidden) {
         NSTimeInterval idleTime = CACurrentMediaTime() - self.lastPanMoveTime;
         if (idleTime >= SBHomeBarPauseSeconds - 0.05 && self.lastPanTranslationY < -8.0) {
             self.pauseToastShown = YES;
-            SBHomeBarShowToast(@"切换器 v1 未提供");
+            SBHomeBarRequestSwitcher();
         }
     });
 }
 
 - (void)handleLongPress:(UILongPressGestureRecognizer *)press {
     if (press.state == UIGestureRecognizerStateBegan) {
-        SBHomeBarShowToast(@"切换器 v1 未提供");
+        SBHomeBarRequestSwitcher();
     }
 }
 
@@ -253,7 +218,7 @@ void SBHomeBarOverlaySetHidden(BOOL hidden) {
 }
 
 - (void)handleDoubleTap:(UITapGestureRecognizer *)tap {
-    SBHomeBarShowToast(@"切换器 v1 未提供");
+    SBHomeBarRequestSwitcher();
 }
 
 @end

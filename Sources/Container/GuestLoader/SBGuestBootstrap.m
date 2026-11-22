@@ -289,6 +289,63 @@ static void SBCallHomeBarOverlaySetHidden(BOOL hidden) {
     return NO;
 }
 
+/// 0.2.44：按 bundleID＋diskDirectoryName 回查安装记录里的钥匙串组号。
+/// 记录存在 App Group UserDefaults 的 SBInstalledApps JSON 里（与 Swift
+/// 侧 SBStore 同一键、同一 JSON；keychainGroup 字段名与 SBInstalledApp
+/// 的 Codable 键一致）。diskDirectoryName 为空时退到只按 bundleID 找首条
+///（旧收据无目录名时的兜底，与 SBStore.recordLaunchResult 同款）。
+/// 找不到记录或组号无效返回 -1。只在加载时调（主线程），不作缓存。
+static NSInteger SBGuestRecordKeychainGroup(NSString *bundleID,
+                                            NSString *diskDirectoryName) {
+    if (bundleID.length == 0) {
+        return -1;
+    }
+    NSData *data = [[SBGuestLoader sharedDefaults] objectForKey:@"SBInstalledApps"];
+    if (![data isKindOfClass:[NSData class]] || data.length == 0) {
+        return -1;
+    }
+    id object = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+    if (![object isKindOfClass:[NSArray class]]) {
+        return -1;
+    }
+    NSDictionary *found = nil;
+    for (id item in (NSArray *)object) {
+        if (![item isKindOfClass:[NSDictionary class]]) {
+            continue;
+        }
+        NSDictionary *dict = (NSDictionary *)item;
+        if (![dict[@"bundleID"] isKindOfClass:[NSString class]] ||
+            ![(NSString *)dict[@"bundleID"] isEqualToString:bundleID]) {
+            continue;
+        }
+        if (diskDirectoryName.length > 0) {
+            if ([dict[@"diskDirectoryName"] isKindOfClass:[NSString class]] &&
+                [(NSString *)dict[@"diskDirectoryName"] isEqualToString:diskDirectoryName]) {
+                found = dict;
+                break;
+            }
+            if (!found) {
+                found = dict; // 目录名对不上的候选，先留着当退路
+            }
+        } else {
+            found = dict;
+            break;
+        }
+    }
+    if (!found) {
+        return -1;
+    }
+    id group = found[@"keychainGroup"];
+    if (![group isKindOfClass:[NSNumber class]]) {
+        return -1;
+    }
+    NSInteger value = [(NSNumber *)group integerValue];
+    if (value < 0 || value >= SBKeychainGroupCount) {
+        return -1;
+    }
+    return value;
+}
+
 /// 客加载失败统一记一行（0.2.10 报错日志用）：错误码 + bundle ID +
 /// 包路径 + 原因。failWithError 只造 NSError 不记日志；每个失败点
 /// 先调这里再返回，出错位置由调用点的步骤号标出。
@@ -747,8 +804,11 @@ static NSString *SBGuestWatchdogHostVersion(void) {
 
     // —— 2–5b. 应用客上下文（数据容器/HOME/env、主 Bundle 伪装、可执行路径、进程身份）——
     // 0.2.27：抽成 applyGuestContext，首次加载与会话恢复共用；失败时还原已应用的部分。
-    // 钥匙串组：优先用收据里随启动请求一起带来的组号；没有则按旧兜底
-    //（selection 键 / 容器 UUID 哈希）处理。
+    // 0.2.44：钥匙串组只认记录，不哈希兜底——安装分配（首个空闲组）与
+    // 容器 UUID 哈希（djb2%128）是两套算法，兜底走偏即换组，登录态读不到、
+    // 看起来像“数据无法保留”。解析顺序：传入组号（收据/记录）→ selection
+    // 键 → 按 bundleID＋diskDirectoryName 回查记录 → 哈希（只留给无记录
+    // 可查的极端情形，且日志明文写“无记录，哈希兜底，登录可能不延续”）。
     NSInteger keychainGroup = passedKeychainGroup;
     if (keychainGroup < 0 || keychainGroup >= SBKeychainGroupCount) {
         keychainGroup = -1;
@@ -758,7 +818,16 @@ static NSString *SBGuestWatchdogHostVersion(void) {
         }
     }
     if (keychainGroup < 0 || keychainGroup >= SBKeychainGroupCount) {
+        keychainGroup = SBGuestRecordKeychainGroup(bundleID, diskDirectoryName);
+        if (keychainGroup >= 0) {
+            SBDiagLogLine([[NSString stringWithFormat:@"钥匙串组：%@ 记录查到组 %ld（收据缺组号，按记录补）",
+                            bundleID, (long)keychainGroup] UTF8String]);
+        }
+    }
+    if (keychainGroup < 0 || keychainGroup >= SBKeychainGroupCount) {
         keychainGroup = [self keychainGroupIndexForContainerUUID:containerUUID];
+        SBDiagLogLine([[NSString stringWithFormat:@"钥匙串组：%@ 无记录可查，哈希兜底组 %ld，登录可能不延续",
+                        bundleID, (long)keychainGroup] UTF8String]);
     }
     NSBundle *guestBundle = nil;
     if (![self applyGuestContextForBundleID:bundleID
@@ -825,6 +894,19 @@ static NSString *SBGuestWatchdogHostVersion(void) {
     void *guestHandle = dlopenGuest(guestExecPath, &dlopenError);
     SBDiagLogClearDlopenEntry();
     SBDiagLogWatchdogStepEnd("dlopen");
+    // 0.2.44（A 档 1）：dlopen 慢（步超时）不 exit、不跳 main——看门狗只置
+    // slow 标志、写 slow 记录；这里消费标志位，干净失败“加载超时，请重试”，
+    // 可立即再点。句柄已拿到也照此处理：镜像留在进程里（永不 dlclose），
+    // 下次点开 dyld 按路径去重、直接复用，不丢东西。
+    if (SBDiagLogWatchdogConsumeSlowTimeout()) {
+        SBDiagLogLine([[NSString stringWithFormat:@"客加载：%@ dlopen 步超时（慢加载），干净失败，可重试",
+                        bundleID] UTF8String]);
+        [self restoreHostContext];
+        return [self failWithError:error
+                              code:SBGuestLoaderErrorGuestLoadFailed
+                           message:@"加载超时，请重试"
+                          recovery:@"该应用打开较慢，请再点一次"];
+    }
     if (!guestHandle) {
         SBDiagLogGuestFail(SBGuestLoaderErrorGuestLoadFailed, bundleID, guestExecPath,
                            [NSString stringWithFormat:@"dlopen 失败：%@", dlopenError.localizedDescription ?: @"未知错误"]);

@@ -2,7 +2,9 @@
 
 import CryptoKit
 import Foundation
+import ImageIO
 import Security
+import UniformTypeIdentifiers
 
 /// 安装管线。
 ///
@@ -113,7 +115,9 @@ public enum SBInstaller {
             // 见 SBLCPatcher.m；LCAppInfo.m:326-340 同款调用形状）。
             // 0.2.5：段数不一致不再抛错，置标记记进安装记录（启动时 dyld 会按原文报错）。
             var segMismatch: Int32 = 0
-            let patchResult = SBLCPatchExecutable(executablePath, 1, &segMismatch)
+            // 0.2.44（B-1）：主程序打补丁时带客 bundleID，LC_ID_DYLIB 写
+            // 唯一名 "<bundleID>/<basename>"，不再写裸 basename（Guoguo 碰撞根因）。
+            let patchResult = SBLCPatchExecutableForGuest(executablePath, 1, &segMismatch, parsed.bundleID)
             guard patchResult == SB_LC_PATCH_OK else {
                 throw patchError(for: patchResult)
             }
@@ -126,6 +130,12 @@ public enum SBInstaller {
                 throw SBError.patchFailed(
                     reason: "可执行文件没有足够空间插入 LC_ID_DYLIB，装了也打不开")
             }
+            // 0.2.44（B-2）：整包命名空间——只修主程序不够，framework 的
+            // 安装名与引用也要同步改唯一名，否则 App.framework 还会串味。
+            // 在重签之前跑（改加载命令会使签名失效）。
+            var namespaceWarnings: Int32 = 0
+            let namespaceChanged = SBLCPatchBundleNamespace(destinationDir.path, executablePath, parsed.bundleID, &namespaceWarnings)
+            SBDiagLog.log("安装命名空间改写：\(parsed.bundleID) 改写 \(namespaceChanged) 个文件\(namespaceWarnings > 0 ? "，\(namespaceWarnings) 处改不了（已记警告，原样留着）" : "")")
             // 0.2.17：全包 arm64e 修正改用 LC 原样函数
             // （LCPatchAppBundleFixupARM64eSlice，见 SBLCPatcher.m）。
             // 尽力而为：某文件失败不阻塞安装。
@@ -204,6 +214,15 @@ public enum SBInstaller {
                     to: destinationDir.appendingPathComponent("SBIcon.png"),
                     options: [.atomic]
                 )
+                // 0.2.44（F7）：同时写 128px 缩略图 SBIcon-thumb.png——桌面
+                // 只显示 64pt，1024px 原图每次 body 都全尺寸解码是启动
+                // 空白段的大头；缩略图 128² 解码量是原图的 1/64。
+                if let thumb = Self.downsampledIconPNG(iconData, maxPixelSize: 128) {
+                    try? thumb.write(
+                        to: destinationDir.appendingPathComponent("SBIcon-thumb.png"),
+                        options: [.atomic]
+                    )
+                }
             }
 
             // ---- 数据容器与钥匙串组 ----
@@ -391,7 +410,10 @@ public enum SBInstaller {
                 repatchEntryOffset = rawRepatchEntryOffset
             }
             var segMismatch: Int32 = 0
-            let patchResult = SBLCPatchExecutable(executablePath, 1, &segMismatch)
+            // 0.2.44（B-1/B-2）：重打补丁也带客 bundleID（唯一安装名），
+            // 再跑整包命名空间（已装旧包的 LC_ID_DYLIB 是裸 basename，
+            // 命名空间改写把它改成唯一名——B-3 修复门就靠这个触发条件）。
+            let patchResult = SBLCPatchExecutableForGuest(executablePath, 1, &segMismatch, record.bundleID)
             guard patchResult == SB_LC_PATCH_OK else {
                 throw patchError(for: patchResult)
             }
@@ -400,6 +422,9 @@ public enum SBInstaller {
                 throw SBError.patchFailed(
                     reason: "重打补丁后仍缺少 LC_ID_DYLIB，该应用无法启动")
             }
+            var namespaceWarnings: Int32 = 0
+            let namespaceChanged = SBLCPatchBundleNamespace(appPath, executablePath, record.bundleID, &namespaceWarnings)
+            SBDiagLog.log("重打补丁命名空间改写：\(record.bundleID) 改写 \(namespaceChanged) 个文件\(namespaceWarnings > 0 ? "，\(namespaceWarnings) 处改不了（已记警告，原样留着）" : "")")
             SBLCFixupBundleARM64e(appPath)
             // 0.2.17：appex 也按 LC 的方法打补丁（同安装路径，doInject=false）。
             for appexPath in appexExecutablePaths(appPath: appPath) {
@@ -429,7 +454,7 @@ public enum SBInstaller {
             // 0.2.12：重签后先单查 CMS 证书链（叶子 + WWDR 中间证书），
             // 链不全直接报原因——不要等后面的验签才含糊报错。链不全时
             // 外层 catch 会把主可执行文件还原回备份。
-            let chainDetail = SBCodesignCheck.signatureDetail(atPath: executablePath)
+            let chainDetail = cachedSignatureDetail(atPath: executablePath)
             if !((chainDetail["cmsChainComplete"] as? NSNumber)?.boolValue ?? false) {
                 let chainReason = chainDetail["cmsError"] as? String ?? "CMS 证书链不完整"
                 SBDiagLog.log("重打补丁 CMS 链不完整：\(record.bundleID) \(executablePath) \(chainReason)（\(signatureDetailFields(detail: chainDetail))）")
@@ -506,10 +531,27 @@ public enum SBInstaller {
     /// 客本身无 Team 时跳过 Team 项（无 Team 可比；adhoc/未签名件走 JIT 门）。
     /// 安装时不验 Team（checkTeam: false）：Team 是宿主与客应用的配对属性，
     /// 是部署问题不是签名缺陷；在安装时按 Team 拦会把所有应用都挡在门外。
+    /// 0.2.44（F7）：图标下采样到边长 maxPixelSize 的 PNG（ImageIO 缩略图，
+    /// 带方向修正；失败返回 nil，调用方只写原图、不阻塞安装）。
+    private static func downsampledIconPNG(_ data: Data, maxPixelSize: Int) -> Data? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
+        ]
+        guard let thumb = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else { return nil }
+        let destData = NSMutableData()
+        guard let dest = CGImageDestinationCreateWithData(destData, UTType.png.identifier as CFString, 1, nil) else { return nil }
+        CGImageDestinationAddImage(dest, thumb, nil)
+        guard CGImageDestinationFinalize(dest) else { return nil }
+        return destData as Data
+    }
+
     /// 把签名逐项结果拼成日志字段（0.2.10 报错日志用）：
     /// 有效 / CMS / 页哈希（页数、首坏页）/ Team / identifier / 原因。
     static func signatureDetailFields(at path: String) -> String {
-        signatureDetailFields(detail: SBCodesignCheck.signatureDetail(atPath: path))
+        signatureDetailFields(detail: cachedSignatureDetail(atPath: path))
     }
 
     /// 0.2.12：逐项字段扩到 CMS 全项（链、摘要、叶子到期、备用 CD、特殊槽）。
@@ -693,7 +735,7 @@ public enum SBInstaller {
     }
 
     static func failingSignatureItems(at path: String) -> [String] {
-        failingSignatureItems(detail: SBCodesignCheck.signatureDetail(atPath: path))
+        failingSignatureItems(detail: cachedSignatureDetail(atPath: path))
     }
 
     /// 只抛错、不静默：调用方在 do 块内，抛错会走 catch 还原备份。
@@ -794,8 +836,16 @@ public enum SBInstaller {
     }
 
     static func ensureLaunchableSignature(_ record: SBInstalledApp) async throws -> SBInstalledApp {
+        // 0.2.44（F3 计量）：验签起止行——defer 包住全部返回／抛错路径，
+        // 耗时进日志（0.2.43 日志里验签段完全无计量）。
+        let verifyStart = CFAbsoluteTimeGetCurrent()
+        SBDiagLog.log("签名修复门验签开始：\(record.bundleID)")
+        defer {
+            let verifyMs = Int((CFAbsoluteTimeGetCurrent() - verifyStart) * 1000)
+            SBDiagLog.log("签名修复门验签结束：\(record.bundleID) 耗时 \(verifyMs)ms")
+        }
         let executablePath = record.executableURL.path
-        let gateDetail = SBCodesignCheck.signatureDetail(atPath: executablePath)
+        let gateDetail = cachedSignatureDetail(atPath: executablePath)
         let lastLaunchSigFailed = record.lastLaunchSigFailed
         SBDiagLog.log("签名修复门验签：\(record.bundleID) \(executablePath) \(signatureDetailFields(detail: gateDetail)) 上次签名失败标记=\(lastLaunchSigFailed ? "是" : "否")\(record.lastLaunchResult.map { "（\($0.message.prefix(80))）" } ?? "")")
         // 叶子指纹只记诊断（0.2.39：触发重签已删，见函数头注释）。
@@ -830,6 +880,17 @@ public enum SBInstaller {
                 SBDiagLog.log("签名修复门：\(record.bundleID) \(executablePath) 内核验签通过但缺 LC_ID_DYLIB，走重打补丁")
                 return try await repatchInstalledApp(record)
             }
+            // 0.2.44（B-3）：安装名不是期望唯一名 → 重打补丁（命名空间改写
+            // 会把它改成唯一名）。launchApp 的 patchRevision 门已先拦过
+            // 一次，这里是门本身的第二道（ensureLaunchableSignature 也可
+            // 被别的路直接调）。
+            if installNameNeedsRepair(record) {
+                guard canRepair else {
+                    throw SBError.patchFailed(reason: "安装名不是期望唯一名，且未导入证书，无法重打补丁修复")
+                }
+                SBDiagLog.log("签名修复门：\(record.bundleID) \(executablePath) 内核验签通过但安装名不是期望唯一名，走重打补丁")
+                return try await repatchInstalledApp(record)
+            }
             return clearedSignatureFailure(record)
         }
         // 内核不认，或上次实测死在 dlopen 签名失败（守卫②）：重签。
@@ -848,6 +909,130 @@ public enum SBInstaller {
         // repatchInstalledApp 内已做重签后内核复验（不通过即抛错还原备份），
         // 这里不再重复跑逐项复验。重签后叶子复验也不再做——判定权在内核。
         return repaired
+    }
+
+    // MARK: - 0.2.44（F5）：验签结果进程内缓存
+
+    /// 验签逐项缓存（key=路径＋大小＋修改时间）。每次点图标都对主可执行
+    /// 文件做一次全文件读＋逐页哈希（Spotify 30,676 页 ≈ 122MB），是点开
+    /// 慢的大头；同文件同大小同 mtime 时直接复用。改包必改大小或 mtime，
+    /// 缓存即失效（重签后 mtime 变，下次必重读）。
+    /// 安全情形：缓存的 detail 只作诊断——ensureLaunchableSignature 的放行
+    /// 判定走内核验签＋lastLaunchSigFailed＋LC_ID_DYLIB 门，都不读它，
+    /// 陈旧 detail 不可能造成错误放行。残留风险：同一秒内同大小改写——
+    /// 极小概率，接受（见 build log）。
+    private static var signatureDetailCache: [String: (size: Int64, mtime: TimeInterval, detail: [AnyHashable: Any])] = [:]
+    private static let signatureDetailCacheLock = NSLock()
+
+    static func cachedSignatureDetail(atPath path: String) -> [AnyHashable: Any] {
+        let attrs = try? FileManager.default.attributesOfItem(atPath: path)
+        let size = (attrs?[.size] as? NSNumber)?.int64Value ?? -1
+        let mtime = (attrs?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? -1
+        signatureDetailCacheLock.lock()
+        if let entry = signatureDetailCache[path], entry.size == size, entry.mtime == mtime {
+            signatureDetailCacheLock.unlock()
+            return entry.detail
+        }
+        signatureDetailCacheLock.unlock()
+        let detail = SBCodesignCheck.signatureDetail(atPath: path)
+        signatureDetailCacheLock.lock()
+        signatureDetailCache[path] = (size: size, mtime: mtime, detail: detail)
+        signatureDetailCacheLock.unlock()
+        return detail
+    }
+
+    /// 客可执行文件整文件 Data 缓存（guestLeafFingerprint 用：原来每次点
+    /// 图标都把主可执行文件整个读进内存一次，与 signatureDetail 的全文件
+    /// 读是两次独立的全文件读）。与上面同款 key、同款失效语义。
+    private static var guestExecDataCache: [String: (size: Int64, mtime: TimeInterval, data: Data)] = [:]
+    private static let guestExecDataCacheLock = NSLock()
+
+    private static func cachedGuestExecData(atPath path: String) -> Data? {
+        let attrs = try? FileManager.default.attributesOfItem(atPath: path)
+        let size = (attrs?[.size] as? NSNumber)?.int64Value ?? -1
+        let mtime = (attrs?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? -1
+        guestExecDataCacheLock.lock()
+        if let entry = guestExecDataCache[path], entry.size == size, entry.mtime == mtime {
+            guestExecDataCacheLock.unlock()
+            return entry.data
+        }
+        guestExecDataCacheLock.unlock()
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else { return nil }
+        guestExecDataCacheLock.lock()
+        guestExecDataCache[path] = (size: size, mtime: mtime, data: data)
+        guestExecDataCacheLock.unlock()
+        return data
+    }
+
+    // MARK: - 0.2.44（B-3）：期望安装名与修复门触发条件
+
+    /// 主程序期望的 LC_ID_DYLIB 安装名："<bundleID>/<basename>"。
+    static func expectedInstallName(bundleID: String, executableName: String) -> String {
+        "\(bundleID)/\(executableName)"
+    }
+
+    /// dylinker 复用路的短安装名：6 位 djb2 哈希——须与 LCMachOUtils.m 的
+    /// SBGuestDjb2 与 SBLCPatcher.m 的 SBGuestShortInstallName 同算法
+    ///（djb2，低 24 位，%06llx），否则修复门会误判、每点都重打补丁。
+    static func djb2Hex6(_ string: String) -> String {
+        var hash: UInt64 = 5381
+        for byte in string.utf8 {
+            hash = (hash &* 33) &+ UInt64(byte)
+        }
+        return String(format: "%06llx", hash & 0xffffff)
+    }
+
+    /// 主程序期望的短安装名（dylinker 复用路，名域只有约 8 字节时用）。
+    static func expectedShortInstallName(bundleID: String) -> String {
+        djb2Hex6(bundleID)
+    }
+
+    /// 该客主程序的安装名是不是“不是期望唯一名”（B-3 修复门触发条件）：
+    /// 既不是完整唯一名、也不是短名 → 下次点图标走重打补丁＋命名空间改写。
+    /// 读不到安装名时返回 false（不以此为由触发——缺 LC_ID_DYLIB 另有守卫）。
+    static func installNameNeedsRepair(_ record: SBInstalledApp) -> Bool {
+        var nameBuffer = [CChar](repeating: 0, count: 512)
+        let found = nameBuffer.withUnsafeMutableBufferPointer { buf in
+            SBMachOIDDylibName(record.executableURL.path, buf.baseAddress, buf.count) != 0
+        }
+        guard found else { return false }
+        let current = nameBuffer.withUnsafeBufferPointer { buf in
+            buf.baseAddress.map { String(cString: $0) } ?? ""
+        }
+        guard !current.isEmpty else { return false }
+        let needsRepair = current != expectedInstallName(bundleID: record.bundleID, executableName: record.executableName)
+            && current != expectedShortInstallName(bundleID: record.bundleID)
+        if needsRepair {
+            SBDiagLog.log("签名修复门：\(record.bundleID) 安装名不是期望唯一名（当前=\(current)），触发重打补丁")
+        }
+        return needsRepair
+    }
+
+    // MARK: - 0.2.44（F2）：熔断前置检查
+
+    /// 该客是否在卡死熔断中（熔断步名，nil = 未熔断）。launchApp 的 Task
+    /// 一开头调，在验签之前——0.2.43 的 Aweme 点按先花 79ms 跑完整验签，
+    /// 熔断检查才在 1ms 内拦下。指纹与宿主版本格式与 SBGuestBootstrap 的
+    /// SBGuestWatchdogFingerprintForExecPath／SBGuestWatchdogHostVersion
+    /// 同款（文件名|大小|修改时间秒；版本(构建号)），格式差一个字符即对不上。
+    static func stuckStep(for record: SBInstalledApp) -> String? {
+        let attrs = try? FileManager.default.attributesOfItem(atPath: record.executableURL.path)
+        let size = (attrs?[.size] as? NSNumber)?.int64Value ?? -1
+        let mtime = (attrs?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? -1
+        let fingerprint = "\(record.executableName)|\(size)|\(String(format: "%.0f", mtime))"
+        let info = Bundle.main.infoDictionary
+        let marketing = info?["CFBundleShortVersionString"] as? String ?? "?"
+        let build = info?["CFBundleVersion"] as? String ?? "?"
+        let hostVersion = "\(marketing)(\(build))"
+        var stepBuffer = [CChar](repeating: 0, count: 128)
+        let stuck = stepBuffer.withUnsafeMutableBufferPointer { buf in
+            SBDiagLogIsGuestStuckForGuest(record.bundleID, fingerprint, hostVersion, buf.baseAddress, buf.count) != 0
+        }
+        guard stuck else { return nil }
+        let step = stepBuffer.withUnsafeBufferPointer { buf in
+            buf.baseAddress.map { String(cString: $0) } ?? ""
+        }
+        return step.isEmpty ? "未知步骤" : step
     }
 
     /// 从解析出的 .app 路径反推解析时的临时根目录：往上找到名字以
@@ -1126,7 +1311,9 @@ public enum SBInstaller {
     /// 0x10000；CMS blob 长度含 8 字节 BlobWrapper 头，DER 从槽偏移＋8 起）。
     /// 无签名、无 CMS 槽、解析失败都返回 nil。
     private static func guestLeafFingerprint(atPath path: String) -> String? {
-        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+        // 0.2.44（F5）：整文件 Data 走缓存——原来每次点图标都把主可执行
+        // 文件整个读进内存一次（与 signatureDetail 的全文件读各一次）。
+        guard let data = cachedGuestExecData(atPath: path),
               data.count >= 4 else { return nil }
         var sliceBase = 0
         var sliceLen = data.count

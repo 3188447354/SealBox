@@ -21,12 +21,14 @@
 #import "SBDiagLog.h"
 #import "SBGuestMachOClassList.h"
 #import "SealBox-Swift.h"
+#import <AVFoundation/AVFoundation.h> // 0.2.44：closeGuest 去激活共享音频会话
 
 NSString * const SBGuestReturnToHostRequestedNotification = @"SBGuestReturnToHostRequested";
 NSString * const SBGuestDidEnterBackgroundNotification = @"SBGuestDidEnterBackground";
 NSString * const SBGuestDidEnterForegroundNotification = @"SBGuestDidEnterForeground";
 NSString * const SBGuestActivationFailedNotification = @"SBGuestActivationFailed";
 NSString * const SBGuestActivationFailedMessageKey = @"SBGuestActivationFailedMessage";
+NSString * const SBGuestSwitcherRequestedNotification = @"SBGuestSwitcherRequested";
 
 // 0.2.27：收据阶段与 selection 键的字面量与 SBGuestLoader.m / Swift 侧一致
 //（那两处是 static / 字面量，未进公共头；原型核对三处一致）。
@@ -88,6 +90,18 @@ static NSMutableDictionary<NSString *, id> *SBGuestClassCache(void) {
         cache = [NSMutableDictionary dictionary];
     });
     return cache;
+}
+
+/// 0.2.44（F4）：miss 项记下当时的 dyld 镜像数。镜像数变了（后加载的
+/// framework 可能使旧 miss 过时）只复核 miss 项，不清空 hit 项（hit 的
+/// 类指针在进程内终身有效——镜像永不 dlclose）。
+static NSMutableDictionary<NSString *, NSNumber *> *SBGuestClassMissImageCount(void) {
+    static NSMutableDictionary<NSString *, NSNumber *> *missCounts = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        missCounts = [NSMutableDictionary dictionary];
+    });
+    return missCounts;
 }
 
 /// 直接读客 Mach-O 的 __objc_classlist，找名字是 className 且定义在客
@@ -177,16 +191,31 @@ static Class SBGuestClassNamedInGuest(NSString *className, NSString *bundleID,
     // scene delegate）都是一步，阈值 2s——读表应为毫秒级，2s 即异常。
     SBDiagLogWatchdogStepBegin("class-resolve", 2.0);
     NSString *fingerprint = SBGuestExecFingerprint(guestExecPath);
-    // 0.2.43：miss 缓存 key 追加 dyld 镜像数——同一进程内后加载的
-    // framework 可能使旧 miss 过时（旧 key 不含镜像数，见调查报告 §5.2-9）。
-    NSString *cacheKey = [NSString stringWithFormat:@"%@|%@|%@|%u", bundleID, fingerprint, className, _dyld_image_count()];
+    // 0.2.44（F4）：缓存 key 去掉镜像数——0.2.43 的 key 含镜像数，同一进程
+    // 内每 dlopen 一个新客、镜像数一变，之前缓存的 hit/miss 全失效，
+    // 每次激活 2–3 次 miss 各付 139–221ms 全量重扫。改为：hit 永不清
+    //（类指针进程内终身有效）；miss 只在镜像数变了时复核一次。
+    NSString *cacheKey = [NSString stringWithFormat:@"%@|%@|%@", bundleID, fingerprint, className];
     NSMutableDictionary<NSString *, id> *cache = SBGuestClassCache();
     id cached = cache[cacheKey];
     Class cls = Nil;
     if (cached) {
-        cls = (cached == (id)[NSNull null]) ? Nil : (__bridge Class)[(NSValue *)cached pointerValue];
-        SBDiagLogWatchdogStepEnd("class-resolve");
-        return cls;
+        if (cached == (id)[NSNull null]) {
+            NSNumber *missCount = SBGuestClassMissImageCount()[cacheKey];
+            if (missCount && missCount.unsignedIntValue != _dyld_image_count()) {
+                // 镜像数变了：旧 miss 可能过时（后加载的 framework 带来了
+                // 这个类），删掉重扫；不清空 hit 项。
+                [cache removeObjectForKey:cacheKey];
+                [SBGuestClassMissImageCount() removeObjectForKey:cacheKey];
+            } else {
+                SBDiagLogWatchdogStepEnd("class-resolve");
+                return Nil;
+            }
+        } else {
+            cls = (__bridge Class)[(NSValue *)cached pointerValue];
+            SBDiagLogWatchdogStepEnd("class-resolve");
+            return cls;
+        }
     }
     cls = SBGuestClassNamedInGuestImage(className, guestAppPath, guestExecPath);
     Class globalDiag = Nil;
@@ -217,6 +246,7 @@ static Class SBGuestClassNamedInGuest(NSString *className, NSString *bundleID,
         }
     }
     cache[cacheKey] = (id)[NSNull null];
+    SBGuestClassMissImageCount()[cacheKey] = @(_dyld_image_count());
     SBDiagLogWatchdogStepEnd("class-resolve");
     return Nil;
 }
@@ -405,6 +435,7 @@ static Class SBGuestClassNamedForSession(NSString *className, SBGuestSession *se
         session.guestSceneDelegate = session.guestScene.delegate;
     }
     session.active = YES;
+    session.lastActiveAt = [NSDate date];
     self.currentBundleID = session.bundleID;
     [session.guestWindow makeKeyAndVisible];
     SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 已激活（客窗 %@，scene %@）",
@@ -506,6 +537,44 @@ static Class SBGuestClassNamedForSession(NSString *className, SBGuestSession *se
                     sessionRole:UIWindowSceneSessionRoleApplication];
     config.delegateClass = delegateClass;
     return config;
+}
+
+/// 0.2.44 C-层2 (a)(b)：收养客已建的窗并完成激活。窗先找当前 keyWindow
+///（findGuestWindowForSession 会排除激活前窗口集合与宿主窗），找不到再读
+/// delegate.window；窗须非空、不是宿主窗。收养时挂到宿主 scene 上、
+/// makeKeyAndVisible、completeActivation。返回 YES = 已收养并完成激活
+///（调用方直接返回）；NO = 无窗可收养。
+- (BOOL)adoptGuestWindowForSession:(SBGuestSession *)session {
+    UIWindow *guestWindow = [self findGuestWindowForSession:session];
+    if (!guestWindow) {
+        id delegate = session.guestAppDelegate;
+        if ([delegate respondsToSelector:@selector(window)]) {
+            UIWindow *delegateWindow = nil;
+            @try {
+                delegateWindow = [delegate window];
+            } @catch (NSException *exception) {
+                SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 回退链(a) 读 delegate.window 异常（%@）",
+                                session.bundleID, exception.name] UTF8String]);
+                delegateWindow = nil;
+            }
+            if (delegateWindow && delegateWindow != self.hostWindow &&
+                ![session.windowsBeforeActivation containsObject:delegateWindow]) {
+                guestWindow = delegateWindow;
+            }
+        }
+    }
+    if (!guestWindow) {
+        return NO;
+    }
+    if (!guestWindow.windowScene && self.hostScene) {
+        guestWindow.windowScene = self.hostScene;
+    }
+    SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 回退链(a)：收养客窗（scene 已挂宿主），完成激活",
+                    session.bundleID] UTF8String]);
+    guestWindow.hidden = NO;
+    [guestWindow makeKeyAndVisible];
+    [self completeActivationForSession:session];
+    return YES;
 }
 
 /// 手动路：在宿主 scene 上换入客 scene delegate、调 willConnect，让客建窗。
@@ -613,12 +682,46 @@ static Class SBGuestClassNamedForSession(NSString *className, SBGuestSession *se
             config = nil;
         }
     }
-    if (!config) {
-        config = [self sceneConfigurationFromGuestPlist:session];
+    // 0.2.44 C-层1：delegate 可能返回“有配置、无 delegate 类”的空壳
+    //（Dopamine 2.x 的 configurationForConnectingSceneSession 只给名不给
+    // 类）；空壳时读 plist 合并——plist 有 delegate 类就填进空壳配置，
+    // 否则直接用 plist 配置。正常启动时 UIKit 也是这么补全的。
+    if (!config || !config.delegateClass) {
+        UISceneConfiguration *plistConfig = [self sceneConfigurationFromGuestPlist:session];
+        if (config && plistConfig && plistConfig.delegateClass) {
+            config.delegateClass = plistConfig.delegateClass;
+            SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ scene 配置合并（delegate 给了空壳配置，delegate 类 %@ 取自 Info.plist）",
+                            context.bundleID, NSStringFromClass(plistConfig.delegateClass)] UTF8String]);
+        } else if (!config && plistConfig) {
+            config = plistConfig;
+            SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ scene 配置已取（plist，delegate 类 %@）",
+                            context.bundleID, NSStringFromClass(plistConfig.delegateClass)] UTF8String]);
+        }
     }
     if (!config || !config.delegateClass) {
+        // 0.2.44 C-层2 回退链（只在 UIKit 路径；SwiftUI 不进 driveSceneManually）：
+        // (a) 收养客 delegate 已建的窗（didFinishLaunching 里建了窗但没
+        // 显示、或异步建窗晚于同步检查）；(b) 同一步处理（窗存在但没显示）；
+        // (c) 仅无窗且无配置时，补调一次 applicationDidBecomeActive:。
+        if ([self adoptGuestWindowForSession:session]) {
+            return;
+        }
+        id guestDelegate = session.guestAppDelegate;
+        if (guestDelegate && [guestDelegate respondsToSelector:@selector(applicationDidBecomeActive:)]) {
+            SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 回退链(c)：无窗且无配置，补调 applicationDidBecomeActive: 一次",
+                            context.bundleID] UTF8String]);
+            @try {
+                [guestDelegate applicationDidBecomeActive:[UIApplication sharedApplication]];
+            } @catch (NSException *exception) {
+                SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 回退链(c) 补调异常（%@），停",
+                                context.bundleID, exception.name] UTF8String]);
+            }
+            if ([self adoptGuestWindowForSession:session]) {
+                return;
+            }
+        }
         [self failActivationForSession:session
-                               message:@"客 App 未提供 scene 配置，无法创建窗口"];
+                               message:@"客 App 未提供 scene 配置，无法创建窗口（已试 delegate 窗口收养与激活回调回退）"];
         return;
     }
     SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 手动 willConnect：scene 配置已取（delegate 类 %@）",
@@ -1036,21 +1139,18 @@ static Class SBGuestClassNamedForSession(NSString *className, SBGuestSession *se
     // scene 客：先试系统路（UIKit 经 delegate 问配置、请求 scene session），
     // 0.4 秒后补查，无窗则手动 willConnect。宿主 MultipleScenes=false，
     // iPhone 上系统路大概率不建新 scene，手动路是主路。
-    [app requestSceneSessionActivation:nil
-                          userActivity:nil
-                               options:nil
-                          errorHandler:^(NSError *requestError) {
-        SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 请求 scene session 失败（%@），等 0.4 秒补查走手动路",
-                        context.bundleID, requestError.localizedDescription] UTF8String]);
-    }];
-    // 0.2.42 看门狗“scene-check”步，阈值 2s（0.4s＋余量）；步在
-    // checkSceneSystemPathForSession 入口结束（或会话已释放分支）。
+    // 0.2.44（F1）：errorHandler 已同步失败时 0.4 秒是纯浪费——系统路已
+    // 经判死刑，立即走手动路（等待 0ms）。0.2.43 日志里这步占全流程
+    // 37%–68%（Loon 412ms、Dopamine 412ms、Spotify 402ms）。
     SBDiagLogWatchdogStepBegin("scene-check", 2.0);
     __weak SBGuestSession *weakSession = session;
     NSString *checkBundleID = session.bundleID;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
-                                 (int64_t)(SBGuestSceneSystemPathWaitSeconds * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
+    __block BOOL sceneCheckDone = NO;
+    void (^runSceneCheck)(void) = ^{
+        if (sceneCheckDone) {
+            return;
+        }
+        sceneCheckDone = YES;
         SBGuestSession *strongSession = weakSession;
         if (strongSession) {
             [self checkSceneSystemPathForSession:strongSession];
@@ -1062,6 +1162,19 @@ static Class SBGuestClassNamedForSession(NSString *className, SBGuestSession *se
             SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 0.4 秒补查：会话已释放，不补查",
                             checkBundleID] UTF8String]);
         }
+    };
+    [app requestSceneSessionActivation:nil
+                          userActivity:nil
+                               options:nil
+                          errorHandler:^(NSError *requestError) {
+        SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 请求 scene session 失败（%@），立即走手动路（等待 0ms）",
+                        context.bundleID, requestError.localizedDescription] UTF8String]);
+        runSceneCheck();
+    }];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                 (int64_t)(SBGuestSceneSystemPathWaitSeconds * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        runSceneCheck();
     });
     return YES;
 }
@@ -1211,6 +1324,89 @@ static Class SBGuestClassNamedForSession(NSString *className, SBGuestSession *se
 
 #pragma mark - 恢复 / 回后台
 
+/// 0.2.44：补发客生命周期后台回调。进程内模型下 UIKit 永远不会替客调
+/// 这些——大量应用只在后台回调里落盘／停音频；不补，数据只在内存里，
+/// 杀进程即丢（问题 2 的主因 R2-A）。与 didFinishLaunching 调用点同款
+/// 写法：respondsToSelector＋@try；顺序与真机一致（先 resignActive，
+/// 再 didEnterBackground；scene 侧同理）。guard：SwiftUI 嵌客无 adaptor
+/// 时 guestAppDelegate 为 nil，静默跳过。
+- (void)notifyGuestDidEnterBackgroundForSession:(SBGuestSession *)session {
+    UIApplication *app = [UIApplication sharedApplication];
+    id appDelegate = session.guestAppDelegate;
+    if (appDelegate) {
+        if ([appDelegate respondsToSelector:@selector(applicationWillResignActive:)]) {
+            @try { [appDelegate applicationWillResignActive:app]; } @catch (NSException *e) {
+                SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 后台回调 applicationWillResignActive 异常（%@），已跳过",
+                                session.bundleID, e.name] UTF8String]);
+            }
+        }
+        if ([appDelegate respondsToSelector:@selector(applicationDidEnterBackground:)]) {
+            @try { [appDelegate applicationDidEnterBackground:app]; } @catch (NSException *e) {
+                SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 后台回调 applicationDidEnterBackground 异常（%@），已跳过",
+                                session.bundleID, e.name] UTF8String]);
+            }
+        }
+    }
+    id sceneDelegate = session.guestSceneDelegate;
+    UIScene *scene = session.guestScene;
+    if (sceneDelegate && scene) {
+        if ([sceneDelegate respondsToSelector:@selector(sceneWillResignActive:)]) {
+            @try { [sceneDelegate sceneWillResignActive:scene]; } @catch (NSException *e) {
+                SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 后台回调 sceneWillResignActive 异常（%@），已跳过",
+                                session.bundleID, e.name] UTF8String]);
+            }
+        }
+        if ([sceneDelegate respondsToSelector:@selector(sceneDidEnterBackground:)]) {
+            @try { [sceneDelegate sceneDidEnterBackground:scene]; } @catch (NSException *e) {
+                SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 后台回调 sceneDidEnterBackground 异常（%@），已跳过",
+                                session.bundleID, e.name] UTF8String]);
+            }
+        }
+    }
+    SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 已补发后台生命周期回调（客自停／落盘）",
+                    session.bundleID] UTF8String]);
+}
+
+/// 0.2.44：补发客生命周期前台回调（与后台回调对称：先 willEnterForeground，
+/// 再 didBecomeActive；scene 侧同理）。在窗已 key、active=YES 之后调，
+/// 与真机“窗可见后再激活”一致。
+- (void)notifyGuestWillEnterForegroundForSession:(SBGuestSession *)session {
+    UIApplication *app = [UIApplication sharedApplication];
+    id appDelegate = session.guestAppDelegate;
+    if (appDelegate) {
+        if ([appDelegate respondsToSelector:@selector(applicationWillEnterForeground:)]) {
+            @try { [appDelegate applicationWillEnterForeground:app]; } @catch (NSException *e) {
+                SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 前台回调 applicationWillEnterForeground 异常（%@），已跳过",
+                                session.bundleID, e.name] UTF8String]);
+            }
+        }
+        if ([appDelegate respondsToSelector:@selector(applicationDidBecomeActive:)]) {
+            @try { [appDelegate applicationDidBecomeActive:app]; } @catch (NSException *e) {
+                SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 前台回调 applicationDidBecomeActive 异常（%@），已跳过",
+                                session.bundleID, e.name] UTF8String]);
+            }
+        }
+    }
+    id sceneDelegate = session.guestSceneDelegate;
+    UIScene *scene = session.guestScene;
+    if (sceneDelegate && scene) {
+        if ([sceneDelegate respondsToSelector:@selector(sceneWillEnterForeground:)]) {
+            @try { [sceneDelegate sceneWillEnterForeground:scene]; } @catch (NSException *e) {
+                SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 前台回调 sceneWillEnterForeground 异常（%@），已跳过",
+                                session.bundleID, e.name] UTF8String]);
+            }
+        }
+        if ([sceneDelegate respondsToSelector:@selector(sceneDidBecomeActive:)]) {
+            @try { [sceneDelegate sceneDidBecomeActive:scene]; } @catch (NSException *e) {
+                SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 前台回调 sceneDidBecomeActive 异常（%@），已跳过",
+                                session.bundleID, e.name] UTF8String]);
+            }
+        }
+    }
+    SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 已补发前台生命周期回调",
+                    session.bundleID] UTF8String]);
+}
+
 - (nullable SBGuestSession *)resumeGuestWithBundleID:(NSString *)bundleID {
     if (![NSThread isMainThread]) {
         __block SBGuestSession *result = nil;
@@ -1263,7 +1459,10 @@ static Class SBGuestClassNamedForSession(NSString *className, SBGuestSession *se
     session.guestWindow.hidden = NO;
     [session.guestWindow makeKeyAndVisible];
     session.active = YES;
+    session.lastActiveAt = [NSDate date];
     self.currentBundleID = bundleID;
+    // 0.2.44：窗已 key、active=YES 之后补发前台回调（客恢复播放／刷新 UI）。
+    [self notifyGuestWillEnterForegroundForSession:session];
     SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 已恢复（后台→前台，未重 dlopen/未重跑 main）",
                     bundleID] UTF8String]);
     [[NSNotificationCenter defaultCenter] postNotificationName:SBGuestDidEnterForegroundNotification
@@ -1282,6 +1481,10 @@ static Class SBGuestClassNamedForSession(NSString *className, SBGuestSession *se
     if (!session || !session.active) {
         return;
     }
+    // 0.2.44：藏窗之前先补发后台回调——客在回调里落盘／停音频；回调之后
+    // 才藏窗、换出 delegate、恢复宿主环境。
+    [self notifyGuestDidEnterBackgroundForSession:session];
+    session.lastActiveAt = [NSDate date];
     session.guestWindow.hidden = YES;
     session.active = NO;
     self.currentBundleID = nil;
@@ -1308,6 +1511,96 @@ static Class SBGuestClassNamedForSession(NSString *className, SBGuestSession *se
     // 浮层（注入件）发的回宿主请求：当前客回后台，会话保留、收据不清除。
     SBDiagLogLine([@"进程内进客：收到回宿主请求（侧滑/横杠），当前客回后台" UTF8String]);
     [self backgroundCurrentGuest];
+}
+
+#pragma mark - 关闭客 / 切换器快照（0.2.44）
+
+- (void)closeGuestWithBundleID:(NSString *)bundleID {
+    if (![NSThread isMainThread]) {
+        dispatch_sync(dispatch_get_main_queue(), ^{
+            [self closeGuestWithBundleID:bundleID];
+        });
+        return;
+    }
+    SBGuestSession *session = self.sessions[bundleID];
+    if (!session) {
+        SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：关闭 %@：无此会话，空操作",
+                        bundleID] UTF8String]);
+        return;
+    }
+    // 1. 前台客先回后台：backgroundCurrentGuest 藏窗、换出 delegate、
+    // 恢复宿主环境，之前已补发后台回调（客自停／落盘）。后台客跳过此步。
+    if (session.active && [self.currentBundleID isEqualToString:bundleID]) {
+        [self backgroundCurrentGuest];
+    }
+    // 2. 去激活共享音频会话（问题 3）。进程级操作：不用 AVAudioSession 的
+    // 客、或后台线程重激活会话的客停不掉（见 build log 诚实缺口）；多客
+    // 同播时这是全进程静音，不是单客静音——文案不得承诺“只停这一个”。
+    // 去激活失败只记日志，绝不阻塞后续步骤（关客必须能关到底）。
+    NSError *audioError = nil;
+    [[AVAudioSession sharedInstance] setActive:NO
+                                   withOptions:AVAudioSessionSetActiveOptionNotifyOthersOnDeactivation
+                                         error:&audioError];
+    if (audioError) {
+        SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：关闭 %@：音频会话去激活失败（%@），继续关",
+                        bundleID, audioError.localizedDescription] UTF8String]);
+    } else {
+        SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：关闭 %@：音频会话已去激活",
+                        bundleID] UTF8String]);
+    }
+    // 3. 清会话（当前客指针一并清）。
+    [self.sessions removeObjectForKey:bundleID];
+    if ([self.currentBundleID isEqualToString:bundleID]) {
+        self.currentBundleID = nil;
+    }
+    // 4. 释窗口：藏窗、根视图置空、delegate／hosting 引用置空。
+    UIWindow *guestWindow = session.guestWindow;
+    if (guestWindow) {
+        guestWindow.hidden = YES;
+        guestWindow.rootViewController = nil;
+    }
+    session.guestWindow = nil;
+    session.guestAppDelegate = nil;
+    session.guestSceneDelegate = nil;
+    session.guestSwiftUIApp = nil;
+    session.guestHostingController = nil;
+    session.guestScene = nil;
+    // 5. 不 dlclose、不删容器、不清钥匙串——关 ≠ 删。下次点图标走冷启动
+    //（签名门重跑；镜像仍在进程里，dyld 按路径去重、直接复用）。
+    SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 已关闭（会话已清、窗口已释；下次点图标冷启动）",
+                    bundleID] UTF8String]);
+}
+
+- (NSArray<NSDictionary *> *)activeSessions {
+    NSMutableArray<NSDictionary *> *result = [NSMutableArray array];
+    for (SBGuestSession *session in self.sessions.allValues) {
+        if (!session.loaded) {
+            continue;
+        }
+        NSMutableDictionary *dict = [NSMutableDictionary dictionary];
+        dict[@"bundleID"] = session.bundleID ?: @"";
+        dict[@"containerUUID"] = session.containerUUID ?: @"";
+        if (session.lastActiveAt) {
+            dict[@"lastActiveAt"] = session.lastActiveAt;
+        }
+        [result addObject:dict];
+    }
+    // 按上次活跃倒序；无时间戳（旧会话）的排最后。
+    [result sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        NSDate *da = a[@"lastActiveAt"];
+        NSDate *db = b[@"lastActiveAt"];
+        if (!da && !db) {
+            return NSOrderedSame;
+        }
+        if (!da) {
+            return NSOrderedDescending;
+        }
+        if (!db) {
+            return NSOrderedAscending;
+        }
+        return [db compare:da];
+    }];
+    return result;
 }
 
 @end

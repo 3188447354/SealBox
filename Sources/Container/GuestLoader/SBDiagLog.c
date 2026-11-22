@@ -57,6 +57,13 @@
 #define SB_DIAG_WD_CHECK_MS 500
 #define SB_DIAG_WD_STALL_LIMIT_MS 5000
 #define SB_DIAG_WD_TOTAL_LIMIT_MS 20000
+/// 0.2.44 分级熔断：步超时（慢）与真卡死分开。慢触发后、主线程心跳仍死
+/// 超过该宽限才升级为真卡死 exit；宽限内主线程返回即干净失败、可重试。
+#define SB_DIAG_WD_SLOW_GRACE_MS 5000
+/// slow 连续达该次数升级为 stuck（永久拦，直到指纹/版本变或成功激活清）。
+#define SB_DIAG_SLOW_MAX_COUNT 3
+/// slow 记录过期时限（秒）：超期即失效、可再试。
+#define SB_DIAG_SLOW_EXPIRY_SECONDS 86400
 #define SB_DIAG_MAX_FILES 20
 #define SB_DIAG_MAX_TOTAL_BYTES (2 * 1024 * 1024)
 
@@ -97,6 +104,11 @@ static uint64_t g_wdStepStartMs = 0;
 static uint64_t g_wdFlowStartMs = 0;
 static volatile uint64_t g_wdLastHeartbeatMs = 0;
 static int g_wdTimedOut = 0;
+/// 0.2.44：步超时（慢）标志——看门狗线程置位，不杀进程；主线程在 dlopen
+/// 返回后消费（见 SBDiagLogWatchdogConsumeSlowTimeout），置位即干净失败
+/// “加载超时，请重试”。g_wdSlowAtMs 是置位时刻（单调时钟），宽限计时用。
+static int g_wdSlowTimedOut = 0;
+static uint64_t g_wdSlowAtMs = 0;
 /// 超时写熔断时用的熔断目录快照（武装时从 g_fuseDir 拷；BeginRun 后即稳定）。
 static char g_wdFuseDir[PATH_MAX + 64];
 #if defined(__APPLE__)
@@ -782,7 +794,7 @@ void SBDiagLogBeginRun(void) {
                 size_t contentLen = 0;
                 char *content = SBDiagReadFile(fusePath, &contentLen);
                 if (content && contentLen > 0) {
-                    // 四行：步名、耗时秒、指纹、宿主版本——只取前两行。
+                    // 六行：步名、耗时秒、指纹、宿主版本、kind、计数/时间戳——只取前两行。
                     char *nl1 = strchr(content, '\n');
                     if (nl1) {
                         *nl1 = '\0';
@@ -1244,16 +1256,38 @@ static int SBDiagStuckPathFromDir(const char *dir, const char *guestBundleID,
     return rc > 0 && (size_t)rc < outLen;
 }
 
-/// 熔断文件内容（四行：步名、步耗时秒、客指纹、宿主版本）。
+/// 熔断文件内容（0.2.44 起六行：步名、步耗时秒、客指纹、宿主版本、
+/// kind（slow | stuck）、计数/时间戳）。旧四行记录读时按 slow 计一次
+///（见 IsGuestStuckForGuest）；升 0.2.44 改了宿主版本，旧记录本就因
+/// 版本对不上而失效，无需迁移。
 static int SBDiagStuckContent(const char *step, double elapsedSeconds,
                               const char *fingerprint, const char *hostVersion,
+                              const char *kind, int count, long long timestamp,
                               char *out, size_t outLen) {
-    int n = snprintf(out, outLen, "%s\n%.1f\n%s\n%s\n",
+    int n = snprintf(out, outLen, "%s\n%.1f\n%s\n%s\n%s\n%d/%lld\n",
                      (step && step[0] != '\0') ? step : "未知步骤",
                      elapsedSeconds,
                      (fingerprint && fingerprint[0] != '\0') ? fingerprint : "?",
-                     (hostVersion && hostVersion[0] != '\0') ? hostVersion : "?");
+                     (hostVersion && hostVersion[0] != '\0') ? hostVersion : "?",
+                     (kind && kind[0] != '\0') ? kind : "stuck",
+                     count, timestamp);
     return n > 0 && (size_t)n < outLen;
+}
+
+/// 六行熔断记录原样写盘（不拿日志锁、不记日志行——超时路径上调）。
+static void SBDiagWriteStuckRecord(const char *path, const char *step,
+                                   double elapsedSeconds,
+                                   const char *fingerprint,
+                                   const char *hostVersion,
+                                   const char *kind, int count,
+                                   long long timestamp) {
+    char content[1024];
+    if (!SBDiagStuckContent(step, elapsedSeconds, fingerprint, hostVersion,
+                            kind, count, timestamp,
+                            content, sizeof(content))) {
+        return;
+    }
+    SBDiagWriteFile(path, content, strlen(content));
 }
 
 void SBDiagLogMarkStuckGuest(const char *guestBundleID, const char *step, double elapsedSeconds, const char *fingerprint, const char *hostVersion) {
@@ -1262,12 +1296,8 @@ void SBDiagLogMarkStuckGuest(const char *guestBundleID, const char *step, double
     if (!SBDiagStuckPath(guestBundleID, path, sizeof(path), &isShared)) {
         return;
     }
-    char content[1024];
-    if (!SBDiagStuckContent(step, elapsedSeconds, fingerprint, hostVersion,
-                            content, sizeof(content))) {
-        return;
-    }
-    SBDiagWriteFile(path, content, strlen(content));
+    SBDiagWriteStuckRecord(path, step, elapsedSeconds, fingerprint, hostVersion,
+                           "stuck", 1, (long long)time(NULL));
     {
         char line[512];
         int ln = snprintf(line, sizeof(line), "卡死熔断记录已写%s：%s（%s）",
@@ -1293,8 +1323,9 @@ int SBDiagLogIsGuestStuckForGuest(const char *guestBundleID, const char *fingerp
     int stuck = 0;
     const char *why = "无记录";
     if (content && len > 0) {
-        // 四行：步名、耗时秒、指纹、宿主版本——后两行都对上才熔断；
-        // 任一不符（重装/升级）即失效、自动重试。
+        // 六行：步名、耗时秒、指纹、宿主版本、kind、计数/时间戳——指纹与
+        // 版本两行都对上才继续看 kind；任一不符（重装/升级）即失效、自动重试。
+        // kind 缺失 = 旧四行记录，按 slow 计一次（可重试，不永久封）。
         char *nl1 = strchr(content, '\n');
         if (!nl1) {
             why = "记录损坏（不是四行）";
@@ -1317,11 +1348,58 @@ int SBDiagLogIsGuestStuckForGuest(const char *guestBundleID, const char *fingerp
                     if (nl4) {
                         *nl4 = '\0';
                     }
-                    stuck = (fingerprint && strcmp(line3, fingerprint) == 0 &&
-                             hostVersion && strcmp(line4, hostVersion) == 0);
-                    why = stuck ? "指纹与宿主版本均对上" : "记录不符（指纹/版本已变）";
-                    if (stuck && stepOut && stepOutSize > 0) {
-                        (void)snprintf(stepOut, stepOutSize, "%s", content);
+                    if (!(fingerprint && strcmp(line3, fingerprint) == 0 &&
+                          hostVersion && strcmp(line4, hostVersion) == 0)) {
+                        why = "记录不符（指纹/版本已变）";
+                    } else {
+                        // 指纹与版本均对上：看 kind（第 5 行）与计数/时间戳（第 6 行）。
+                        char *kind = NULL;
+                        char *countLine = NULL;
+                        if (nl4) {
+                            kind = nl4 + 1;
+                            char *nl5 = strchr(kind, '\n');
+                            if (nl5) {
+                                *nl5 = '\0';
+                                countLine = nl5 + 1;
+                                char *nl6 = strchr(countLine, '\n');
+                                if (nl6) {
+                                    *nl6 = '\0';
+                                }
+                            }
+                        }
+                        if (!kind || kind[0] == '\0') {
+                            // 旧四行记录：按 slow 计一次，可重试。
+                            why = "旧记录（按 slow 计 1 次，可重试）";
+                        } else if (strcmp(kind, "stuck") == 0) {
+                            stuck = 1;
+                            why = "指纹与宿主版本均对上";
+                        } else if (strcmp(kind, "slow") == 0) {
+                            int count = 0;
+                            long long ts = 0;
+                            if (countLine) {
+                                (void)sscanf(countLine, "%d/%lld", &count, &ts);
+                            }
+                            if (count <= 0) {
+                                count = 1;
+                            }
+                            long long now = (long long)time(NULL);
+                            if (ts > 0 && now - ts > SB_DIAG_SLOW_EXPIRY_SECONDS) {
+                                why = "慢加载记录已过期（>24h），可再试";
+                            } else if (count >= SB_DIAG_SLOW_MAX_COUNT) {
+                                stuck = 1;
+                                why = "慢加载连续 3 次，已升级熔断";
+                            } else {
+                                static char slowWhy[128];
+                                (void)snprintf(slowWhy, sizeof(slowWhy),
+                                               "慢加载计数 %d（可重试）", count);
+                                why = slowWhy;
+                            }
+                        } else {
+                            why = "记录 kind 未知，不拦";
+                        }
+                        if (stuck && stepOut && stepOutSize > 0) {
+                            (void)snprintf(stepOut, stepOutSize, "%s", content);
+                        }
                     }
                 }
             }
@@ -1338,6 +1416,72 @@ int SBDiagLogIsGuestStuckForGuest(const char *guestBundleID, const char *fingerp
         }
     }
     return stuck;
+}
+
+/// 读一份熔断记录里的 slow 计数与时间戳（只认 kind=slow 的六行记录；
+/// 旧四行按计数 1 计；无记录/非 slow 返回计数 0）。供看门狗线程写下一
+/// 次 slow 记录时计数 +1 用（超时路径，不拿日志锁）。
+static int SBDiagSlowCountFromDir(const char *dir, const char *guestBundleID,
+                                  int *countOut, long long *tsOut) {
+    if (countOut) {
+        *countOut = 0;
+    }
+    if (tsOut) {
+        *tsOut = 0;
+    }
+    char path[PATH_MAX + 64];
+    if (!SBDiagStuckPathFromDir(dir, guestBundleID, path, sizeof(path))) {
+        return 0;
+    }
+    size_t len = 0;
+    char *content = SBDiagReadFile(path, &len);
+    if (!content || len == 0) {
+        free(content);
+        return 0;
+    }
+    int count = 0;
+    long long ts = 0;
+    // 逐行走到第 5 行 kind、第 6 行计数/时间戳；行数不足即旧四行记录。
+    char *cur = content;
+    int lineNo = 0;
+    char *kind = NULL;
+    char *countLine = NULL;
+    while (cur && *cur != '\0') {
+        lineNo++;
+        char *nl = strchr(cur, '\n');
+        if (nl) {
+            *nl = '\0';
+        }
+        if (lineNo == 5) {
+            kind = cur;
+        } else if (lineNo == 6) {
+            countLine = cur;
+        }
+        if (!nl) {
+            break;
+        }
+        cur = nl + 1;
+    }
+    if (!kind || kind[0] == '\0') {
+        // 旧四行记录：按 slow 计一次。
+        count = 1;
+    } else if (strcmp(kind, "slow") == 0 && countLine) {
+        (void)sscanf(countLine, "%d/%lld", &count, &ts);
+        if (count <= 0) {
+            count = 1;
+        }
+    } else {
+        // stuck 记录或 kind 未知：slow 计数从 0 起（不沿用 stuck 的计数）。
+        count = 0;
+    }
+    free(content);
+    if (countOut) {
+        *countOut = count;
+    }
+    if (tsOut) {
+        *tsOut = ts;
+    }
+    return 1;
 }
 
 void SBDiagLogClearStuckGuestForGuest(const char *guestBundleID) {
@@ -1409,6 +1553,55 @@ static void SBDiagTimeoutTimestamp(char *out, size_t outSize) {
     }
 }
 
+/// 写一行 WATCHDOG TIMEOUT（超时路径专用：先 trylock 走正常写盘路，
+/// 拿不到锁直接对 g_fd 写＋fsync，死点信息一定落盘；不拿日志锁等待）。
+static void SBDiagWriteTimeoutLine(const char *step, const char *why,
+                                   uint64_t stepMs, uint64_t flowMs) {
+    char ts[32];
+    SBDiagTimeoutTimestamp(ts, sizeof(ts));
+    char line[1024];
+    int n = snprintf(line, sizeof(line),
+                     "[%s] WATCHDOG TIMEOUT at %s（%s，步耗时 %llums，全流程 %llums）\n",
+                     ts, (step && step[0] != '\0') ? step : "未知步骤", why,
+                     (unsigned long long)stepMs, (unsigned long long)flowMs);
+    if (n <= 0) {
+        return;
+    }
+    if (pthread_mutex_trylock(&g_lock) == 0) {
+        if (g_begun && g_fd >= 0) {
+            SBDiagWriteAll(g_fd, line, (size_t)n);
+        }
+        pthread_mutex_unlock(&g_lock);
+    } else {
+        int fd = g_fd; // BeginRun 后即稳定；未 BeginRun 时为 -1，不写
+        if (fd >= 0) {
+            SBDiagWriteAll(fd, line, (size_t)n);
+        }
+    }
+}
+
+/// 0.2.44：slow 记录写盘（看门狗线程调）：计数 = 旧记录计数 +1（旧四行
+/// 按 1 计），kind=slow，时间戳=现在。不杀进程、不 exit。
+static void SBDiagMarkSlowGuest(const char *guestBundleID, const char *step,
+                                double elapsedSeconds, const char *fingerprint,
+                                const char *hostVersion, const char *fuseDir) {
+    if (!fuseDir || fuseDir[0] == '\0' || !guestBundleID || guestBundleID[0] == '\0') {
+        return;
+    }
+    char path[PATH_MAX + 64];
+    if (!SBDiagStuckPathFromDir(fuseDir, guestBundleID, path, sizeof(path))) {
+        return;
+    }
+    int prevCount = 0;
+    long long prevTs = 0;
+    (void)SBDiagSlowCountFromDir(fuseDir, guestBundleID, &prevCount, &prevTs);
+    long long now = (long long)time(NULL);
+    // 24h 过期的 slow 记录重新从 1 计（过期即失效，不累计旧债）。
+    int count = (prevTs > 0 && now - prevTs > SB_DIAG_SLOW_EXPIRY_SECONDS) ? 1 : prevCount + 1;
+    SBDiagWriteStuckRecord(path, step, elapsedSeconds, fingerprint, hostVersion,
+                           "slow", count, now);
+}
+
 /// 超时落点（只在看门狗线程跑）：写 WATCHDOG TIMEOUT 行＋熔断标记，
 // 然后主动 exit(0) 把手机还给用户。正常情况下不返回。
 // 写行先 trylock 拿 g_lock 走正常写盘路；拿不到（主线程正卡在写日志
@@ -1421,37 +1614,15 @@ static void SBDiagWatchdogTimeout(const char *step, const char *why,
                                   const char *fingerprint,
                                   const char *hostVersion,
                                   const char *fuseDir) {
-    char ts[32];
-    SBDiagTimeoutTimestamp(ts, sizeof(ts));
-    char line[1024];
-    int n = snprintf(line, sizeof(line),
-                     "[%s] WATCHDOG TIMEOUT at %s（%s，步耗时 %llums，全流程 %llums）\n",
-                     ts, (step && step[0] != '\0') ? step : "未知步骤", why,
-                     (unsigned long long)stepMs, (unsigned long long)flowMs);
-    if (n > 0) {
-        if (pthread_mutex_trylock(&g_lock) == 0) {
-            if (g_begun && g_fd >= 0) {
-                SBDiagWriteAll(g_fd, line, (size_t)n);
-            }
-            pthread_mutex_unlock(&g_lock);
-        } else {
-            int fd = g_fd; // BeginRun 后即稳定；未 BeginRun 时为 -1，不写
-            if (fd >= 0) {
-                SBDiagWriteAll(fd, line, (size_t)n);
-            }
-        }
-    }
+    SBDiagWriteTimeoutLine(step, why, stepMs, flowMs);
     // 熔断标记（超时路径不经过 SBDiagLogMarkStuckGuest——后者会记日志行
-    // 取 g_lock；这里只写文件）。
+    // 取 g_lock；这里只写文件）。kind=stuck，六行格式。
     if (fuseDir && fuseDir[0] != '\0' && bundleID && bundleID[0] != '\0') {
         char path[PATH_MAX + 64];
         if (SBDiagStuckPathFromDir(fuseDir, bundleID, path, sizeof(path))) {
-            char content[1024];
-            if (SBDiagStuckContent(step, (double)stepMs / 1000.0,
+            SBDiagWriteStuckRecord(path, step, (double)stepMs / 1000.0,
                                    fingerprint, hostVersion,
-                                   content, sizeof(content))) {
-                SBDiagWriteFile(path, content, strlen(content));
-            }
+                                   "stuck", 1, (long long)time(NULL));
         }
     }
     // 看门狗解不开已死锁的主线程：冻住的进程留着只会让用户以为手机坏了；
@@ -1497,10 +1668,44 @@ static void *SBDiagWatchdogThread(void *arg) {
         uint64_t stepMs = (now >= stepStart) ? (now - stepStart) : 0;
         uint64_t flowMs = (now >= flowStart) ? (now - flowStart) : 0;
         uint64_t stallMs = (now >= lastBeat) ? (now - lastBeat) : 0;
-        if (stallMs > SB_DIAG_WD_STALL_LIMIT_MS) {
+        // 0.2.44：判定顺序改——有步阈值在跑时步超时优先，停摆只在无步
+        // （step == "armed" 或步间缝隙）时触发。0.2.42 的顺序让 dlopen
+        // 这种主线程同步步永远等不到自己的 10s 步阈值：心跳是主队列
+        // timer，主线程一进 dlopen 就停打点，5s 停摆恒先于 10s 步超时成立
+        //（抖音 5040ms 的 dlopen 就是这么被当成卡死的）。
+        int stepActive = (stepTimeout > 0 && step[0] != '\0');
+        if (stepActive) {
+            if (stepMs > stepTimeout) {
+                // 步超时 = 慢，不是卡死：只置 slow 标志、写 slow 记录，
+                // 不 exit。主线程在 dlopen 返回后消费标志位、干净失败
+                // “加载超时，请重试”，可立即再点。慢触发后心跳仍死满
+                // 宽限（5s）才升级为真卡死 exit。
+                int slowFire = 0;
+                uint64_t slowAt = 0;
+                pthread_mutex_lock(&g_wdLock);
+                if (!g_wdSlowTimedOut) {
+                    g_wdSlowTimedOut = 1;
+                    g_wdSlowAtMs = now;
+                    slowFire = 1;
+                }
+                slowAt = g_wdSlowAtMs;
+                pthread_mutex_unlock(&g_wdLock);
+                if (slowFire) {
+                    SBDiagWriteTimeoutLine(step, "步超时（慢加载，可重试）", stepMs, flowMs);
+                    SBDiagMarkSlowGuest(bundleID, step, (double)stepMs / 1000.0,
+                                        fingerprint, hostVersion, fuseDir);
+                }
+                if (stallMs > SB_DIAG_WD_STALL_LIMIT_MS &&
+                    now >= slowAt && now - slowAt > SB_DIAG_WD_SLOW_GRACE_MS) {
+                    why = "步超时后心跳仍停摆";
+                } else if (flowMs > SB_DIAG_WD_TOTAL_LIMIT_MS) {
+                    why = "全流程超时";
+                }
+            } else if (flowMs > SB_DIAG_WD_TOTAL_LIMIT_MS) {
+                why = "全流程超时";
+            }
+        } else if (stallMs > SB_DIAG_WD_STALL_LIMIT_MS) {
             why = "主线程心跳停摆";
-        } else if (stepTimeout > 0 && step[0] != '\0' && stepMs > stepTimeout) {
-            why = "步超时";
         } else if (flowMs > SB_DIAG_WD_TOTAL_LIMIT_MS) {
             why = "全流程超时";
         }
@@ -1553,6 +1758,8 @@ void SBDiagLogWatchdogArm(const char *guestBundleID) {
     g_wdArmed = 1;
     g_wdGeneration++;
     g_wdTimedOut = 0;
+    g_wdSlowTimedOut = 0;
+    g_wdSlowAtMs = 0;
     (void)snprintf(g_wdBundleID, sizeof(g_wdBundleID), "%s", guestBundleID);
     g_wdFingerprint[0] = '\0';
     g_wdHostVersion[0] = '\0';
@@ -1612,6 +1819,8 @@ void SBDiagLogWatchdogDisarmForGuest(const char *guestBundleID) {
         uint64_t now = SBDiagMonotonicMs();
         flowMs = (now >= g_wdFlowStartMs) ? (now - g_wdFlowStartMs) : 0;
         g_wdArmed = 0;
+        g_wdSlowTimedOut = 0;
+        g_wdSlowAtMs = 0;
         g_wdGeneration++;
 #if defined(__APPLE__)
         if (g_wdHeartbeatTimer) {
@@ -1652,6 +1861,12 @@ void SBDiagLogWatchdogStepBegin(const char *step, double timeoutSeconds) {
     pthread_mutex_lock(&g_wdLock);
     if (g_wdArmed && !g_wdTimedOut) {
         armed = 1;
+        g_wdSlowTimedOut = 0;
+        g_wdSlowAtMs = 0;
+        // 0.2.44：步开始即主线程存活证明——刷新心跳。否则慢 dlopen
+        // 返回后、解除武装前，看门狗下一轮会在“无步”分支里看到 dlopen
+        // 期间冻住的心跳时间戳，误判停摆而 exit（slow 设计就白做了）。
+        g_wdLastHeartbeatMs = now;
         (void)snprintf(g_wdStep, sizeof(g_wdStep), "%s", step);
         g_wdStepStartMs = now;
         g_wdStepTimeoutMs = (timeoutSeconds > 0)
@@ -1683,6 +1898,9 @@ void SBDiagLogWatchdogStepEnd(const char *step) {
         stepMs = (now >= g_wdStepStartMs) ? (now - g_wdStepStartMs) : 0;
         g_wdStep[0] = '\0';
         g_wdStepTimeoutMs = 0;
+        // 0.2.44：同 StepBegin——步结束即存活证明，刷新心跳，免得
+        // “无步”分支用旧时间戳误判停摆。
+        g_wdLastHeartbeatMs = now;
     }
     pthread_mutex_unlock(&g_wdLock);
     if (armed) {
@@ -1693,6 +1911,19 @@ void SBDiagLogWatchdogStepEnd(const char *step) {
             SBDiagLogLine(line);
         }
     }
+}
+
+/// 主线程消费 slow 标志位：返回 1 表示本流程里某步曾超时（慢），调用
+/// 后清零（只消费一次）。dlopen 返回后调：置位即干净失败“加载超时，
+/// 请重试”，不跳 main、不 exit。
+int SBDiagLogWatchdogConsumeSlowTimeout(void) {
+    int slow = 0;
+    pthread_mutex_lock(&g_wdLock);
+    slow = g_wdSlowTimedOut;
+    g_wdSlowTimedOut = 0;
+    g_wdSlowAtMs = 0;
+    pthread_mutex_unlock(&g_wdLock);
+    return slow;
 }
 
 char *SBDiagLogLatestText(void) {

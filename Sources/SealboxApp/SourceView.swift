@@ -240,8 +240,26 @@ private struct SourceRow: View {
 
 // MARK: - Source detail
 
+/// 0.2.44（问题 1）：各宿主页面共用的“回桌面” chrome——详情页以前是
+/// NavigationStack 的栈根，没有返回按钮，唯一出口是底部 28pt 隐形上滑区。
+/// 按钮放在 toolbar 层（不在 ScrollView 内容里、不在底部 28pt 手势区里），
+/// 点按即 vm.openApp = nil。SourceAppDetailView 与 InstalledAppDetailView
+/// 共用；Settings 等宿主页面按需复用。
+struct HostPageBackButton: View {
+    @EnvironmentObject private var vm: VMState
+
+    var body: some View {
+        Button {
+            vm.openApp = nil
+        } label: {
+            Label("回桌面", systemImage: "chevron.left")
+        }
+    }
+}
+
 struct SourceAppDetailView: View {
     let app: SourceApp
+    @EnvironmentObject private var vm: VMState
     @ObservedObject var downloads: DownloadManager
     @ObservedObject private var store = SBStore.shared
 
@@ -295,6 +313,11 @@ struct SourceAppDetailView: View {
         }
         .navigationTitle(app.name)
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .navigationBarLeading) {
+                HostPageBackButton()
+            }
+        }
         .safeAreaInset(edge: .bottom) { Color.clear.frame(height: 28) }
     }
 
@@ -320,6 +343,8 @@ struct InstalledAppDetailView: View {
     @EnvironmentObject private var coordinator: SBAppCoordinator
     @ObservedObject private var store = SBStore.shared
     @State private var showDeleteConfirm = false
+    /// 0.2.44（F8）：包大小后台算完填这里；未算完显示“计算中…”。
+    @State private var bundleSizeText: String?
 
     private var app: SBInstalledApp? {
         store.installedApps.first { $0.recordID.uuidString == recordID }
@@ -374,10 +399,16 @@ struct InstalledAppDetailView: View {
                                         value: "\(VMTime.dateTimeString(for: last.date)) \(last.message)")
                                 }
                                 // 文件大小：已装包在磁盘上的实测大小；包不在不显示该行。
-                                if let size = VMFiles.directorySizeString(url: app.bundleURL) {
+                                // 0.2.44（F8）：旧实现在 body 里同步递归枚举整个 .app 包，
+                                // 每次 body 求值都算一次；改后台算，算完填 @State。
+                                if let size = bundleSizeText {
                                     Divider()
                                         .padding(.vertical, 8)
                                     infoRow(label: "文件大小", value: size)
+                                } else if packageExists {
+                                    Divider()
+                                        .padding(.vertical, 8)
+                                    infoRow(label: "文件大小", value: "计算中…")
                                 }
                             }
                             .padding()
@@ -428,6 +459,22 @@ struct InstalledAppDetailView: View {
             }
             .navigationTitle(app.map { store.displayName(for: $0) } ?? "详情")
             .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    HostPageBackButton()
+                }
+            }
+            .task(id: recordID) {
+                // 0.2.44（F8）：包大小后台算（.task 在详情页打开时跑一次）。
+                guard let app = store.installedApps.first(where: { $0.recordID.uuidString == recordID }) else { return }
+                let start = CFAbsoluteTimeGetCurrent()
+                let size = await Task.detached(priority: .utility) {
+                    VMFiles.directorySizeString(url: app.bundleURL)
+                }.value
+                let ms = Int((CFAbsoluteTimeGetCurrent() - start) * 1000)
+                bundleSizeText = size
+                SBDiagLog.log("详情页：文件大小统计 \(ms)ms（后台）")
+            }
         }
     }
 
@@ -470,21 +517,74 @@ struct AppIconView: View {
     }
 }
 
-/// 已装应用的图标：包内 SBIcon.png 存在就显示它（读磁盘文件），
-/// 没有用默认色块 + 首字（沿用 AppIconView 的配色逻辑）。
+/// 已装应用的图标：0.2.44（F7）——缩略图优先（安装时写的 128px
+/// SBIcon-thumb.png，桌面只显示 64pt）、NSCache 缓存、后台解码、占位先行。
+/// 旧实现在 body 里同步 UIImage(contentsOfFile:) 读 1024px 原图，每次
+/// body 求值都全尺寸重解码，是启动空白段的大头。旧安装没有缩略图时后台
+/// 解全图（不写回，避免竞态）。
 struct InstalledAppIconView: View {
     let app: SBInstalledApp
     let size: CGFloat
 
+    @State private var uiImage: UIImage?
+
+    /// 解码后缓存（进程内共享，按 recordID 分键）。
+    private static let imageCache = NSCache<NSString, UIImage>()
+    /// 首帧计量（F3）：首次解码耗时累计；有图标文件的应用全解完记一行。
+    private static let decodeLogLock = NSLock()
+    private static var firstDecodeCount = 0
+    private static var firstDecodeTotalMs = 0
+    private static var firstDecodeLogged = false
+
     var body: some View {
-        if let uiImage = UIImage(contentsOfFile: app.iconURL.path) {
-            Image(uiImage: uiImage)
-                .resizable()
-                .aspectRatio(contentMode: .fill)
-                .frame(width: size, height: size)
-                .clipShape(RoundedRectangle(cornerRadius: size * 0.22, style: .continuous))
-        } else {
-            AppIconView(name: SBStore.shared.displayName(for: app), size: size)
+        Group {
+            if let uiImage {
+                Image(uiImage: uiImage)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+                    .frame(width: size, height: size)
+                    .clipShape(RoundedRectangle(cornerRadius: size * 0.22, style: .continuous))
+            } else {
+                AppIconView(name: SBStore.shared.displayName(for: app), size: size)
+            }
+        }
+        .task(id: app.recordID) {
+            await loadIcon()
+        }
+    }
+
+    private func loadIcon() async {
+        let key = app.recordID.uuidString as NSString
+        if let cached = Self.imageCache.object(forKey: key) {
+            uiImage = cached
+            return
+        }
+        let thumbURL = app.iconThumbnailURL
+        let url = FileManager.default.fileExists(atPath: thumbURL.path) ? thumbURL : app.iconURL
+        let start = CFAbsoluteTimeGetCurrent()
+        let decoded = await Task.detached(priority: .userInitiated) {
+            UIImage(contentsOfFile: url.path)
+        }.value
+        guard let decoded else { return }
+        let ms = Int((CFAbsoluteTimeGetCurrent() - start) * 1000)
+        Self.imageCache.setObject(decoded, forKey: key)
+        uiImage = decoded
+        Self.noteFirstDecode(ms: ms)
+    }
+
+    private static func noteFirstDecode(ms: Int) {
+        decodeLogLock.lock()
+        defer { decodeLogLock.unlock() }
+        guard !firstDecodeLogged else { return }
+        firstDecodeCount += 1
+        firstDecodeTotalMs += ms
+        let expected = SBStore.shared.installedApps.filter {
+            FileManager.default.fileExists(atPath: $0.iconThumbnailURL.path)
+                || FileManager.default.fileExists(atPath: $0.iconURL.path)
+        }.count
+        if expected > 0 && firstDecodeCount >= expected {
+            firstDecodeLogged = true
+            SBDiagLog.log("首帧图标解码：\(expected) 张共 \(firstDecodeTotalMs)ms（缩略图＋缓存＋后台解码）")
         }
     }
 }

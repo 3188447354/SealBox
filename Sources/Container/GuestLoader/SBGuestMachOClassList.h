@@ -57,6 +57,25 @@ void *SBGuestMachOClassNamedInGuest(const char *className,
                                     const char *guestExecPath,
                                     const char *guestAppPath,
                                     const char **failureReasonOut);
+
+/// 0.2.44（B-4）：按 LC_UUID 找已加载镜像——安装名可能碰撞（同名 Runner），
+/// UUID 不会。SBGuestMachOUUIDForDiskFile 读磁盘文件首个 arm64 切片的
+/// LC_UUID（fat 包取首个 arm64 切片；薄包直接读）；读不到返回 0。
+/// SBGuestMachOUUIDForMemoryHeader 读内存头里的 LC_UUID。
+int SBGuestMachOUUIDForDiskFile(const char *path, uint8_t uuidOut[16]);
+int SBGuestMachOUUIDForMemoryHeader(const struct mach_header *header, uint8_t uuidOut[16]);
+
+/// 0.2.44（B-4）：按磁盘文件找已加载镜像头，判定顺序：
+/// (0) dlopenHandle 非空时先试 dlsym(handle, "__mh_dylib_header")，再试
+///     "__mh_execute_header"（主程序转 dylib 后仍带后者；须真机验证）；
+/// (1) 磁盘 LC_UUID 与内存头 LC_UUID 匹配；
+/// (2) 全路径精确匹配（dyld 登记的是安装名，主程序与 framework 通常
+///     匹配不上——留着只为安装名即路径的 system dylib）；
+/// (3) basename 仅当全进程恰好一个同名镜像时用；多于一个时拒绝并把碰撞
+///     清单写进 collisionOut（调用方记日志，不静默绑错镜像）。
+/// diskPath 须为磁盘全路径。返回 NULL = 没找到或同名碰撞（拒绝）。
+const struct mach_header *SBGuestImageHeaderForDiskFile(const char *diskPath, void *dlopenHandle,
+                                                        char *collisionOut, size_t collisionOutSize);
 #endif
 
 #ifdef __cplusplus

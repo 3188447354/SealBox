@@ -11,6 +11,7 @@
 #import "SBChainedFixupRebind.h"
 #import "SBGuestLoader.h"
 #import "SBDiagLog.h"
+#import "SBGuestMachOClassList.h" // 0.2.44 B-4：UUID 优先查找
 
 // Swift 覆盖层 UIApplicationMain 的替身（SBSwiftUIEmbed.swift，@_cdecl 导出）。
 // 它的参数是 Swift 覆盖层签名的 ABI（Int32，argv 指针，String?，String?）；
@@ -126,28 +127,22 @@ int SBHookedUIApplicationMain(int argc, char * _Nullable * _Nullable argv,
 
 #pragma mark - 安装
 
-/// 按执行路径找客镜像头（SBGuestHookUtils.h 同款逻辑，宿主侧自带一份——
-// GuestHooks target 的头宿主侧不包含）。
+/// 按执行路径找客镜像头（0.2.44 B-4：UUID 优先，全路径次之，basename
+/// 仅当全进程恰好一个同名镜像时用——同名多镜像时拒绝并列出碰撞，
+// 绝不静默绑到别客的镜像上。SBGuestHookUtils.h 里的客端版同款逻辑）。
 static const struct mach_header *SBGuestImageHeaderForExecPath(NSString *execPath) {
     const char *execPathUTF8 = [execPath UTF8String];
     if (!execPathUTF8) {
         return NULL;
     }
-    uint32_t count = _dyld_image_count();
-    for (uint32_t i = 0; i < count; i++) {
-        const char *name = _dyld_get_image_name(i);
-        if (name && strcmp(name, execPathUTF8) == 0) {
-            return _dyld_get_image_header(i);
-        }
+    char collision[1024];
+    const struct mach_header *header = SBGuestImageHeaderForDiskFile(execPathUTF8, NULL,
+                                                                      collision, sizeof(collision));
+    if (!header && collision[0] != '\0') {
+        SBDiagLogLine([[NSString stringWithFormat:@"客镜像查找：%@ 同名镜像碰撞，拒绝（%@）",
+                        execPath, [NSString stringWithUTF8String:collision]] UTF8String]);
     }
-    NSString *execName = execPath.lastPathComponent;
-    for (uint32_t i = 0; i < count; i++) {
-        const char *name = _dyld_get_image_name(i);
-        if (name && [[[NSString stringWithUTF8String:name] lastPathComponent] isEqualToString:execName]) {
-            return _dyld_get_image_header(i);
-        }
-    }
-    return NULL;
+    return header;
 }
 
 /// 客包 Frameworks 目录下各 Framework 的可执行文件路径

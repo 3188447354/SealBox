@@ -379,12 +379,19 @@ static BOOL SBArm64SliceOffset(FILE *file, uint64_t *baseOffsetOut) {
     return NO;
 }
 
+/// 0.2.44（B-5）：链式路失败的原因标志——置 1 当且仅当失败原因是“磁盘文件
+/// 里没有 LC_DYLD_CHAINED_FIXUPS 数据”。入口清零；调度点读它决定是否退
+/// 传统路再试。注意：它只救“头对、文件无链式数据”的情形，救不了“头错”
+///（B 的 Guoguo 重进：头是别客的，传统路读的也是错头的间接符号表）。
+static int g_chainedMissingData = 0;
+
 /// 链式修正路：读磁盘文件，走链按 import 名找槽的文件偏移，换算成运行时地址
 /// 改写。返回改写的槽数。layout 只用来做文件偏移→运行时地址换算与日志。
 static uint32_t SBRebindChained(SBImageLayout *layout,
                                 NSString *execPath,
                                 const char *symbolName,
                                 void *replacement) {
+    g_chainedMissingData = 0;
     FILE *file = fopen([execPath UTF8String], "rb");
     if (!file) {
         SBDiagLogLine([[NSString stringWithFormat:@"链式重绑：打不开可执行文件 %@",
@@ -437,6 +444,7 @@ static uint32_t SBRebindChained(SBImageLayout *layout,
     }
     if (chainedDataoff == 0 || chainedDatasize < 28) {
         SBDiagLogLine([@"链式重绑：找不到 LC_DYLD_CHAINED_FIXUPS 数据" UTF8String]);
+        g_chainedMissingData = 1;
         fclose(file);
         return 0;
     }
@@ -772,7 +780,18 @@ BOOL SBRebindGuestSymbolForImage(const struct mach_header *header,
             return NO;
         }
         rewrote = SBRebindChained(&layout, execPath, symbolName, replacement);
-        if (rewrote == 0) {
+        if (rewrote == 0 && g_chainedMissingData) {
+            // 0.2.44（B-5）：链式路只报了“无数据”——头是对的、文件里就是
+            // 没有链式数据（Guoguo 首开就是这情形：分类器报“链式修正=否”，
+            // 但调度按内存头的 hasChainedFixups 走了链式路）。退传统路
+            // 再试一次；传统路读的是内存头的间接符号表，头对才救得回来。
+            SBDiagLogLine([@"重绑：链式路无数据，退传统路再试" UTF8String]);
+            rewrote = SBRebindClassic(&layout, symbolName, replacement);
+            if (rewrote == 0) {
+                SBDiagLogLine([[NSString stringWithFormat:@"重绑：%@ 传统路亦未找到槽",
+                                [NSString stringWithUTF8String:symbolName]] UTF8String]);
+            }
+        } else if (rewrote == 0) {
             // 具体原因（符号不在 import 表里 / 无引用它的槽 / 改写失败 /
             // 解析失败）已由 SBRebindChained 在上文逐条记下，这里只汇总。
             SBDiagLogLine([[NSString stringWithFormat:@"重绑：%@ 链式修正路未找到槽（见上文链式重绑诊断）",

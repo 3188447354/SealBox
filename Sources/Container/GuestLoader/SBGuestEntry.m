@@ -12,6 +12,7 @@
 #import <string.h>
 
 #import "SBDiagLog.h"
+#import "SBGuestMachOClassList.h" // 0.2.44 B-4：UUID 优先查找
 #import "SBGuestLoader.h"
 
 // LC_DYLD_CHAINED_FIXUPS 在公开头文件里有定义；这里只用它做段数不匹配的诊断提示。
@@ -279,27 +280,26 @@ BOOL runtimeAddressForImageAtPath(NSString *imagePath,
     if (addressOut) {
         *addressOut = 0;
     }
-    NSString *wantedName = [imagePath lastPathComponent];
-    // 两遍匹配：先精确全路径，再退到同名——同名不同路径的镜像（如
-    // 同名 framework）先被扫到会算错入口。
-    for (int pass = 0; pass < 2; pass++) {
-        uint32_t count = _dyld_image_count();
-        for (uint32_t i = 0; i < count; i++) {
-            const char *imageName = _dyld_get_image_name(i);
-            if (!imageName) {
-                continue;
+    // 0.2.44（B-4）：两遍匹配已删——旧逻辑先全路径、再退同名首个命中，
+    // 同名不同路径的镜像（如两客同名 Runner）先被扫到即算错入口。
+    // 新逻辑（SBGuestImageHeaderForDiskFile）：UUID 优先 → 全路径 →
+    // basename 仅当全进程恰好一个同名镜像；同名多镜像拒绝并列出碰撞。
+    char collision[1024];
+    const struct mach_header *header = SBGuestImageHeaderForDiskFile([imagePath UTF8String], NULL,
+                                                                      collision, sizeof(collision));
+    if (header) {
+        {
+            const char *imageName = NULL;
+            intptr_t slide = 0;
+            uint32_t count = _dyld_image_count();
+            for (uint32_t i = 0; i < count; i++) {
+                if (_dyld_get_image_header(i) == header) {
+                    imageName = _dyld_get_image_name(i);
+                    slide = _dyld_get_image_vmaddr_slide(i);
+                    break;
+                }
             }
-            NSString *loadedPath = [NSString stringWithUTF8String:imageName];
-            BOOL matches = (pass == 0)
-                ? [loadedPath isEqualToString:imagePath]
-                : [[loadedPath lastPathComponent] isEqualToString:wantedName];
-            if (!matches) {
-                continue;
-            }
-            const struct mach_header *header = _dyld_get_image_header(i);
-            if (!header) {
-                continue;
-            }
+            NSString *loadedPath = imageName ? [NSString stringWithUTF8String:imageName] : imagePath;
             // 0.2.4 根因修：_dyld_get_image_header 返回的已是滑移后的
             // 实际加载地址，LC_MAIN 的 entryoff 是从文件头的偏移，
             // 入口 = header + entryoff。旧代码又加了一次 slide
@@ -307,7 +307,6 @@ BOOL runtimeAddressForImageAtPath(NSString *imagePath,
             // 跳过去必崩（EXC_BAD_ACCESS）——点客应用图标必闪退的根因，
             // 0.2.0 起就有，真机从未验过。slide 只对从文件里读出的
             // preferred vmaddr 才要加，这里不加。
-            intptr_t slide = _dyld_get_image_vmaddr_slide(i);
             uintptr_t entryAddress = (uintptr_t)header + (uintptr_t)fileOffset;
             SBDiagLogLine([[NSString stringWithFormat:
                 @"客入口：镜像=%@ header=0x%lx slide=0x%lx entryoff=0x%llx 入口=0x%lx",
@@ -324,6 +323,9 @@ BOOL runtimeAddressForImageAtPath(NSString *imagePath,
     }
     // 0.2.10 报错日志：之前只返错不记日志；记下要找的镜像、已加载
     // 镜像数与 entryoff，定位“dlopen 成功了但镜像不在列表里”。
-    SBDiagLogLine([[NSString stringWithFormat:@"客入口：镜像未加载：%@ 已加载镜像数=%u entryoff=0x%llx", imagePath, _dyld_image_count(), (unsigned long long)fileOffset] UTF8String]);
+    // 0.2.44：同名碰撞拒绝时把碰撞清单也记下来（否则只看“未加载”会误判）。
+    SBDiagLogLine([[NSString stringWithFormat:@"客入口：镜像未加载：%@ 已加载镜像数=%u entryoff=0x%llx%@",
+                    imagePath, _dyld_image_count(), (unsigned long long)fileOffset,
+                    collision[0] != '\0' ? [NSString stringWithFormat:@" 同名碰撞：%@", [NSString stringWithUTF8String:collision]] : @""] UTF8String]);
     return NO;
 }

@@ -171,6 +171,25 @@ struct HomeScreenView: View {
         .onChange(of: customWallpaperVersion) { _ in
             customWallpaperImage = VMCustomWallpaper.loadImage()
         }
+        .overlay {
+            // 0.2.44（F6）：点按即显示加载态——coordinator.launchingBundleID
+            // 非空时叠 spinner＋“正在启动…”，点图标后第一帧即有反馈；
+            // 成功／失败回调里清掉（恢复路是同步的，不设它）。
+            if let launchingBundleID = coordinator.launchingBundleID {
+                VStack(spacing: 12) {
+                    ProgressView()
+                        .progressViewStyle(.circular)
+                        .tint(.white)
+                        .scaleEffect(1.4)
+                    Text("正在启动\(store.installedApps.first { $0.bundleID == launchingBundleID }.map { SBStore.shared.displayName(for: $0) } ?? "")…")
+                        .font(.system(size: 15))
+                        .foregroundColor(.white)
+                }
+                .padding(24)
+                .background(.ultraThinMaterial)
+                .clipShape(RoundedRectangle(cornerRadius: 16))
+            }
+        }
     }
 
     // MARK: - Page 1: built-in apps
@@ -229,6 +248,16 @@ struct HomeScreenView: View {
                 Spacer()
             } else {
                 HStack {
+                    // 0.2.44（问题 3）：桌面可见的切换器入口——与客内横杠长按
+                    // 同一个通知（SBGuestSwitcherRequested），VMRootView 接到
+                    // 即弹切换器；无后台客时切换器只显示“没有正在运行的应用”。
+                    Button("切换器") {
+                        NotificationCenter.default.post(
+                            name: Notification.Name(SBGuestSwitcherRequestedNotification), object: nil)
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(.white)
+                    .controlSize(.small)
                     Spacer()
                     Button("导入 IPA") {
                         coordinator.importIPA()

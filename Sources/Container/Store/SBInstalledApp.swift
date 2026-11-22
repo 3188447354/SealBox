@@ -179,6 +179,11 @@ struct SBInstalledApp: Codable, Identifiable, Equatable {
     var iconURL: URL {
         bundleURL.appendingPathComponent("SBIcon.png")
     }
+
+    /// 0.2.44（F7）：128px 缩略图（安装时写；旧安装没有时图标视图回落到原图）。
+    var iconThumbnailURL: URL {
+        bundleURL.appendingPathComponent("SBIcon-thumb.png")
+    }
 }
 
 /// 启动收据：点图标后写下，宿主重起后兑现；客加载失败时靠它区分
@@ -192,7 +197,8 @@ struct SBLaunchReceipt: Codable {
     var containerUUID: String
     /// 客 App 在磁盘上的目录名（平行安装带时间戳后缀）。
     var diskDirectoryName: String
-    /// 该客 App 的钥匙串组号（0..<128）；-1 表示未知，按容器 UUID 哈希兜底。
+    /// 该客 App 的钥匙串组号（0..<128）；-1 表示未知，加载时按记录回查补
+    ///（0.2.44：只认记录；哈希兜底只留给无记录可查的极端情形）。
     var keychainGroup: Int
     /// restart-requested（已发请求）→ restart-confirmed（新进程已启动）
     /// → guest-loaded（已进客 App，可清除）/ guest-failed（客加载失败）

@@ -16,6 +16,13 @@
 //   3. `tweakLoaderPath` 由 "@loader_path/../../Tweaks/TweakLoader.dylib"
 //      改为 "@loader_path/../../Tweaks/SBGuestHooks.dylib"（我们的客端 Hook
 //      件名；同一变量既用于匹配已注入的命令、也用于注入新命令，改一处即全通）。
+//   5. 0.2.44（B-1，SealBox 分叉点——上游 LiveContainer 一进程只载一客，
+//      裸 basename 安装名无碰撞；SealBox 多客同进程，裸名即碰撞）：
+//      LCSetPatchGuestBundleID 置客 bundleID 后，insertDylibCommand 写
+//      LC_ID_DYLIB 时用唯一名 "<bundleID>/<basename>"，不再写裸 basename；
+//      dylinker 复用路（名域只有约 8 字节，唯一名塞不进）写 6 位 djb2 短名。
+//      置空即恢复上游行为。短名算法须与 Swift 侧 SBInstaller.djb2Hex6
+//      一致（djb2，低 24 位，%06llx），否则签名修复门会误判。
 //   4. `#include "dyld_cache_format.h"` 保持原样；该头不在 LC 仓库里，
 //      由 litehook 自带的副本提供（litehook/external/include/
 //      dyld_cache_format.h，已在 HEADER_SEARCH_PATHS 里）。注意：不要在
@@ -83,8 +90,53 @@ static uint32_t get_chained_fixups_seg_count(void *macho, struct linkedit_data_c
 }
 
 
+// 0.2.44（B-1）：打补丁期间的客 bundleID（SBLCPatcher 在主程序打补丁
+// 前置、打完清；只在同步调用里有效）。
+static char g_patchGuestBundleID[128] = { 0 };
+
+void LCSetPatchGuestBundleID(const char *bundleID) {
+    if (!bundleID || bundleID[0] == '\0') {
+        g_patchGuestBundleID[0] = '\0';
+        return;
+    }
+    strncpy(g_patchGuestBundleID, bundleID, sizeof(g_patchGuestBundleID) - 1);
+    g_patchGuestBundleID[sizeof(g_patchGuestBundleID) - 1] = '\0';
+}
+
+static uint64_t SBGuestDjb2(const char *s) {
+    uint64_t h = 5381;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        h = h * 33 + *p;
+    }
+    return h;
+}
+
+/// 唯一安装名（主程序用）："<bundleID>/<basename>"；未置 bundleID 时
+/// 退回上游行为（裸 basename）。buf 须 >= 256 字节。
+static const char *SBGuestUniqueInstallName(const char *path, char *buf, size_t bufSize) {
+    const char *base = basename((char *)path);
+    if (g_patchGuestBundleID[0] != '\0') {
+        snprintf(buf, bufSize, "%s/%s", g_patchGuestBundleID, base);
+        return buf;
+    }
+    return base;
+}
+
+/// 短安装名（dylinker 复用路用）：6 位 djb2 哈希——名域只有约 8 字节，
+/// 唯一名塞不进，短名是唯一能塞进的每客唯一标识（24 位哈希；与 Swift 侧
+/// SBInstaller.djb2Hex6 同算法）。buf 须 >= 8 字节。
+static const char *SBGuestShortInstallName(char *buf, size_t bufSize) {
+    snprintf(buf, bufSize, "%06llx",
+             (unsigned long long)(SBGuestDjb2(g_patchGuestBundleID) & 0xffffff));
+    return buf;
+}
+
 static void insertDylibCommand(uint32_t cmd, const char *path, struct mach_header_64 *header) {
-    const char *name = cmd==LC_ID_DYLIB ? basename((char *)path) : path;
+    // 0.2.44（B-1）：LC_ID_DYLIB 写唯一名，不再写裸 basename——裸名是
+    // Guoguo 碰撞的根因（两客 Runner 都叫 "Runner"，dyld 按安装名去重，
+    // 第二客 dlopen 拿到的是第一客的镜像）。
+    char uniqueNameBuf[256];
+    const char *name = cmd==LC_ID_DYLIB ? SBGuestUniqueInstallName(path, uniqueNameBuf, sizeof(uniqueNameBuf)) : path;
     struct dylib_command *dylib;
     size_t cmdsize = sizeof(struct dylib_command) + rnd32((uint32_t)strlen(name) + 1, 8);
     if (cmd == LC_ID_DYLIB) {
@@ -117,7 +169,13 @@ static void replaceDylinkerWithIDDylibCommand(struct dylinker_command* dylinkerC
     newDylibCommand->dylib.timestamp = 2;
     uint32_t nameSize = size - sizeof(struct dylib_command);
     // we only have 8 bytes to use
-    const char* name = basename((char *)path);
+    // 0.2.44（B-1）：dylinker 复用路名域太小，唯一名塞不进——写 6 位 djb2
+    // 短名（7 字节含 NUL），仍是每客唯一；裸 basename 会与别客碰撞。
+    // 未置 bundleID 时保持上游行为（裸 basename）。
+    char shortNameBuf[8];
+    const char* name = g_patchGuestBundleID[0] != '\0'
+        ? SBGuestShortInstallName(shortNameBuf, sizeof(shortNameBuf))
+        : basename((char *)path);
     strncpy((void *)newDylibCommand + newDylibCommand->dylib.name.offset, name, nameSize);
     *((char *)newDylibCommand + newDylibCommand->dylib.name.offset + nameSize - 1) = 0;
 }
@@ -207,7 +265,10 @@ int LCPatchExecSlice(const char *path, struct mach_header_64 *header, bool doInj
         freeLoadCommandCountLeft -= 0x10;
     }
     
-    int idDylibCommandSize = sizeof(struct dylib_command) + rnd32((uint32_t)strlen(basename((char*)path)) + 1, 8);
+    // 0.2.44（B-1）：空闲空间按唯一名长度算——按裸名算会低估，插完命令
+    // 表顶到 __text（上游只按裸名算，是因为它只写裸名）。
+    char uniqueNameSizeBuf[256];
+    int idDylibCommandSize = sizeof(struct dylib_command) + rnd32((uint32_t)strlen(SBGuestUniqueInstallName(path, uniqueNameSizeBuf, sizeof(uniqueNameSizeBuf))) + 1, 8);
     if(!hasDylibCommand) {
         if (freeLoadCommandCountLeft >= idDylibCommandSize) {
             freeLoadCommandCountLeft -= idDylibCommandSize;

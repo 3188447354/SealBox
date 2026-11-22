@@ -6,6 +6,11 @@ typedef void (^LCParseMachOCallback)(const char *path, struct mach_header_64 *he
 #define PATCH_EXEC_RESULT_NO_SPACE_FOR_TWEAKLOADER 1
 #define PATCH_EXEC_RESULT_SEG_COUNT_MISMATCH 2
 
+// 0.2.44（B-1，SealBox 分叉点）：打补丁时写进 LC_ID_DYLIB 的客标识。
+// 置空（NULL）即恢复上游行为（裸 basename）。SBLCPatcher 在每次主程序
+// 打补丁前置、打完清——全局量只在打补丁的同步调用里有效，不跨调用残留。
+void LCSetPatchGuestBundleID(const char *bundleID);
+
 void LCPatchAppBundleFixupARM64eSlice(NSURL *bundleURL);
 NSString *LCParseMachO(const char *path, bool readOnly, NS_NOESCAPE LCParseMachOCallback callback);
 void LCPatchAddRPath(const char *path, struct mach_header_64 *header);

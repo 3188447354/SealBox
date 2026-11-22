@@ -14,8 +14,9 @@ NS_ASSUME_NONNULL_BEGIN
 /// - Parameters:
 ///   - diskDirectoryName: 客 App 在磁盘上的目录名（平行安装带时间戳后缀；
 ///     为空时按 <bundleID>.app 处理）。
-///   - keychainGroup: 该客 App 的钥匙串组号（0..<128）；< 0 时按旧兜底
-///     （selection 键 / 容器 UUID 哈希）处理。
+///   - keychainGroup: 该客 App 的钥匙串组号（0..<128）；< 0 时按记录回查
+///     （selection 键 → 安装记录）；哈希兜底只留给无记录可查的极端情形
+///     （0.2.44：只认记录，不哈希兜底）。
 + (BOOL)loadGuestWithBundleID:(NSString *)bundleID
                 containerUUID:(NSString *)containerUUID
             diskDirectoryName:(nullable NSString *)diskDirectoryName

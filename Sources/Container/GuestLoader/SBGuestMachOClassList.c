@@ -726,4 +726,217 @@ void *SBGuestMachOClassNamedInGuest(const char *className,
     }
     return NULL;
 }
+
+// MARK: - 0.2.44（B-4）：按 LC_UUID 找已加载镜像
+
+#include <dlfcn.h>
+#include <fcntl.h>
+#include <libkern/OSByteOrder.h>
+#include <mach-o/fat.h>
+#include <unistd.h>
+
+int SBGuestMachOUUIDForDiskFile(const char *path, uint8_t uuidOut[16]) {
+    if (!path || !uuidOut) {
+        return 0;
+    }
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        return 0;
+    }
+    uint32_t magic = 0;
+    if (pread(fd, &magic, sizeof(magic), 0) != (ssize_t)sizeof(magic)) {
+        close(fd);
+        return 0;
+    }
+    off_t sliceOff = 0;
+    if (magic == FAT_CIGAM) {
+        struct fat_header fh;
+        if (pread(fd, &fh, sizeof(fh), 0) != (ssize_t)sizeof(fh)) {
+            close(fd);
+            return 0;
+        }
+        uint32_t n = OSSwapBigToHostInt32(fh.nfat_arch);
+        if (n > 64) {
+            close(fd);
+            return 0;
+        }
+        int found = 0;
+        for (uint32_t i = 0; i < n; i++) {
+            struct fat_arch fa;
+            if (pread(fd, &fa, sizeof(fa), (off_t)sizeof(fh) + (off_t)i * (off_t)sizeof(fa)) != (ssize_t)sizeof(fa)) {
+                break;
+            }
+            if (OSSwapBigToHostInt32(fa.cputype) == CPU_TYPE_ARM64) {
+                sliceOff = OSSwapBigToHostInt32(fa.offset);
+                found = 1;
+                break;
+            }
+        }
+        if (!found) {
+            close(fd);
+            return 0;
+        }
+    } else if (magic != MH_MAGIC_64) {
+        close(fd);
+        return 0;
+    }
+    struct mach_header_64 mh;
+    if (pread(fd, &mh, sizeof(mh), sliceOff) != (ssize_t)sizeof(mh)) {
+        close(fd);
+        return 0;
+    }
+    if (mh.magic != MH_MAGIC_64 || mh.sizeofcmds > 1024 * 1024) {
+        close(fd);
+        return 0;
+    }
+    uint8_t *cmds = malloc(mh.sizeofcmds);
+    if (!cmds) {
+        close(fd);
+        return 0;
+    }
+    ssize_t got = pread(fd, cmds, mh.sizeofcmds, sliceOff + (off_t)sizeof(mh));
+    close(fd);
+    if (got != (ssize_t)mh.sizeofcmds) {
+        free(cmds);
+        return 0;
+    }
+    uint32_t off = 0;
+    for (uint32_t i = 0; i < mh.ncmds; i++) {
+        if (off + sizeof(struct load_command) > mh.sizeofcmds) {
+            break;
+        }
+        struct load_command *lc = (struct load_command *)(cmds + off);
+        if (lc->cmdsize < sizeof(struct load_command) || off + lc->cmdsize > mh.sizeofcmds) {
+            break;
+        }
+        if (lc->cmd == LC_UUID) {
+            struct uuid_command *uc = (struct uuid_command *)lc;
+            memcpy(uuidOut, uc->uuid, 16);
+            free(cmds);
+            return 1;
+        }
+        off += lc->cmdsize;
+    }
+    free(cmds);
+    return 0;
+}
+
+int SBGuestMachOUUIDForMemoryHeader(const struct mach_header *header, uint8_t uuidOut[16]) {
+    if (!header || !uuidOut) {
+        return 0;
+    }
+    if (header->magic != MH_MAGIC_64) {
+        return 0;
+    }
+    const struct mach_header_64 *h64 = (const struct mach_header_64 *)header;
+    if (h64->ncmds > 1024) {
+        return 0;
+    }
+    struct load_command *lc = (struct load_command *)(h64 + 1);
+    for (uint32_t i = 0; i < h64->ncmds; i++) {
+        if (lc->cmd == LC_UUID) {
+            memcpy(uuidOut, ((struct uuid_command *)lc)->uuid, 16);
+            return 1;
+        }
+        if (lc->cmdsize < sizeof(struct load_command)) {
+            return 0;
+        }
+        lc = (struct load_command *)((uint8_t *)lc + lc->cmdsize);
+    }
+    return 0;
+}
+
+static const char *SBGuestImageBasename(const char *path) {
+    const char *slash = strrchr(path, '/');
+    return slash ? slash + 1 : path;
+}
+
+const struct mach_header *SBGuestImageHeaderForDiskFile(const char *diskPath, void *dlopenHandle,
+                                                        char *collisionOut, size_t collisionOutSize) {
+    if (!diskPath || diskPath[0] == '\0') {
+        return NULL;
+    }
+    if (collisionOut && collisionOutSize > 0) {
+        collisionOut[0] = '\0';
+    }
+    // (0) dlopen 句柄优先（须真机验证：主程序转 dylib 后是否仍带
+    // __mh_execute_header、dylib 是否带 __mh_dylib_header）。
+    if (dlopenHandle) {
+        void *sym = dlsym(dlopenHandle, "__mh_dylib_header");
+        if (!sym) {
+            sym = dlsym(dlopenHandle, "__mh_execute_header");
+        }
+        if (sym) {
+            return (const struct mach_header *)sym;
+        }
+    }
+    uint32_t count = _dyld_image_count();
+    // (1) LC_UUID：安装名会碰撞，UUID 不会。
+    uint8_t diskUUID[16];
+    if (SBGuestMachOUUIDForDiskFile(diskPath, diskUUID)) {
+        for (uint32_t i = 0; i < count; i++) {
+            const struct mach_header *h = _dyld_get_image_header(i);
+            uint8_t memUUID[16];
+            if (h && SBGuestMachOUUIDForMemoryHeader(h, memUUID) &&
+                memcmp(memUUID, diskUUID, 16) == 0) {
+                return h;
+            }
+        }
+    }
+    // (2) 全路径精确匹配（dyld 登记的是安装名，主程序与 framework 通常
+    // 匹配不上——留着只为安装名即路径的 system dylib）。
+    for (uint32_t i = 0; i < count; i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (name && strcmp(name, diskPath) == 0) {
+            return _dyld_get_image_header(i);
+        }
+    }
+    // (3) basename：仅当全进程恰好一个同名镜像时用；多于一个时拒绝，
+    // 并把碰撞清单写进 collisionOut（调用方记日志，不静默绑错镜像）。
+    const char *base = SBGuestImageBasename(diskPath);
+    const struct mach_header *found = NULL;
+    uint32_t matches = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (name && strcmp(SBGuestImageBasename(name), base) == 0) {
+            matches++;
+            found = _dyld_get_image_header(i);
+        }
+    }
+    if (matches == 1) {
+        return found;
+    }
+    if (matches > 1 && collisionOut && collisionOutSize > 0) {
+        size_t used = 0;
+        for (uint32_t i = 0; i < count; i++) {
+            const char *name = _dyld_get_image_name(i);
+            if (!name || strcmp(SBGuestImageBasename(name), base) != 0) {
+                continue;
+            }
+            const struct mach_header *h = _dyld_get_image_header(i);
+            uint8_t memUUID[16];
+            char uuidText[40];
+            if (h && SBGuestMachOUUIDForMemoryHeader(h, memUUID)) {
+                (void)snprintf(uuidText, sizeof(uuidText),
+                               "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+                               memUUID[0], memUUID[1], memUUID[2], memUUID[3],
+                               memUUID[4], memUUID[5], memUUID[6], memUUID[7],
+                               memUUID[8], memUUID[9], memUUID[10], memUUID[11],
+                               memUUID[12], memUUID[13], memUUID[14], memUUID[15]);
+            } else {
+                (void)snprintf(uuidText, sizeof(uuidText), "无 UUID");
+            }
+            int n = snprintf(collisionOut + used, collisionOutSize - used, "%s%s（UUID %s）",
+                             used > 0 ? "；" : "", name, uuidText);
+            if (n < 0) {
+                break;
+            }
+            if ((size_t)n >= collisionOutSize - used) {
+                break; // 写满即停（末尾仍有 NUL，snprintf 已保证）。
+            }
+            used += (size_t)n;
+        }
+    }
+    return NULL;
+}
 #endif

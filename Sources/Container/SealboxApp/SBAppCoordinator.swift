@@ -41,6 +41,10 @@ final class SBAppCoordinator: ObservableObject {
     @Published var deleteError: Error?
     @Published var activeAlert: CoordinatorAlert?
     @Published var duplicatePending: DuplicatePending?
+    /// 0.2.44（F6）：正在启动的客 bundleID——点按即显示加载态（HomeScreenView
+    /// 叠一层 spinner＋“正在启动…”），成功／失败回调里清掉。恢复路是同步的，
+    /// 不设它（恢复不走签名门、不经过这里的 Task）。
+    @Published var launchingBundleID: String?
 
     // MARK: - 顶层 presenter（文件选择器 / 密码框用）
 
@@ -303,6 +307,10 @@ final class SBAppCoordinator: ObservableObject {
     /// 先走 SBInstaller.repatchInstalledApp 重打补丁 + 重签，成功才继续；
     /// 失败弹错，不发启动请求。
     func launchApp(_ app: SBInstalledApp) {
+        // 0.2.44（F3 计量）：点图标行——真实点按时间，后续“已激活”行与它
+        // 相减即点图标→已激活全流程耗时（0.2.43 日志里这行不存在，耗时
+        // 只能从“进 SealboxApp”这类行反推）。
+        SBDiagLog.log("点图标：\(app.bundleID)（\(app.displayName)）")
         if app.needsReimport {
             activeAlert = CoordinatorAlert(
                 title: "需重新导入",
@@ -344,6 +352,10 @@ final class SBAppCoordinator: ObservableObject {
             }
         }
         isLaunching = true
+        // 0.2.44（F6）：点按即显示加载态——设 launchingBundleID，桌面立即
+        // 叠 spinner＋“正在启动…”，不再是 0.12 秒按压缩放后一片静默。
+        launchingBundleID = app.bundleID
+        SBDiagLog.log("点图标：\(app.bundleID) 加载态已显示")
         // 0.2.11：签名门无条件跑。0.2.10 真机实证（KMusic）：门只在有证书
         // 且记录 signed==true 时才跑，点图标后照常写收据、加载，当前进程
         // 直接走到 dlopen 报 code signature invalid——门没跑等于没门。
@@ -354,12 +366,31 @@ final class SBAppCoordinator: ObservableObject {
         Task {
             var appToLaunch = app
             do {
+                // 0.2.44（F2）：熔断检查前置到验签之前——熔断的客直接干净失败，
+                // 不再先花几十毫秒跑完整验签。熔断逻辑本身不动（分级在
+                // SBDiagLogIsGuestStuckForGuest 里：slow 可重试，stuck 才拦）。
+                if let stuckStep = SBInstaller.stuckStep(for: app) {
+                    SBDiagLog.log("点图标：\(app.bundleID) 卡死熔断检查：熔断=是（步=\(stuckStep)），跳过验签直接干净失败")
+                    await MainActor.run {
+                        self.isLaunching = false
+                        self.launchingBundleID = nil
+                        self.activeAlert = CoordinatorAlert(
+                            title: "启动失败",
+                            message: "该应用上次打开时卡住了（\(stuckStep)），已跳过；重新导入或等后续版本可再试")
+                    }
+                    return
+                }
                 // 0.2.6：旧版本装的包先重打补丁 + 重签（patchRevision < 2 的
                 // 包主可执行文件缺 LC_ID_DYLIB，dlopen 必败——0.2.5 真机实证）。
                 // 重打失败直接弹错，不发启动请求；无证书时不重打（修不了），
                 // 直接进签名门（门能拦 Team/结构，不依赖证书）。
+                // 0.2.44（B-3）：重打补丁门再扩一个触发条件——主程序安装名
+                // 不是期望唯一名（0.2.43 及以前装的包是裸 basename，Guoguo
+                // 碰撞的根因）。patchRevision 已是当前值、但安装名仍是旧
+                // 的包（例如 0.2.44 装完又被外部改过）同样触发重打补丁。
                 if SBCertificate.hasCertificate,
-                   app.patchRevision < SBConstants.patchRevision {
+                   app.patchRevision < SBConstants.patchRevision
+                   || SBInstaller.installNameNeedsRepair(app) {
                     appToLaunch = try await SBInstaller.repatchInstalledApp(app)
                 }
                 // 0.2.8：启动前签名修复门。patchRevision 已是当前值也不等于
@@ -388,6 +419,7 @@ final class SBAppCoordinator: ObservableObject {
                 SBDiagLog.log("启动失败：\(app.bundleID) \(app.executableURL.path) 签名修复门失败（[code=\(SBInstaller.errorCode(of: error))] \(error.localizedDescription)）")
                 await MainActor.run {
                     self.isLaunching = false
+                    self.launchingBundleID = nil
                     self.activeAlert = CoordinatorAlert(
                         title: "启动失败",
                         message: self.launchRepairErrorMessage(error))
@@ -405,6 +437,8 @@ final class SBAppCoordinator: ObservableObject {
                 let launchTarget = appToLaunch
                 await MainActor.run { self.launchGuestInProcess(app: launchTarget) }
                 return
+            // 注意：launchingBundleID 不在这里清——launchGuestInProcess 的
+            // 完成回调里统一清（成功与失败都清），避免加载态提前消失。
             }
             // 0.2.8：Swift 6 下 @Sendable 闭包不能捕获 var——先把最终值
             // 定格成 let 再进 MainActor.run（0.2.8 第一轮 CI 红于此，
@@ -423,6 +457,7 @@ final class SBAppCoordinator: ObservableObject {
                     // 重导证书背锅；具体原因见启动日志。
                     SBDiagLog.log("启动失败：\(launchTarget.bundleID) 注入组件签名失败，弹启动失败（\(SBCertificate.hooksSignFailureReason)）")
                     self.isLaunching = false
+                    self.launchingBundleID = nil
                     self.activeAlert = CoordinatorAlert(
                         title: "启动失败",
                         message: SBCertificate.hooksSignFailureReason)
@@ -475,6 +510,7 @@ final class SBAppCoordinator: ObservableObject {
         ) { [weak self] error in
             guard let self = self else { return }
             self.launchStage = nil
+            self.launchingBundleID = nil
             guard let error = error else {
                 // 0.2.36：成功也要清旗——之前成功时直接 return，旗标永久为真，
                 // 同进程内再点任何客都被 launchApp 的 guard 静默吞掉（0.2.35
