@@ -208,6 +208,19 @@ void LCOpenWebPage(NSString* webPageUrlString, NSString* originalUrl) {
     UIWindow *window = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"LiveContainer" message:message preferredStyle:UIAlertControllerStyleAlert];
     UIAlertAction* okAction = [UIAlertAction actionWithTitle:@"lc.common.ok".loc style:UIAlertActionStyleDefault handler:^(UIAlertAction * action) {
+        if(NSUserDefaults.isLiveProcess) {
+            // Multitask guest: ask the host to open the web page. Don't
+            // relaunch here: the classic relaunch would kill this guest's
+            // LiveProcess instead of returning to the host UI.
+            NSData *data = [webPageUrlString dataUsingEncoding:NSUTF8StringEncoding];
+            NSString *encodedUrl = [data base64EncodedStringWithOptions:0];
+            NSURL *hostURL = [NSURL URLWithString:[NSString stringWithFormat:@"%@://open-web-page?url=%@", NSUserDefaults.lcAppUrlScheme, encodedUrl]];
+            if(hostURL) {
+                [[UIApplication sharedApplication] openURL:hostURL options:@{} completionHandler:nil];
+            }
+            window.windowScene = nil;
+            return;
+        }
         [NSClassFromString(@"LCSharedUtils") setWebPageUrlForNextLaunch:webPageUrlString];
         [NSClassFromString(@"LCSharedUtils") launchToGuestAppWithClassicMode:0];
     }];
@@ -241,19 +254,34 @@ void LCOpenWebPage(NSString* webPageUrlString, NSString* originalUrl) {
 
 }
 
+// Switch to builtin SideStore. In a multitask guest, ask the host to launch
+// it (relaunching would kill this guest's LiveProcess); in classic mode keep
+// write-selected + relaunch.
+static void LCLaunchBuiltinSideStore(NSURL *sidestoreUrl) {
+    if(NSUserDefaults.isLiveProcess) {
+        NSData *data = [sidestoreUrl.absoluteString dataUsingEncoding:NSUTF8StringEncoding];
+        NSString *encodedUrl = [data base64EncodedStringWithOptions:0];
+        NSURL *hostURL = [NSURL URLWithString:[NSString stringWithFormat:@"%@://livecontainer-launch?bundle-name=builtinSideStore&open-url=%@", NSUserDefaults.lcAppUrlScheme, encodedUrl]];
+        if(hostURL) {
+            [[UIApplication sharedApplication] openURL:hostURL options:@{} completionHandler:nil];
+        }
+        return;
+    }
+    [NSUserDefaults.lcUserDefaults setObject:sidestoreUrl.absoluteString forKey:@"launchAppUrlScheme"];
+    [NSUserDefaults.lcUserDefaults setObject:@"builtinSideStore" forKey:@"selected"];
+    [NSClassFromString(@"LCSharedUtils") launchToGuestAppWithClassicMode:0];
+}
+
 void LCOpenSideStoreURL(NSURL* sidestoreUrl) {
     if ([NSUserDefaults.lcUserDefaults boolForKey:@"LCSwitchAppWithoutAsking"]) {
-        [NSUserDefaults.lcUserDefaults setObject:sidestoreUrl.absoluteString forKey:@"launchAppUrlScheme"];
-        [NSUserDefaults.lcUserDefaults setObject:@"builtinSideStore" forKey:@"selected"];
-        [NSClassFromString(@"LCSharedUtils") launchToGuestAppWithClassicMode:0];
+        LCLaunchBuiltinSideStore(sidestoreUrl);
+        return;
     }
     NSString *message = [@"lc.guestTweak.appSwitchTip %@" localizeWithFormat:@"SideStore"];
     UIWindow *window = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"LiveContainer" message:message preferredStyle:UIAlertControllerStyleAlert];
     UIAlertAction* okAction = [UIAlertAction actionWithTitle:@"lc.common.ok".loc style:UIAlertActionStyleDefault handler:^(UIAlertAction * action) {
-        [NSUserDefaults.lcUserDefaults setObject:sidestoreUrl.absoluteString forKey:@"launchAppUrlScheme"];
-        [NSUserDefaults.lcUserDefaults setObject:@"builtinSideStore" forKey:@"selected"];
-        [NSClassFromString(@"LCSharedUtils") launchToGuestAppWithClassicMode:0];
+        LCLaunchBuiltinSideStore(sidestoreUrl);
     }];
     [alert addAction:okAction];
     
@@ -435,6 +463,34 @@ static LCControlAppURLHandling LCHandleControlAppURL(NSURL *url, NSString** modi
     NSString* urlHost = url.host;
     
     if([urlHost isEqualToString:@"livecontainer-relaunch"]) {
+        // Multitask guest: ask the host to terminate + relaunch this guest.
+        // bundle-name / container-folder-name default to this guest's own
+        // identity when the sender omitted them. Classic guest: there is no
+        // separate host process, so keep swallowing the signal as before.
+        if(NSUserDefaults.isLiveProcess) {
+            NSURLComponents *relaunchComponents = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO];
+            NSMutableArray<NSURLQueryItem *> *queryItems = [relaunchComponents.queryItems mutableCopy];
+            if(!queryItems) {
+                queryItems = [NSMutableArray array];
+            }
+            BOOL hasBundleName = NO, hasContainer = NO;
+            for(NSURLQueryItem *item in queryItems) {
+                if([item.name isEqualToString:@"bundle-name"]) hasBundleName = YES;
+                else if([item.name isEqualToString:@"container-folder-name"]) hasContainer = YES;
+            }
+            if(!hasBundleName) {
+                [queryItems addObject:[NSURLQueryItem queryItemWithName:@"bundle-name" value:NSBundle.mainBundle.bundlePath.lastPathComponent]];
+            }
+            if(!hasContainer) {
+                [queryItems addObject:[NSURLQueryItem queryItemWithName:@"container-folder-name" value:[NSString stringWithUTF8String:getenv("HOME")].lastPathComponent]];
+            }
+            relaunchComponents.queryItems = queryItems;
+            relaunchComponents.scheme = NSUserDefaults.lcAppUrlScheme;
+            NSURL *hostURL = relaunchComponents.URL;
+            if(hostURL) {
+                [[UIApplication sharedApplication] openURL:hostURL options:@{} completionHandler:nil];
+            }
+        }
         return LCControlAppURLHandlingStop;
     }
     

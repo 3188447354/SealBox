@@ -144,11 +144,17 @@ class LCAppModel: ObservableObject, Hashable {
         }
     }
     
+    // Multitask is the default launch path: the host stays alive and each
+    // guest runs in its own LiveProcess, so switching apps no longer relaunches.
+    // - Per-app override (.yes/.no) still wins.
+    // - A stored `LCLaunchInMultitaskMode == false` (user explicitly opted out
+    //   in Settings) still wins; only a never-set key defaults to true.
+    // - `runApp` still forces classic when `classicMode != 0`.
     public var shouldLaunchInMultitaskMode : Bool {
         get {
             if #available(iOS 16.0, *) {
                 return uiIsMultitaskModeSpecificed == .yes ||
-                (uiIsMultitaskModeSpecificed == .default && UserDefaults.standard.bool(forKey: "LCLaunchInMultitaskMode"))
+                (uiIsMultitaskModeSpecificed == .default && (UserDefaults.standard.object(forKey: "LCLaunchInMultitaskMode") as? Bool ?? true))
             } else {
                 return false
             }
@@ -232,6 +238,10 @@ class LCAppModel: ObservableObject, Hashable {
         }
         let currentDataFolder = containerFolderName ?? uiSelectedContainer?.folderName
         
+        // Multitask is the default: `multitask` is true unless the app needs
+        // classic mode, the caller overrode it, or the user opted out
+        // (see shouldLaunchInMultitaskMode). Classic relaunch below is only
+        // the fallback for multitask-unavailable cases.
         let classicMode = appInfo.defaultClassicMode
         let multitask = classicMode == 0 ? (multitask ?? shouldLaunchInMultitaskMode) : false
         

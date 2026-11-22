@@ -1006,7 +1006,7 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
         }
     }
     
-    func launchAppWithBundleId(bundleId : String, container : String?, urlStr: String? = nil, forceJIT: Bool? = nil) async {
+    func launchAppWithBundleId(bundleId : String, container : String?, urlStr: String? = nil, forceJIT: Bool? = nil, multitask: Bool? = nil) async {
         if bundleId == "" {
             return
         }
@@ -1054,7 +1054,7 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
         }
 
         do {
-            try await appFound.runApp(multitask: nil, containerFolderName: container, urlStr: urlStr, forceJIT: forceJIT)
+            try await appFound.runApp(multitask: multitask, containerFolderName: container, urlStr: urlStr, forceJIT: forceJIT)
         } catch {
             errorInfo = error.localizedDescription
             errorShow = true
@@ -1233,6 +1233,44 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
                 }
                 if let bundleId, bundleId != "ui"{
                     Task { await launchAppWithBundleId(bundleId: bundleId, container: containerName, urlStr: urlStr, forceJIT: forceJIT) }
+                } else if bundleId == "ui" {
+                    // Guest asked to go back to the host UI. The host never
+                    // relaunched, so just hide the guest windows (virtual-
+                    // window mode); the host UI underneath shows again. In
+                    // native-window mode the main scene coming to the
+                    // foreground is enough and the guest scenes stay alive.
+                    MultitaskDockManager.shared.minimizeAllWindows()
+                }
+            }
+        } else if url.host == "livecontainer-relaunch" {
+            // Guest asked the host to terminate + relaunch it (e.g. after a
+            // crash inside the guest). Terminate the running LiveProcess
+            // first so the relaunch starts a fresh process, then launch it
+            // in multitask mode.
+            if let components = URLComponents(url: url, resolvingAgainstBaseURL: false) {
+                var bundleId : String? = nil
+                var containerName : String? = nil
+                for queryItem in components.queryItems ?? [] {
+                    if queryItem.name == "bundle-name", let bundleId1 = queryItem.value {
+                        bundleId = bundleId1
+                    } else if queryItem.name == "container-folder-name", let containerName1 = queryItem.value {
+                        containerName = containerName1
+                    }
+                }
+                if let bundleId {
+                    Task {
+                        if let containerName {
+                            // Must run on MainActor: it reads the dock's
+                            // @Published apps and touches UIKit.
+                            let closed = await MainActor.run {
+                                MultitaskDockManager.shared.closeMultitaskWindow(uuid: containerName)
+                            }
+                            if closed {
+                                try? await Task.sleep(nanoseconds: 600_000_000)
+                            }
+                        }
+                        await launchAppWithBundleId(bundleId: bundleId, container: containerName, multitask: true)
+                    }
                 }
             }
         } else if url.host == "install" {

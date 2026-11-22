@@ -173,6 +173,24 @@ NSString* FBSOpenApplicationOptionKeyPayloadURL = @"__PayloadURL";
     NSURLComponents* components = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO];
     if(![components.host isEqualToString:@"livecontainer-launch"]) return NO;
 
+    // Multitask guest (LiveProcess): the host process is alive and already
+    // hosts this guest's scene, so don't write `selected` + relaunch.
+    // Forward the switch request to the host scheme instead; the host brings
+    // the target window forward or launches it in multitask mode, and the
+    // current guest keeps running. Classic mode (isLiveProcess == NO) keeps
+    // the write-selected + relaunch path below as the fallback.
+    if(NSUserDefaults.isLiveProcess) {
+        NSURLComponents *hostComponents = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO];
+        hostComponents.scheme = NSUserDefaults.lcAppUrlScheme;
+        NSURL *hostURL = hostComponents.URL;
+        if(!hostURL) {
+            return NO;
+        }
+        UIApplication *application = [NSClassFromString(@"UIApplication") sharedApplication];
+        [application openURL:hostURL options:@{} completionHandler:nil];
+        return YES;
+    }
+
     NSString* launchBundleId = nil;
     NSString* openUrl = nil;
     NSString* containerFolderName = nil;

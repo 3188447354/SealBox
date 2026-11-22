@@ -727,7 +727,33 @@ class AppInfoProvider {
             }
         }
     }
-    
+
+    // Terminate one running guest's LiveProcess by dataUUID. Hiding is NOT
+    // enough here: a guest-initiated relaunch needs a fresh process, and the
+    // dock close menu means "end this app". Must be called on the main
+    // thread (reads the @Published apps and touches UIKit).
+    // - Virtual-window mode: the dock owns the decorated view controller,
+    //   so close it (closeWindow -> AppSceneViewController.terminate ->
+    //   SIGTERM, SIGKILL after 3s).
+    // - Native-window mode: the dock has no view for the window, so ask the
+    //   window scene to terminate itself via notification (handled by
+    //   MultitaskAppWindow, which sets show=false -> terminate()).
+    // Returns true if a running window was found for this UUID.
+    @objc public func closeMultitaskWindow(uuid: String) -> Bool {
+        if let app = apps.first(where: { $0.appUUID == uuid }),
+           let vc = app.view?._viewDelegate() as? DecoratedAppSceneViewController {
+            vc.closeWindow()
+            return true
+        }
+        if #available(iOS 16.1, *) {
+            if MultitaskWindowManager.appDict[uuid] != nil {
+                NotificationCenter.default.post(name: .lcMultitaskTerminateWindow, object: nil, userInfo: ["dataUUID": uuid])
+                return true
+            }
+        }
+        return false
+    }
+
     @objc public func toggleDockCollapse() {
         DispatchQueue.main.async {
             self.isCollapsed.toggle()
@@ -1135,6 +1161,13 @@ struct AppIconView: View {
             }
         )
         .contentShape(Rectangle())
+        .contextMenu {
+            Button(role: .destructive) {
+                let _ = dockManager.closeMultitaskWindow(uuid: app.appUUID)
+            } label: {
+                Label("lc.common.close".loc, systemImage: "xmark")
+            }
+        }
     }
     
     private func loadAppIcon() {

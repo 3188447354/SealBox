@@ -164,6 +164,17 @@ struct MultitaskAppWindow: View {
                     show = false
                 }
             }
+            .onReceive(NotificationCenter.default.publisher(for: .lcMultitaskTerminateWindow)) { notification in
+                // Asked by the host (e.g. guest-initiated relaunch) to end
+                // this guest: hide the window, which terminates the
+                // LiveProcess via AppSceneViewSwiftUI.updateUIViewController.
+                // didRequestManualClose stops the auto-relaunch scheduling
+                // on the terminated screen.
+                guard let uuid = notification.userInfo?["dataUUID"] as? String,
+                      uuid == appInfo.dataUUID else { return }
+                didRequestManualClose = true
+                show = false
+            }
             
         } else if skipTerminatedScreen && isVirtualWindowMode, appInfo != nil {
             Color.clear
