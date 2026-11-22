@@ -15,6 +15,11 @@
 #ifndef SB_GUEST_MACHO_CLASS_LIST_H
 #define SB_GUEST_MACHO_CLASS_LIST_H
 
+// 0.2.44（B-4）：本头声明用 uint8_t／size_t，须自带头文件——之前声明只用
+// char *／unsigned int／void *，没引也编得过；B-4 之后不引即 unknown type。
+#include <stdint.h>
+#include <stddef.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
