@@ -31,30 +31,100 @@ static NSString * const SBKeySelectedGuestContainer = @"SBSelectedGuestContainer
 // scene 驱动：系统路先试，0.4 秒后无窗则手动 willConnect。
 static const NSTimeInterval SBGuestSceneSystemPathWaitSeconds = 0.4;
 
-// 0.2.40（洞 1）：按镜像定点取类——NSClassFromString 是进程全局查找，
-// 另一客先在同一进程加载过同名 AppDelegate 时会返回别人的类（彩云已证实
-// 其 AppDelegate 注册为裸 AppDelegate）。只认定义在本客 .app 包内的类
-// （可执行本身，或包内 framework）；类不在本客包内时记一行并返回 Nil，
-// 调用方按“探测不到”干净失败，绝不装错 delegate。取不到镜像名时沿用
-// 旧行为（不破坏正常探测路径）。
-// 0.2.40（并轨）：核心按路径参数取类；context 与 session 是两个不同类型、
-// 同名字段（bundleID/guestAppPath/guestExecPath），各由一个薄包装器传参，
-// 定点取类逻辑只此一份，不另写查找。
+// 0.2.41（本轮，根因 A＋B）：按客镜像取类——0.2.40 的 NSClassFromString＋
+// 路径比对仍有两处必错：
+//  (A) class_getImageName 返回 dyld 规范化路径（/private/var/…），而
+//      guestExecPath/guestAppPath 是存量路径（/var/mobile/…，见
+//      SBGuestBootstrap.m:588 Documents 下拼接），直接 isEqualToString /
+//      hasPrefix 必失败——Guoguo 自己的类被当成别客的类拒掉（12:06:10 日志）；
+//  (B) NSClassFromString 只返回进程全局第一个注册的同名类——Guoguo 先加载，
+//      它的 AppDelegate 占了裸名，Picsew/彩云自己的同名类按裸名永远查不到。
+// 修法：比对前两边都规范化（stringByResolvingSymlinksInPath；/var 是到
+// /private/var 的符号链接）；取类改成枚举 ObjC 类表（objc_getClassList，
+// 公开运行时 API）后按类名＋镜像归属过滤。选枚举不用直接读 Mach-O
+// __objc_classlist：后者要自己算 slide/段偏移、认 dyld 镜像，与运行时已
+// 维护的注册表重复；guest dlopen 后类必已注册，枚举即全集。
+// 全局 NSClassFromString 只用于诊断行（说明“找到的是谁家的类”），绝不再
+// 作为取类依据；客镜像内没有该名类即 Nil，调用方按“探测不到”干净失败。
+static NSString *SBGuestNormalizedPath(NSString *path) {
+    if (path.length == 0) {
+        return path;
+    }
+    return [path stringByResolvingSymlinksInPath];
+}
+
+static BOOL SBGuestImagePathIsInGuest(NSString *imagePath, NSString *guestAppPath, NSString *guestExecPath) {
+    NSString *normImage = SBGuestNormalizedPath(imagePath);
+    NSString *normExec = SBGuestNormalizedPath(guestExecPath);
+    if (normImage.length > 0 && normExec.length > 0 && [normImage isEqualToString:normExec]) {
+        return YES;
+    }
+    NSString *normApp = SBGuestNormalizedPath(guestAppPath);
+    if (normImage.length > 0 && normApp.length > 0) {
+        NSString *appPrefix = [normApp stringByAppendingString:@"/"];
+        if ([normImage hasPrefix:appPrefix]) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
+/// 枚举 ObjC 类表，找名字是 className 且定义在客 .app 包内（可执行本身，
+/// 或包内 framework）的类；没有即 Nil。激活时才调（非热路径），类表规模
+/// 数千，一次枚举可接受；不缓存——同进程多客依次加载时类表会变。
+static Class SBGuestClassNamedInGuestImage(NSString *className, NSString *guestAppPath, NSString *guestExecPath) {
+    int count = objc_getClassList(NULL, 0);
+    if (count <= 0) {
+        return Nil;
+    }
+    Class *classes = malloc(sizeof(Class) * (size_t)count);
+    if (!classes) {
+        return Nil;
+    }
+    int fetched = objc_getClassList(classes, count);
+    Class found = Nil;
+    const char *wantedName = [className UTF8String];
+    for (int i = 0; i < fetched; i++) {
+        Class cls = classes[i];
+        const char *name = class_getName(cls);
+        if (!name || !wantedName || strcmp(name, wantedName) != 0) {
+            continue;
+        }
+        const char *imageName = class_getImageName(cls);
+        if (!imageName) {
+            continue;
+        }
+        NSString *imagePath = [NSString stringWithUTF8String:imageName];
+        if (SBGuestImagePathIsInGuest(imagePath, guestAppPath, guestExecPath)) {
+            found = cls;
+            break;
+        }
+    }
+    free(classes);
+    return found;
+}
+
 static Class SBGuestClassNamedInGuest(NSString *className, NSString *bundleID,
                                       NSString *guestAppPath, NSString *guestExecPath) {
-    Class cls = NSClassFromString(className);
-    if (!cls) return Nil;
-    const char *imageName = class_getImageName(cls);
-    if (!imageName) return cls;
-    NSString *imagePath = [NSString stringWithUTF8String:imageName];
-    if ([imagePath isEqualToString:guestExecPath]) return cls;
-    NSString *appPrefix = [guestAppPath stringByAppendingString:@"/"];
-    if (guestAppPath.length > 0 && [imagePath hasPrefix:appPrefix]) return cls;
-    SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 按名找到的 %@ 在另一镜像（%@），不是本客的类，不用",
-                    bundleID, className, imagePath] UTF8String]);
+    Class cls = SBGuestClassNamedInGuestImage(className, guestAppPath, guestExecPath);
+    if (cls) {
+        return cls;
+    }
+    // 客镜像内没有该名类：只记诊断行（全局查到的是谁家的类），不回落全局查找——
+    // 回落会把先加载的另一客的同名类误认成本客的类（根因 B）。
+    Class global = NSClassFromString(className);
+    if (global) {
+        const char *imageName = class_getImageName(global);
+        NSString *imagePath = imageName ? [NSString stringWithUTF8String:imageName] : @"?";
+        SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 按名找到的 %@ 在另一镜像（%@），不是本客的类，不用",
+                        bundleID, className, imagePath] UTF8String]);
+    }
     return Nil;
 }
 
+// 0.2.40（并轨）：核心按路径参数取类；context 与 session 是两个不同类型、
+// 同名字段（bundleID/guestAppPath/guestExecPath），各由一个薄包装器传参，
+// 定点取类逻辑只此一份，不另写查找。0.2.41：同一 helper，枚举取类＋路径规范化。
 static Class SBGuestClassNamed(NSString *className, SBGuestMainHookContext *context) {
     return SBGuestClassNamedInGuest(className, context.bundleID, context.guestAppPath, context.guestExecPath);
 }
@@ -320,6 +390,7 @@ static Class SBGuestClassNamedForSession(NSString *className, SBGuestSession *se
     // 0.2.40（并轨，洞 1 同根因）：plist 的 scene delegate 类名也走按镜像
     // 定点取类——NSClassFromString 是进程全局查找，另一客先加载过的同名类
     // 会污染；不在本客包内即 Nil，调用方按“无 scene 配置”干净失败。
+    // 0.2.41：同一 helper，枚举取类＋路径规范化。
     Class delegateClass = SBGuestClassNamedForSession(delegateClassName, session);
     if (!delegateClass) {
         return nil;
@@ -695,6 +766,17 @@ static Class SBGuestClassNamedForSession(NSString *className, SBGuestSession *se
                         context.bundleID, principalClassName] UTF8String]);
     }
     NSString *resolvedDelegateClassName = delegateClassName;
+    if (resolvedDelegateClassName.length > 0) {
+        // 0.2.41（根因 B 补充）：main 传来的显式 delegate 名先在客镜像内验；
+        // 验不过不直接干净失败——main 传的可能是裸名（彩云传 AppDelegate，
+        // 类实际注册为 <模块>.AppDelegate），回落到下面通用探测再找一遍；
+        // 回落对所有客通用，不写应用特判。仍找不到才干净失败。
+        if (!SBGuestClassNamed(resolvedDelegateClassName, context)) {
+            SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ main 传的 delegate 类 %@ 不在本客镜像内，回落到按名探测（<模块>.AppDelegate / AppDelegate）",
+                            context.bundleID, resolvedDelegateClassName] UTF8String]);
+            resolvedDelegateClassName = nil;
+        }
+    }
     if (resolvedDelegateClassName.length == 0) {
         // 0.2.36：main 没传 delegate 类时，按名探测真 AppDelegate（模块名取
         // 客可执行名）——0.2.35 真机 MediaStormCamera 的 main 传 delegate=nil
@@ -705,6 +787,7 @@ static Class SBGuestClassNamedForSession(NSString *className, SBGuestSession *se
         // 头号嫌疑）。探测不到时不再回退到 scene delegate 类（见下一块），宁可干净失败。
         // 0.2.40：Swift 模块名里 '-' 写成 '_'（可执行名含 '-' 时探测一否则必 miss）；
         // 探测走 SBGuestClassNamed 按镜像定点取类，不走全局名查找（见文件头 helper）。
+        // 0.2.41：SBGuestClassNamed 改成枚举客镜像类表＋路径规范化（同上）。
         NSString *moduleName = [[context.guestExecPath lastPathComponent]
             stringByReplacingOccurrencesOfString:@"-" withString:@"_"];
         NSString *appDelegateName = [NSString stringWithFormat:@"%@.AppDelegate", moduleName];
@@ -724,6 +807,7 @@ static Class SBGuestClassNamedForSession(NSString *className, SBGuestSession *se
         // nil。装错 delegate 只会静默死或黑屏，不如干净失败写明原因。
         // 0.2.40：探测二同样走 SBGuestClassNamed——裸名跨客污染时（另一客的
         // AppDelegate 已注册）返回 Nil，不装别人的类。
+        // 0.2.41：枚举客镜像类表，客自己的同名类（后注册）也能找到，不再只认全局第一个。
         if (SBGuestClassNamed(@"AppDelegate", context)) {
             resolvedDelegateClassName = @"AppDelegate";
             SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ main 未传 delegate 类，按名探测到裸 AppDelegate 类",
@@ -737,6 +821,7 @@ static Class SBGuestClassNamedForSession(NSString *className, SBGuestSession *se
     }
     // 0.2.40：最终解析也按镜像定点取类——main 传来的显式类名同样可能撞上
     // 另一客先注册的同名类；SBGuestClassNamed 验不过即 Nil，走干净失败。
+    // 0.2.41：显式名验不过时上面已回落探测过一次，到这里仍是 Nil 才是真找不到。
     Class delegateClass = resolvedDelegateClassName.length > 0
         ? SBGuestClassNamed(resolvedDelegateClassName, context) : Nil;
     if (!delegateClass) {

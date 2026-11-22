@@ -27,6 +27,8 @@ void SBDiagLogBeginRun(void);
 /// 当 C 串读，只写出 isa 指针的低 5 字节乱码（0.2.31 真机三行乱码的根因，
 /// 0.2.32 已把全仓 14 处字面量调用改成 [@"..." UTF8String]）。新调用点
 /// 一律传 UTF8String 或 C 串，绝不直接传 @"..."。
+/// 0.2.41 全仓审计：215 处调用点只剩 main.m:137 这一处直接传 @"..."（同款
+/// 错误重现），已改 C 串；其余均为 UTF8String / C 串 / char * 变量。
 void SBDiagLogLine(const char *step);
 
 /// 正常启动完成时调用：写完成标记。下次启动看到标记即认作上次正常。
