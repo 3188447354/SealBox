@@ -47,6 +47,7 @@
 
 #include <limits.h>
 #include <stdint.h>
+#include <stdio.h>  // snprintf（0.2.42 首轮 CI：隐式声明在工程里是 -Werror）
 #include <stdlib.h>
 #include <string.h>
 

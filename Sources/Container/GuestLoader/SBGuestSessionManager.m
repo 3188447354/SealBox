@@ -88,7 +88,10 @@ static NSMutableDictionary<NSString *, id> *SBGuestClassCache(void) {
 /// 结构性失败时 SBGuestLastClassTableFailure 置原因串（调用方干净失败用）。
 static Class SBGuestClassNamedInGuestImage(NSString *className, NSString *guestAppPath, NSString *guestExecPath) {
     const char *failureReason = NULL;
-    Class found = (Class)SBGuestMachOClassNamedInGuest([className UTF8String],
+    // CI 教训（0.2.42 首轮 run 44989722207）：ARC 下 void * → Class 的 C 风格
+    // cast 不许，必须 __bridge（不转移所有权，类指针不归调用方所有）；
+    // 同一函数内 NSValue pointerValue 的取回也一律 __bridge，免得再红一轮。
+    Class found = (__bridge Class)SBGuestMachOClassNamedInGuest([className UTF8String],
                                                        [guestExecPath UTF8String],
                                                        [guestAppPath UTF8String],
                                                        &failureReason);
@@ -111,7 +114,7 @@ static Class SBGuestClassNamedInGuest(NSString *className, NSString *bundleID,
     id cached = cache[cacheKey];
     Class cls = Nil;
     if (cached) {
-        cls = (cached == (id)[NSNull null]) ? Nil : (Class)[(NSValue *)cached pointerValue];
+        cls = (cached == (id)[NSNull null]) ? Nil : (__bridge Class)[(NSValue *)cached pointerValue];
         SBDiagLogWatchdogStepEnd("class-resolve");
         return cls;
     }
