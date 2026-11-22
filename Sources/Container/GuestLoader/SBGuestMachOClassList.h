@@ -20,6 +20,11 @@
 #include <stdint.h>
 #include <stddef.h>
 
+// 0.2.44 fixup 3b：struct mach_header 前向声明须在文件作用域——只写在
+// 函数原型里时，该 tag 的作用域仅限该函数，与 .c 里 <mach-o/loader.h> 的
+// 真定义是两个不同的 struct，报 conflicting types（CI 第四轮）。
+struct mach_header;
+
 #ifdef __cplusplus
 extern "C" {
 #endif
