@@ -252,11 +252,11 @@ struct HomeScreenView: View {
                     // 同一个通知（SBGuestSwitcherRequested），VMRootView 接到
                     // 即弹切换器；无后台客时切换器只显示“没有正在运行的应用”。
                     Button("切换器") {
-                        // 常量在 Swift 里已是 NSNotification.Name（Clang 导入器把
-                        // 以 Notification 结尾的 NSString *const 当 Name 导入），
-                        // 直接用，不包 Notification.Name(...)。
+                        // ObjC 常量 SBGuestSwitcherRequestedNotification 在 Swift
+                        // 里被导入器重命名为 NSNotification.Name.SBGuestSwitcherRequested
+                        //（去 Notification 后缀），直接用该名。
                         NotificationCenter.default.post(
-                            name: SBGuestSwitcherRequestedNotification, object: nil)
+                            name: .SBGuestSwitcherRequested, object: nil)
                     }
                     .buttonStyle(.bordered)
                     .tint(.white)

@@ -97,7 +97,7 @@ struct VMRootView: View {
         }
         // 0.2.44（问题 3）：切换器请求（桌面“切换器”按钮／客内横杠长按）
         // → 弹切换器。无后台客时切换器只显示空态，不弹错。
-        .onReceive(NotificationCenter.default.publisher(for: SBGuestSwitcherRequestedNotification)) { _ in
+        .onReceive(NotificationCenter.default.publisher(for: .SBGuestSwitcherRequested)) { _ in
             showSwitcher = true
         }
         .sheet(isPresented: $showSwitcher) {
