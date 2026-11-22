@@ -162,22 +162,18 @@ enum SBLaunchRouter {
         }
     }
 
-    /// 0.2.13：重启路消费收据前的完整签名逐项门。
-    /// 根因（0.2.12 真机实证，2026-11-19 11:59）：hdsh 在 09:52 的旧检查
-    /// 里全过（9492 页、CMS 在位、Team 一致），收据由 0.2.11 在 09:52 写下；
-    /// 0.2.12 重启后只走了 blockReceiptOnTeamMismatch（只比 Team，不验结构），
-    /// 新门没机会拦它，dlopen 照样报 code signature invalid（errno=85，
-    /// codeBlobOffset=0x02513CE0）。点图标门（ensureLaunchableSignature，
-    /// 全逐项 + 强制重签）只在点图标时跑；重启路是另一套逻辑。
-    /// 收据本身没有门版本字段（ObjC 写 JSON，Swift 只读），旧版本收据无法
-    /// 区分——所以重启路对所有收据一律视为未验签，无条件重跑逐项。
-    /// 快查同步跑（逐项解析是纯计算）；需要修时不阻塞启动主线程，返回
+    /// 0.2.39：重启路消费收据前的签名门，与点图标门同一套 LC 判定
+    /// （LCAppInfo.m:377-390，只认内核验签）。旧版（0.2.13）跑静态逐项：
+    /// 0.2.12 真机 hdsh 旧收据绕过新门的教训仍在——收据无门版本字段，
+    /// 重启路对所有收据一律视为未验签，无条件重跑本门，不变。
+    /// 静态逐项只记诊断；上次实测死在 dlopen 签名失败（lastLaunchSigFailed，
+    /// 须容器一致）或缺 LC_ID_DYLIB 时仍触发修复（与点图标门守卫①②同款）。
+    /// 快查同步跑（内核验签是纯系统调用）；需要修时不阻塞启动主线程，返回
     /// needsRepair，由 routeOnLaunchIfNeeded 走异步修复 + 加载。
     private enum ReceiptSignatureGate {
-        /// 逐项全过且上次不是签名失败且 LC_ID_DYLIB 在：直接走 dlopen
-        ///（今天的行为，不变）。
+        /// 内核验签通过且上次不是签名失败且 LC_ID_DYLIB 在：直接走 dlopen。
         case proceed
-        /// 逐项有坏项、或上次死在 dlopen 签名失败、或缺 LC_ID_DYLIB：
+        /// 内核验签不通过、或上次死在 dlopen 签名失败、或缺 LC_ID_DYLIB：
         /// 异步强制重打补丁 + 重签。
         case needsRepair
     }
@@ -193,19 +189,25 @@ enum SBLaunchRouter {
         guard let record = record else { return .proceed }
         let executablePath = record.executableURL.path
         guard FileManager.default.fileExists(atPath: executablePath) else { return .proceed }
-        // 先记一行逐项——重启路以前连这行都没有，坏签是放行还是根本没验，
-        // 看日志分不出来（0.2.12 的 hdsh 就是例子）。0.2.14：同一行里把
-        // 失败标记的状态也记下来（上次死在 dlopen 签名失败与否 + 原因），
-        // 门是放行还是触发修复、按什么输入决定的，日志里一次看清。
+        // 静态逐项只记诊断（0.2.39：不再决定放行/修复，见 SBInstaller
+        // ensureLaunchableSignature 函数头注释）。
         let detail = SBCodesignCheck.signatureDetail(atPath: executablePath)
         let lastLaunchSigFailed = record.lastLaunchSigFailed
         let missingIDDylib = SBMachOHasIDDylib(executablePath) == 0
-        SBDiagLog.log("启动路由验签：\(record.bundleID) \(executablePath) \(SBInstaller.signatureDetailFields(detail: detail)) 上次签名失败标记=\(lastLaunchSigFailed ? "是" : "否")\(record.lastLaunchResult.map { "（\($0.message.prefix(80))）" } ?? "") 缺LC_ID_DYLIB=\(missingIDDylib ? "是" : "否")")
+        var kernelStep: Int32 = 0
+        var kernelErrno: Int32 = 0
+        var kernelMessage = [CChar](repeating: 0, count: 512)
+        let kernelValid = kernelMessage.withUnsafeMutableBufferPointer { msgPtr in
+            SBLCCheckCodeSignatureDetail(executablePath, &kernelStep, &kernelErrno, msgPtr.baseAddress, msgPtr.count) != 0
+        }
+        let kernelMessageText = kernelMessage.withUnsafeBufferPointer { buf in
+            buf.baseAddress.map { String(cString: $0) } ?? ""
+        }
+        SBDiagLog.log("启动路由验签：\(record.bundleID) \(executablePath) \(SBInstaller.signatureDetailFields(detail: detail)) 内核验签=\(kernelValid ? "通过" : "不通过")（步骤=\(kernelStep)，errno=\(kernelErrno)\(kernelMessageText.isEmpty ? "" : "，\(kernelMessageText)") 上次签名失败标记=\(lastLaunchSigFailed ? "是" : "否")\(record.lastLaunchResult.map { "（\($0.message.prefix(80))）" } ?? "") 缺LC_ID_DYLIB=\(missingIDDylib ? "是" : "否")")
         // 未签名记录：只记不拦（与点图标门一致——二进制可能无签名走 JIT；
         // 拦的活由 Team 门做，blockReceiptOnTeamMismatch 已跑过）。
         guard record.signed else { return .proceed }
-        let detailValid = (detail["valid"] as? NSNumber)?.boolValue ?? false
-        if detailValid && !lastLaunchSigFailed && !missingIDDylib {
+        if kernelValid && !lastLaunchSigFailed && !missingIDDylib {
             return .proceed
         }
         return .needsRepair
@@ -422,7 +424,7 @@ enum SBLaunchRouter {
             }
             return
         }
-        // 0.2.13：重启路的签名逐项门（见 receiptSignatureGate）。快查同步；
+        // 0.2.13：重启路的内核验签门（见 receiptSignatureGate）。快查同步；
         // 需要修时走异步修复 + 加载，不阻塞启动主线程。
         switch receiptSignatureGate() {
         case .proceed:

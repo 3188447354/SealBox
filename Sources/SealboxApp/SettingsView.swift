@@ -65,7 +65,6 @@ private enum SettingsDestination: String, Hashable, CaseIterable {
 }
 
 struct SettingsView: View {
-    @EnvironmentObject private var vm: VMState
     @State private var searchText = ""
     @AppStorage("vm.settings.wifiNetwork") private var wifiNetwork = "SealBox-5G"
     /// 0.2.37：账号卡片用的证书信息（叶子证书里取真实 Apple ID）与自选头像。
@@ -81,12 +80,6 @@ struct SettingsView: View {
         let query = searchText.trimmingCharacters(in: .whitespaces)
         guard !query.isEmpty else { return [] }
         return SettingsDestination.allCases.filter { $0.rawValue.localizedCaseInsensitiveContains(query) }
-    }
-
-    /// Whether "软件源" / "插件" match the current search text.
-    private func appRowMatches(_ name: String) -> Bool {
-        let query = searchText.trimmingCharacters(in: .whitespaces)
-        return !query.isEmpty && name.localizedCaseInsensitiveContains(query)
     }
 
     var body: some View {
@@ -197,16 +190,6 @@ struct SettingsView: View {
 
             // 启动诊断日志（0.2.4）：上次启动是否崩了 + 查看全文。
             StartupDiagLogSection()
-
-            // Group 3: other built-in apps (switch apps, not sub-pages)
-            Section {
-                Button { vm.openApp = .source } label: {
-                    AppSwitchRow(icon: "arrow.down.circle.fill", color: .blue, title: "软件源")
-                }
-                Button { vm.openApp = .plugins } label: {
-                    AppSwitchRow(icon: "puzzlepiece.extension.fill", color: .purple, title: "插件")
-                }
-            }
         }
         .safeAreaInset(edge: .bottom) { Color.clear.frame(height: 28) }
     }
@@ -236,17 +219,7 @@ struct SettingsView: View {
                     SettingsRow(destination: destination, detail: destination == .wifi ? wifiNetwork : nil)
                 }
             }
-            if appRowMatches("软件源") {
-                Button { vm.openApp = .source } label: {
-                    AppSwitchRow(icon: "arrow.down.circle.fill", color: .blue, title: "软件源")
-                }
-            }
-            if appRowMatches("插件") {
-                Button { vm.openApp = .plugins } label: {
-                    AppSwitchRow(icon: "puzzlepiece.extension.fill", color: .purple, title: "插件")
-                }
-            }
-            if searchResults.isEmpty && !appRowMatches("软件源") && !appRowMatches("插件") {
+            if searchResults.isEmpty {
                 Text("没有找到结果")
                     .foregroundStyle(.secondary)
             }
@@ -293,25 +266,6 @@ private struct SettingsRow: View {
                 Text(detail)
                     .foregroundStyle(.secondary)
             }
-        }
-    }
-}
-
-/// Row for the third group: switches to another built-in app.
-private struct AppSwitchRow: View {
-    let icon: String
-    let color: Color
-    let title: String
-
-    var body: some View {
-        HStack(spacing: 12) {
-            SettingsIcon(systemName: icon, color: color)
-            Text(title)
-                .foregroundStyle(.primary)
-            Spacer()
-            Image(systemName: "chevron.right")
-                .font(.footnote.weight(.semibold))
-                .foregroundStyle(.tertiary)
         }
     }
 }
@@ -568,7 +522,7 @@ private struct StorageView: View {
             } footer: {
                 Text("以上为本机真实磁盘空间，由系统读取。")
             }
-            Section("软件源下载") {
+            Section("应用下载") {
                 LabeledRow(label: "已下载 IPA 大小", value: VMFiles.ipasDirectorySizeString())
                 LabeledRow(label: "已装应用", value: "\(store.installedApps.count) 个")
             }
@@ -1292,6 +1246,7 @@ private struct TonePickerView: View {
 private struct FaceIDSettingsView: View {
     @AppStorage("vm.settings.faceID") private var faceID = false
     @AppStorage("vm.settings.passcode") private var passcode = ""
+    @State private var showingClearConfirm = false
 
     var body: some View {
         List {
@@ -1315,10 +1270,35 @@ private struct FaceIDSettingsView: View {
             } footer: {
                 Text(passcode.isEmpty ? "未设置虚拟机密码。" : "已设置虚拟机 4 位密码，每次启动虚拟机时需要输入。")
             }
+            // 0.2.39：清除密码（之前只有设置/更改，没有任何清除入口，
+            // vm.settings.passcode 一旦写入就清不掉，只能删 App）。
+            // 清除即把 @AppStorage("vm.settings.passcode") 写回 ""，
+            // 下次冷启动 SealboxApp 的锁门（passcode.isEmpty）即不锁；
+            // 面容 ID 开关只在有密码时有意义，一并关掉。
+            if !passcode.isEmpty {
+                Section {
+                    Button(role: .destructive) {
+                        showingClearConfirm = true
+                    } label: {
+                        Text("清除密码")
+                    }
+                } footer: {
+                    Text("清除后下次启动虚拟机不再出现锁屏。")
+                }
+            }
         }
         .navigationTitle("面容 ID 与密码")
         .navigationBarTitleDisplayMode(.inline)
         .safeAreaInset(edge: .bottom) { Color.clear.frame(height: 28) }
+        .alert("清除进入密码？", isPresented: $showingClearConfirm) {
+            Button("清除密码", role: .destructive) {
+                passcode = ""
+                faceID = false
+            }
+            Button("取消", role: .cancel) { }
+        } message: {
+            Text("清除后下次启动虚拟机不再需要输入密码。")
+        }
     }
 }
 

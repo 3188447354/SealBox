@@ -750,175 +750,81 @@ public enum SBInstaller {
         return true
     }
 
-    /// 0.2.12：点图标前的签名修复门。
-    /// - 无条件先跑完整签名逐项并记进日志（0.2.11 的盲区：KMusic 在两份
-    ///   真机日志里都没有一行签名逐项，门是放行还是根本没验，无从判断。
-    ///   逐项现已含 CMS 证书链（叶子 + WWDR 中间证书）、CMS 摘要、备用
-    ///   CD、特殊槽，不再是 0.2.10 的“CMS 在位 + 页哈希”两项）。
-    /// - 逐项全过且上次不是签名失败：走原有验签（含 Team），原样返回。
-    /// - 逐项任一坏、或上次启动死在 dlopen 签名失败：强制修复——先比 Team
-    ///   （不一致直接抛，不白打补丁），有证书时 repatch + 用当前证书重签，
-    ///   重签后复验再跑一次逐项并记结果；仍坏抛错写明 exact 哪一项坏，
-    ///   绝不走到 dlopen 去撞墙。无证书时只拦不修，抛原错。
-    /// - LC_ID_DYLIB 缺失 → 走 repatchInstalledApp（补 ID）；无证书时
-    /// 0.2.26 A：修后清标记——任一成功返回前，清掉记录的
-    /// lastLaunchResult 并 upsert 落盘。0.2.25 的无限循环就是 hooks
-    /// 分支修好后直接 return record、不清标记、不落盘导致的：下次预检
-    /// 又见同一标记、再修复、再重启。repatch 路径已在返回的记录里清
-    /// （lastLaunchResult: nil），这里只补两条直接返回的路；记录里本就
-    /// 没有标记时是空操作，不多写一次盘。
-    private static func clearedSignatureFailure(_ record: SBInstalledApp) -> SBInstalledApp {
-        guard record.lastLaunchResult != nil else { return record }
-        var updated = record
-        updated.lastLaunchResult = nil
-        SBStore.shared.upsertApp(updated)
-        SBDiagLog.log("签名修复门：\(record.bundleID) 修后清除上次签名失败标记")
-        return updated
-    }
-
-    ///   修不了，直接抛缺 ID 的原因。
-    /// - Team 不一致 → 直接抛 teamMismatch，不走 repatch（0.2.11：重签
-    ///   换不了宿主的 Team，走 repatch 只是白做工；且无证书时 repatch 的
-    ///   signFailed 会盖掉真正的 teamMismatch）。
+    /// 0.2.39：点图标前的签名门改成 LiveContainer 的走法（LCAppInfo.m:302-431
+    /// patchExecAndSignIfNeed），只认内核验签，不再自建多道门。
+    /// LC 的顺序：补丁版本门（launchApp 里已做，patchRevision < 当前值时重打）
+    /// → 无证书/32 位/不签名时跳过 → 内核 checkCodeSignature 有效即放行 →
+    /// 无效时须有证书，ZSign 整包重签 → 再问内核，仍无效即报错。
+    /// 本函数是 LC 那一段的映射：
+    /// - 静态逐项（SBCodesignCheck）与叶子指纹只记诊断行，不再决定放行/重签。
+    ///   0.2.38 的叶子比对触发重签已删：LC 安装时签名、点开时不重签；旧叶子
+    ///   客能不能开由内核说了算——内核拒才重签，内核认就直接开。0.2.37 的
+    ///   旧叶子 dlopen 死因若真是内核拒，内核门同样会触发重签（0.2.21 曾
+    ///   实证内核门比静态逐项严：注入件静态全过、内核门 EPERM 拒过）；
+    ///   若内核认而 dlopen 仍死，那是内核门与 dlopen 不一致的新证据，
+    ///   由 lastLaunchSigFailed 标记兜底（见下），不是叶子比对能证明的事。
+    /// - Team 不再单独拦：LC 没有 Team 门；重签后 repatchInstalledApp 内
+    ///   仍有证书 Team 预检 + verifyExecutableSignature(checkTeam: true)。
+    /// - 保留的两处 SealBox 专属守卫（LC 没有，但有真机依据）：
+    ///   ① 缺 LC_ID_DYLIB → 重打补丁：注入件是 SealBox 的加载方式，
+    ///   LC 的 dontInjectTweakLoader 是受支持的模式，我们的注入件丢了
+    ///   客就裸跑（环境/伪装全无），不能放行；
+    ///   ② 上次启动实测死在 dlopen 签名失败（lastLaunchSigFailed，须容器
+    ///   一致）而内核本次说有效 → 重签一次：静态与 dlopen 不一致已有
+    ///   0.2.37 真机实证，内核与 dlopen 也可能不一致；只在实测失败后触发，
+    ///   0.2.26 D 护栏（连续修 2 次即停）仍防循环。
+    /// - 注入件先修分支已删：launchApp 在门通过后仍调 ensureHooksDylibSigned，
+    ///   门里不再抢修一次。
+    /// - 0.2.26 A 不变：任一成功返回前清掉 lastLaunchResult 并落盘。
     static func ensureLaunchableSignature(_ record: SBInstalledApp) async throws -> SBInstalledApp {
         let executablePath = record.executableURL.path
         let gateDetail = SBCodesignCheck.signatureDetail(atPath: executablePath)
-        // 0.2.14：同一行里把失败标记的状态也记下来（与重启门同款），
-        // 门是放行还是触发修复、按什么输入决定的，日志里一次看清。
-        // 上次启动死在 dlopen 签名失败的判断见 SBInstalledApp
-        // .lastLaunchSigFailed（记录里的上次结果由启动路由在加载失败时
-        // 写回，持久化在每包已装记录里；修好就清——0.2.26 A，任一成功
-        // 返回前 clearedSignatureFailure 清掉并落盘）。
         let lastLaunchSigFailed = record.lastLaunchSigFailed
         SBDiagLog.log("签名修复门验签：\(record.bundleID) \(executablePath) \(signatureDetailFields(detail: gateDetail)) 上次签名失败标记=\(lastLaunchSigFailed ? "是" : "否")\(record.lastLaunchResult.map { "（\($0.message.prefix(80))）" } ?? "")")
-        // 0.2.38：叶子指纹比对——静态逐项“有效=是”不再单独作为放行依据。
-        // 0.2.37 真机（2026-11-22 01:04–01:09）：Husk（两回）、Asspp（两份副本）、
-        // nread 的修复门逐项全过（有效=是、CMS 链完整、Team 一致），随后 dlopen 全死
-        // code signature invalid；它们的叶子全是旧证书（到期 271110144946Z），而同进程
-        // 同 Team 的 Locus／彩云叶子是新证书（到期 271121124929Z）且 dlopen 成功。
-        // 静态逐项只验签名结构与 CMS 数学（SBCodesignCheck.h：证书链的系统信任评估、
-        // 吊销状态是 dyld／amfid 在加载时做的事，静态验签看不见）——旧叶子在内核那里
-        // 已不被接受，静态“有效”放行即撞墙。0.2.36 验过 Husk 通是因为当时还没换证书，
-        // 不是 0.2.37 代码回归。另：第二回点 Husk 时标记仍是“否”（进程内二次点击
-        // 不走 noteGuestLoadFailedIfNeeded 的补记），光靠标记触发修复不够——叶子
-        // 比对不依赖标记，每次点图标都验。
-        // 故：客叶子指纹必须等于当前已导入证书的叶子指纹，否则用当前证书把整个客包
-        // 重签（repatchInstalledApp：打补丁＋ZSign 全包重签＋内核门＋复验；与安装时
-        // signApp 同款签法），重签后复验叶子与逐项；复验不过抛错写明原因，绝不走到
-        // dlopen。任一指纹算不出时跳过本项比对、走原有修复门（不因算不出而误拦）。
-        // 本块在注入件分支之前：叶子不符时先修客包；注入件若也旧，启动时注入件检查
-        // 已重签过它，极端双旧时下一回点图标走注入件分支再修（各干净失败一次）。
-        if let currentFingerprint = currentCertificateLeafFingerprint() {
-            if let guestFingerprint = guestLeafFingerprint(atPath: executablePath) {
-                if guestFingerprint != currentFingerprint {
-                    let guestExpiry = gateDetail["cmsLeafExpiry"] as? String ?? "未知"
-                    SBDiagLog.log("签名修复门：\(record.bundleID) 客叶子指纹与当前证书不符（客=\(guestFingerprint.prefix(12)) 到期\(guestExpiry)，当前=\(currentFingerprint.prefix(12))），用当前证书重签整个客包")
-                    try checkTeamMatch(executablePath, bundleID: record.bundleID)
-                    guard canRepair else {
-                        SBDiagLog.log("签名修复门：\(record.bundleID) 客叶子不是当前证书（客=\(guestFingerprint.prefix(12))，当前=\(currentFingerprint.prefix(12))），且未导入证书，无法重签修复，干净失败")
-                        throw SBError.signFailed(reason: "客叶子不是当前证书（客=\(guestFingerprint.prefix(12))，当前=\(currentFingerprint.prefix(12))），且未导入证书，无法重签修复")
-                    }
-                    SBDiagLog.log("签名修复门：\(record.bundleID) \(executablePath) 叶子不符强制重签（客=\(guestFingerprint.prefix(12)) 当前=\(currentFingerprint.prefix(12))）")
-                    let repaired = try await repatchInstalledApp(record)
-                    // 重签后复验（与下面强制修复路同款逐项复验，再加叶子复验）。
-                    let postDetail = SBCodesignCheck.signatureDetail(atPath: repaired.executableURL.path)
-                    SBDiagLog.log("签名修复门复验：\(record.bundleID) \(repaired.executableURL.path) \(signatureDetailFields(detail: postDetail))")
-                    let postItems = failingSignatureItems(detail: postDetail)
-                    if !postItems.isEmpty {
-                        SBDiagLog.log("签名修复门：\(record.bundleID) 重签后复验仍不合格（\(postItems.joined(separator: "；"))），干净失败")
-                        throw SBError.signFailed(reason: "重签后签名仍不合格：\(postItems.joined(separator: "；"))")
-                    }
-                    let postFingerprint = guestLeafFingerprint(atPath: repaired.executableURL.path)
-                    guard postFingerprint == currentFingerprint else {
-                        SBDiagLog.log("签名修复门：\(record.bundleID) 重签后叶子仍不是当前证书（重签后客=\(postFingerprint.map { String($0.prefix(12)) } ?? "算不出")，当前=\(currentFingerprint.prefix(12))），干净失败")
-                        throw SBError.signFailed(reason: "重签后叶子仍不是当前证书（重签后客=\(postFingerprint.map { String($0.prefix(12)) } ?? "算不出")，当前=\(currentFingerprint.prefix(12))），不走到 dlopen")
-                    }
-                    SBDiagLog.log("签名修复门：\(record.bundleID) 重签后叶子已是当前证书（\(currentFingerprint.prefix(12))），复验通过")
-                    return repaired
-                }
-                SBDiagLog.log("签名修复门：\(record.bundleID) 叶子已是当前证书（\(currentFingerprint.prefix(12))），跳过重签")
-            } else {
-                SBDiagLog.log("签名修复门：\(record.bundleID) 客叶子指纹算不出（无 CMS 或解析失败），跳过叶子比对")
-            }
-        } else {
-            SBDiagLog.log("签名修复门：当前证书叶子指纹算不出（无证书或口令错），跳过叶子比对")
+        // 叶子指纹只记诊断（0.2.39：触发重签已删，见函数头注释）。
+        if let currentFingerprint = currentCertificateLeafFingerprint(),
+           let guestFingerprint = guestLeafFingerprint(atPath: executablePath) {
+            let guestExpiry = gateDetail["cmsLeafExpiry"] as? String ?? "未知"
+            SBDiagLog.log("签名修复门：\(record.bundleID) 客叶子=\(guestFingerprint.prefix(12)) 到期\(guestExpiry)，当前证书叶子=\(currentFingerprint.prefix(12))（仅诊断，不触发重签）")
         }
-        let detailValid = (gateDetail["valid"] as? NSNumber)?.boolValue ?? false
-        // 0.2.18：上次启动死在注入件签名上时，先修注入件，不白打客应用
-        // 的补丁。失败文案里带 SBGuestHooks.dylib 即上次 dlopen 死在注
-        // 入件（客主程序已过，dyld 加载注入件时被拒——0.2.17 真机 Asspp，
-        // 2026-11-19 18:06:41；18:13:59 修复门又只重打了客应用，白做工）。
-        // 注入件修好且客逐项也合格就直接返回；客逐项也坏才继续走下面
-        // 的客修复。无证书时修不了注入件，不抛注入件的错，落到下面
-        // 的客修复门按原逻辑处理（canRepair 会拦）。
-        let lastFailedOnHooks = lastLaunchSigFailed
-            && (record.lastLaunchResult?.message.contains("SBGuestHooks.dylib") ?? false)
-        if lastFailedOnHooks {
-            SBDiagLog.log("签名修复门：\(record.bundleID) 上次启动死在注入件签名（SBGuestHooks.dylib），先修注入件")
-            if SBCertificate.hasCertificate {
-                guard await SBCertificate.ensureHooksDylibSigned() else {
-                    throw SBError.signFailed(reason: SBCertificate.hooksSignFailureReason)
-                }
-                // 0.2.23：静态与门分开报——ensureHooksDylibSigned 只要静态
-                // 通过就返回 true（0.2.21 规则：门只记诊断不拦启动），直接写
-                // “内核验签通过”是假的（0.2.22 真机 15:38:24：上面几行明明是
-                // 门 F_ADDFILESIGS_RETURN errno=1）。门仍拒时明确写未修好。
-                if SBCertificate.hooksKernelGatePassed() {
-                    SBDiagLog.log("签名修复门：\(record.bundleID) 注入件已修好（静态通过，内核验签通过）")
-                } else {
-                    SBDiagLog.log("签名修复门：\(record.bundleID) 注入件未修好（静态通过、内核门仍拒，按 0.2.21 规则不拦启动）")
-                }
-                if detailValid {
-                    try verifyExecutableSignature(executablePath, bundleID: record.bundleID, checkTeam: true)
-                    // 0.2.26 A：这是 0.2.25 循环的根因——以前这里直接
-                    // return record，标记不清、记录不落盘。
-                    return clearedSignatureFailure(record)
-                }
-                // 客逐项也坏：继续走下面的强制修复（客应用）。
-            } else {
-                SBDiagLog.log("签名修复门：\(record.bundleID) 上次死在注入件签名，但未导入证书，修不了注入件，走客应用修复门")
-            }
+        // LC 的判定（LCAppInfo.m:377-390）：直接问内核。
+        var kernelStep: Int32 = 0
+        var kernelErrno: Int32 = 0
+        var kernelMessage = [CChar](repeating: 0, count: 512)
+        let kernelValid = kernelMessage.withUnsafeMutableBufferPointer { msgPtr in
+            SBLCCheckCodeSignatureDetail(executablePath, &kernelStep, &kernelErrno, msgPtr.baseAddress, msgPtr.count) != 0
         }
-        if SBMachOHasIDDylib(executablePath) == 0 {
-            // 0.2.11：无证书修不了，直接报缺 ID 的原因——不调 repatch，
-            // 不然 repatch 的“没有导入证书”会盖掉真正的原因。
-            guard canRepair else {
-                throw SBError.patchFailed(reason: "缺少 LC_ID_DYLIB，且未导入证书，无法重打补丁修复")
-            }
-            NSLog("[SBInstaller] ensureLaunchableSignature: %@ 缺 LC_ID_DYLIB，走重打补丁", record.bundleID)
-            SBDiagLog.log("签名修复门：\(record.bundleID) \(executablePath) 缺 LC_ID_DYLIB，走重打补丁")
-            return try await repatchInstalledApp(record)
+        let kernelMessageText = kernelMessage.withUnsafeBufferPointer { buf in
+            buf.baseAddress.map { String(cString: $0) } ?? ""
         }
-        if detailValid && !lastLaunchSigFailed {
-            try verifyExecutableSignature(executablePath, bundleID: record.bundleID, checkTeam: true)
-            // 0.2.26 A：陈旧标记（容器已换）走到这里时一并清掉，下次
-            // 预检不再靠 B 的容器比对兜底。
+        SBDiagLog.log("签名修复门内核验签：\(record.bundleID) \(executablePath) 内核验签=\(kernelValid ? "通过" : "不通过")（步骤=\(kernelStep)，errno=\(kernelErrno)\(kernelMessageText.isEmpty ? "" : "，内核原话：\(kernelMessageText)")")
+        if kernelValid && !lastLaunchSigFailed {
+            // 内核认 + 上次没死在签名上 → 放行（LC 的 return YES）。
+            // 缺 LC_ID_DYLIB 是 SealBox 专属守卫（见函数头注释①）。
+            if SBMachOHasIDDylib(executablePath) == 0 {
+                guard canRepair else {
+                    throw SBError.patchFailed(reason: "缺少 LC_ID_DYLIB，且未导入证书，无法重打补丁修复")
+                }
+                SBDiagLog.log("签名修复门：\(record.bundleID) \(executablePath) 内核验签通过但缺 LC_ID_DYLIB，走重打补丁")
+                return try await repatchInstalledApp(record)
+            }
             return clearedSignatureFailure(record)
         }
-        // 强制修复：逐项有坏项，或上次启动死在 dlopen 签名失败。
-        // Team 不一致重签修不好：先比 Team，不一致直接抛，不白走 repatch。
-        try checkTeamMatch(executablePath, bundleID: record.bundleID)
+        // 内核不认，或上次实测死在 dlopen 签名失败（守卫②）：重签。
+        // 无证书时只拦不修（LC：noCertificateFoundErr）。
         let reason: String
-        if !detailValid {
-            reason = "签名逐项不合格：\(failingSignatureItems(detail: gateDetail).joined(separator: "；"))"
+        if !kernelValid {
+            reason = "内核验签不通过（步骤=\(kernelStep)，errno=\(kernelErrno)\(kernelMessageText.isEmpty ? "" : "，\(kernelMessageText)")"
         } else {
-            reason = "上次启动死在 dlopen 签名失败（code signature invalid）"
+            reason = "上次启动死在 dlopen 签名失败（code signature invalid），内核本次虽通过仍重签一次"
         }
         guard canRepair else {
             throw SBError.signFailed(reason: "\(reason)，且未导入证书，无法重签修复")
         }
-        NSLog("[SBInstaller] ensureLaunchableSignature: %@ 强制重打补丁修复（%@）",
-              record.bundleID, reason)
         SBDiagLog.log("签名修复门：\(record.bundleID) \(executablePath) 强制重打补丁+重签（\(reason)）")
         let repaired = try await repatchInstalledApp(record)
-        // 重签后复验：再跑一次逐项并记结果；仍不合格就抛错点名，不走到 dlopen。
-        let postDetail = SBCodesignCheck.signatureDetail(atPath: repaired.executableURL.path)
-        SBDiagLog.log("签名修复门复验：\(record.bundleID) \(repaired.executableURL.path) \(signatureDetailFields(detail: postDetail))")
-        let postItems = failingSignatureItems(detail: postDetail)
-        if !postItems.isEmpty {
-            throw SBError.signFailed(reason: "重签后签名仍不合格：\(postItems.joined(separator: "；"))")
-        }
-        // repatchInstalledApp 已在返回的记录里清掉 stale 的 lastLaunchResult。
+        // repatchInstalledApp 内已做重签后内核复验（不通过即抛错还原备份），
+        // 这里不再重复跑逐项复验。重签后叶子复验也不再做——判定权在内核。
         return repaired
     }
 
