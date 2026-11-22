@@ -9,6 +9,7 @@
 #import "SBGuestSessionManager.h"
 
 #import <objc/message.h>
+#import <objc/runtime.h>
 
 #import "SBGuestBootstrap.h"
 #import "SBGuestLoader.h"
@@ -29,6 +30,38 @@ static NSString * const SBKeySelectedGuestContainer = @"SBSelectedGuestContainer
 
 // scene 驱动：系统路先试，0.4 秒后无窗则手动 willConnect。
 static const NSTimeInterval SBGuestSceneSystemPathWaitSeconds = 0.4;
+
+// 0.2.40（洞 1）：按镜像定点取类——NSClassFromString 是进程全局查找，
+// 另一客先在同一进程加载过同名 AppDelegate 时会返回别人的类（彩云已证实
+// 其 AppDelegate 注册为裸 AppDelegate）。只认定义在本客 .app 包内的类
+// （可执行本身，或包内 framework）；类不在本客包内时记一行并返回 Nil，
+// 调用方按“探测不到”干净失败，绝不装错 delegate。取不到镜像名时沿用
+// 旧行为（不破坏正常探测路径）。
+// 0.2.40（并轨）：核心按路径参数取类；context 与 session 是两个不同类型、
+// 同名字段（bundleID/guestAppPath/guestExecPath），各由一个薄包装器传参，
+// 定点取类逻辑只此一份，不另写查找。
+static Class SBGuestClassNamedInGuest(NSString *className, NSString *bundleID,
+                                      NSString *guestAppPath, NSString *guestExecPath) {
+    Class cls = NSClassFromString(className);
+    if (!cls) return Nil;
+    const char *imageName = class_getImageName(cls);
+    if (!imageName) return cls;
+    NSString *imagePath = [NSString stringWithUTF8String:imageName];
+    if ([imagePath isEqualToString:guestExecPath]) return cls;
+    NSString *appPrefix = [guestAppPath stringByAppendingString:@"/"];
+    if (guestAppPath.length > 0 && [imagePath hasPrefix:appPrefix]) return cls;
+    SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 按名找到的 %@ 在另一镜像（%@），不是本客的类，不用",
+                    bundleID, className, imagePath] UTF8String]);
+    return Nil;
+}
+
+static Class SBGuestClassNamed(NSString *className, SBGuestMainHookContext *context) {
+    return SBGuestClassNamedInGuest(className, context.bundleID, context.guestAppPath, context.guestExecPath);
+}
+
+static Class SBGuestClassNamedForSession(NSString *className, SBGuestSession *session) {
+    return SBGuestClassNamedInGuest(className, session.bundleID, session.guestAppPath, session.guestExecPath);
+}
 
 @implementation SBGuestMainHookContext
 @end
@@ -284,7 +317,10 @@ static const NSTimeInterval SBGuestSceneSystemPathWaitSeconds = 0.4;
     if (![delegateClassName isKindOfClass:[NSString class]] || delegateClassName.length == 0) {
         return nil;
     }
-    Class delegateClass = NSClassFromString(delegateClassName);
+    // 0.2.40（并轨，洞 1 同根因）：plist 的 scene delegate 类名也走按镜像
+    // 定点取类——NSClassFromString 是进程全局查找，另一客先加载过的同名类
+    // 会污染；不在本客包内即 Nil，调用方按“无 scene 配置”干净失败。
+    Class delegateClass = SBGuestClassNamedForSession(delegateClassName, session);
     if (!delegateClass) {
         return nil;
     }
@@ -413,7 +449,18 @@ static const NSTimeInterval SBGuestSceneSystemPathWaitSeconds = 0.4;
     }
     SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 手动 willConnect：scene 配置已取（delegate 类 %@）",
                     session.bundleID, NSStringFromClass(config.delegateClass)] UTF8String]);
-    id sceneDelegate = [[config.delegateClass alloc] init];
+    // 0.2.40（并轨，洞 2 同根因）：scene delegate init 包进 @try——某客
+    // scene delegate 的 init 抛异常时干净失败，不让异常直穿崩进程
+    //（willConnect 有 @try，init 原来没有；与 AppDelegate init 同款修法）。
+    id sceneDelegate = nil;
+    @try {
+        sceneDelegate = [[config.delegateClass alloc] init];
+    } @catch (NSException *exception) {
+        SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 客 scene delegate init 抛异常（%@），干净失败",
+                        session.bundleID, exception.reason] UTF8String]);
+        [self failActivationForSession:session message:@"客 scene delegate 初始化抛异常"];
+        return;
+    }
     if (!sceneDelegate) {
         [self failActivationForSession:session message:@"客 scene delegate 创建失败"];
         return;
@@ -656,9 +703,12 @@ static const NSTimeInterval SBGuestSceneSystemPathWaitSeconds = 0.4;
         // （MediaStormCamera.SceneDelegate）当 app.delegate 装上；其 willConnect
         // 里 `delegate as! AppDelegate` 一类强转必 trap（死在 willConnect 内的
         // 头号嫌疑）。探测不到时不再回退到 scene delegate 类（见下一块），宁可干净失败。
-        NSString *moduleName = [context.guestExecPath lastPathComponent];
+        // 0.2.40：Swift 模块名里 '-' 写成 '_'（可执行名含 '-' 时探测一否则必 miss）；
+        // 探测走 SBGuestClassNamed 按镜像定点取类，不走全局名查找（见文件头 helper）。
+        NSString *moduleName = [[context.guestExecPath lastPathComponent]
+            stringByReplacingOccurrencesOfString:@"-" withString:@"_"];
         NSString *appDelegateName = [NSString stringWithFormat:@"%@.AppDelegate", moduleName];
-        if (NSClassFromString(appDelegateName)) {
+        if (SBGuestClassNamed(appDelegateName, context)) {
             resolvedDelegateClassName = appDelegateName;
             SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ main 未传 delegate 类，按名探测到真 AppDelegate（%@），不用 scene delegate 充数",
                             context.bundleID, appDelegateName] UTF8String]);
@@ -672,18 +722,23 @@ static const NSTimeInterval SBGuestSceneSystemPathWaitSeconds = 0.4;
         // 不实现 didFinishLaunching，真 AppDelegate 从未实例化、插件从未注册、
         // launch engine 从未建；其 willConnect 里的 `as? AppDelegate` 也得
         // nil。装错 delegate 只会静默死或黑屏，不如干净失败写明原因。
-        if (NSClassFromString(@"AppDelegate")) {
+        // 0.2.40：探测二同样走 SBGuestClassNamed——裸名跨客污染时（另一客的
+        // AppDelegate 已注册）返回 Nil，不装别人的类。
+        if (SBGuestClassNamed(@"AppDelegate", context)) {
             resolvedDelegateClassName = @"AppDelegate";
             SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ main 未传 delegate 类，按名探测到裸 AppDelegate 类",
                             context.bundleID] UTF8String]);
         } else {
-            NSString *moduleName = [context.guestExecPath lastPathComponent];
+            NSString *moduleName = [[context.guestExecPath lastPathComponent]
+                stringByReplacingOccurrencesOfString:@"-" withString:@"_"];
             SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ main 未传 delegate 类，按名探测不到真 AppDelegate（%@.AppDelegate / AppDelegate 均无），不用 scene delegate 类充 app.delegate，干净失败",
                             context.bundleID, moduleName] UTF8String]);
         }
     }
+    // 0.2.40：最终解析也按镜像定点取类——main 传来的显式类名同样可能撞上
+    // 另一客先注册的同名类；SBGuestClassNamed 验不过即 Nil，走干净失败。
     Class delegateClass = resolvedDelegateClassName.length > 0
-        ? NSClassFromString(resolvedDelegateClassName) : Nil;
+        ? SBGuestClassNamed(resolvedDelegateClassName, context) : Nil;
     if (!delegateClass) {
         if (error) {
             *error = SBGuestLoaderErrorMake(SBGuestLoaderErrorGuestLoadFailed, @"加载客 App",
@@ -692,7 +747,21 @@ static const NSTimeInterval SBGuestSceneSystemPathWaitSeconds = 0.4;
         }
         return NO;
     }
-    id guestDelegate = [[delegateClass alloc] init];
+    // 0.2.40（洞 2）：init 包进 @try——某客 AppDelegate 的 init 抛异常时
+    // 干净失败，不让异常直穿崩进程（didFinishLaunching 有 @try，init 原来没有）。
+    id guestDelegate = nil;
+    @try {
+        guestDelegate = [[delegateClass alloc] init];
+    } @catch (NSException *exception) {
+        SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 客 AppDelegate init 抛异常（%@），干净失败",
+                        context.bundleID, exception.reason] UTF8String]);
+        if (error) {
+            *error = SBGuestLoaderErrorMake(SBGuestLoaderErrorGuestLoadFailed, @"加载客 App",
+                                            @"客 AppDelegate 初始化抛异常",
+                                            @"请重试，或重新导入该应用");
+        }
+        return NO;
+    }
     if (!guestDelegate) {
         if (error) {
             *error = SBGuestLoaderErrorMake(SBGuestLoaderErrorGuestLoadFailed, @"加载客 App",

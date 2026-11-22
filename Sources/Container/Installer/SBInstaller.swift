@@ -799,10 +799,15 @@ public enum SBInstaller {
         let lastLaunchSigFailed = record.lastLaunchSigFailed
         SBDiagLog.log("签名修复门验签：\(record.bundleID) \(executablePath) \(signatureDetailFields(detail: gateDetail)) 上次签名失败标记=\(lastLaunchSigFailed ? "是" : "否")\(record.lastLaunchResult.map { "（\($0.message.prefix(80))）" } ?? "")")
         // 叶子指纹只记诊断（0.2.39：触发重签已删，见函数头注释）。
-        if let currentFingerprint = currentCertificateLeafFingerprint(),
-           let guestFingerprint = guestLeafFingerprint(atPath: executablePath) {
-            let guestExpiry = gateDetail["cmsLeafExpiry"] as? String ?? "未知"
-            SBDiagLog.log("签名修复门：\(record.bundleID) 客叶子=\(guestFingerprint.prefix(12)) 到期\(guestExpiry)，当前证书叶子=\(currentFingerprint.prefix(12))（仅诊断，不触发重签）")
+        // 0.2.40：解析失败也记一行，不再静默跳过；解析器所有失败只返回 nil，
+        // 诊断调用绝不许再崩进程（0.2.39 Guoguo/Husk 即死在这两行之后）。
+        if let currentFingerprint = currentCertificateLeafFingerprint() {
+            if let guestFingerprint = guestLeafFingerprint(atPath: executablePath) {
+                let guestExpiry = gateDetail["cmsLeafExpiry"] as? String ?? "未知"
+                SBDiagLog.log("签名修复门：\(record.bundleID) 客叶子=\(guestFingerprint.prefix(12)) 到期\(guestExpiry)，当前证书叶子=\(currentFingerprint.prefix(12))（仅诊断，不触发重签）")
+            } else {
+                SBDiagLog.log("签名修复门：\(record.bundleID) 客叶子解析失败（仅诊断）")
+            }
         }
         // LC 的判定（LCAppInfo.m:377-390）：直接问内核。
         var kernelStep: Int32 = 0
@@ -960,46 +965,53 @@ public enum SBInstaller {
         var contentStart: Int
         var contentLen: Int
         var totalLen: Int
+        /// 标签头长（不定长 TLV 的 totalLen 含尾部 EOC 2 字节，不能从
+        /// totalLen - contentLen 反推——0.2.40 修：那样会把起点算早 2 字节）。
+        var headerLen: Int
         /// TLV 起点（含标签头）＝内容起点－头长。
-        var start: Int { contentStart - (totalLen - contentLen) }
-        var end: Int { contentStart + contentLen }
+        var start: Int { contentStart - headerLen }
+        var end: Int { start + totalLen }
     }
 
     /// 读一个 TLV（SBDerReadTLV 同款：多字节标签不支持；不定长 0x80 扫子项
     /// 到 EOC；长形式长度 1–4 字节；嵌套深度 ≤16）。
+    /// 0.2.40：下标一律按 data 的下标域（startIndex/endIndex）检查，不再
+    /// 只比 count——Data 切片保留基下标，count 够不等于 data[0] 合法。
     private static func derReadTLV(_ data: Data, at offset: Int, depth: Int) -> SBDerTLV? {
         guard depth <= 16 else { return nil }
-        guard offset + 2 <= data.count else { return nil }
-        let tag = data[offset]
+        guard offset >= 0, data.startIndex + offset + 2 <= data.endIndex else { return nil }
+        let tag = data[data.startIndex + offset]
         guard tag != 0x1F else { return nil }
-        let lenByte = data[offset + 1]
+        let lenByte = data[data.startIndex + offset + 1]
         var headerLen = 2
         var contentLen = 0
         if lenByte == 0x80 {
             var p = offset + headerLen
             while true {
-                guard p + 2 <= data.count else { return nil }
-                if data[p] == 0x00 && data[p + 1] == 0x00 {
+                guard p + 2 <= data.endIndex - data.startIndex else { return nil }
+                if data[data.startIndex + p] == 0x00 && data[data.startIndex + p + 1] == 0x00 {
                     contentLen = p - (offset + headerLen)
                     return SBDerTLV(tag: tag, contentStart: offset + headerLen,
-                                    contentLen: contentLen, totalLen: (p + 2) - offset)
+                                    contentLen: contentLen, totalLen: (p + 2) - offset,
+                                    headerLen: headerLen)
                 }
                 guard let child = derReadTLV(data, at: p, depth: depth + 1) else { return nil }
                 p += child.totalLen
             }
         } else if lenByte & 0x80 != 0 {
             let n = Int(lenByte & 0x7F)
-            guard n >= 1 && n <= 4 && offset + 2 + n <= data.count else { return nil }
+            guard n >= 1 && n <= 4 && offset + 2 + n <= data.endIndex - data.startIndex else { return nil }
             for i in 0..<n {
-                contentLen = (contentLen << 8) | Int(data[offset + 2 + i])
+                contentLen = (contentLen << 8) | Int(data[data.startIndex + offset + 2 + i])
             }
             headerLen = 2 + n
         } else {
             contentLen = Int(lenByte)
         }
-        guard offset + headerLen + contentLen <= data.count else { return nil }
+        guard offset + headerLen + contentLen <= data.endIndex - data.startIndex else { return nil }
         return SBDerTLV(tag: tag, contentStart: offset + headerLen,
-                        contentLen: contentLen, totalLen: headerLen + contentLen)
+                        contentLen: contentLen, totalLen: headerLen + contentLen,
+                        headerLen: headerLen)
     }
 
     /// 列出一个构造型 TLV 的全部子项（必须恰好在内容尾结束；子项 ≤16，
@@ -1096,15 +1108,15 @@ public enum SBInstaller {
     }
 
     private static func be32(_ data: Data, at offset: Int) -> UInt32? {
-        guard offset >= 0 && offset + 4 <= data.count else { return nil }
-        return (UInt32(data[offset]) << 24) | (UInt32(data[offset + 1]) << 16)
-            | (UInt32(data[offset + 2]) << 8) | UInt32(data[offset + 3])
+        guard offset >= 0 && data.startIndex + offset + 4 <= data.endIndex else { return nil }
+        return (UInt32(data[data.startIndex + offset]) << 24) | (UInt32(data[data.startIndex + offset + 1]) << 16)
+            | (UInt32(data[data.startIndex + offset + 2]) << 8) | UInt32(data[data.startIndex + offset + 3])
     }
 
     private static func le32(_ data: Data, at offset: Int) -> UInt32? {
-        guard offset >= 0 && offset + 4 <= data.count else { return nil }
-        return UInt32(data[offset]) | (UInt32(data[offset + 1]) << 8)
-            | (UInt32(data[offset + 2]) << 16) | (UInt32(data[offset + 3]) << 24)
+        guard offset >= 0 && data.startIndex + offset + 4 <= data.endIndex else { return nil }
+        return UInt32(data[data.startIndex + offset]) | (UInt32(data[data.startIndex + offset + 1]) << 8)
+            | (UInt32(data[data.startIndex + offset + 2]) << 16) | (UInt32(data[data.startIndex + offset + 3]) << 24)
     }
 
     /// 客可执行文件 → CMS 叶子证书 DER 的 SHA-256 hex（与 certificateFingerprint
@@ -1188,7 +1200,10 @@ public enum SBInstaller {
         guard foundCMS, cmsBlobLength >= 8 else { return nil }
         let derLen = cmsBlobLength - 8
         guard derLen > 0, cmsOffset + 8 + derLen <= sigSize else { return nil }
-        let cmsDER = data[(sigBase + cmsOffset + 8)..<(sigBase + cmsOffset + 8 + derLen)]
+        // 0.2.40 根治：Data 切片保留基下标（Husk 合法下标约 1370 万起），
+        // 下游解析器第一行 data[0] 即陷阱。Data(...) 拷贝一次把 startIndex
+        // 归零，下游全部 0 起下标一次合法；不要逐处改下标。
+        let cmsDER = Data(data[(sigBase + cmsOffset + 8)..<(sigBase + cmsOffset + 8 + derLen)])
         return cmsLeafFingerprint(cmsDER)
     }
 

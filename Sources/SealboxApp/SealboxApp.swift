@@ -25,6 +25,8 @@ struct SealboxApp: App {
 /// App 时调——main.m 已先分流。
 @_cdecl("SBHostAppMain")
 public func SBHostAppMain() {
+    // 0.2.40：App 入口行——与 main.m 调用前一行夹住“窗口补丁行→读已装应用”段。
+    SBDiagLog.log("宿主启动：进 SealboxApp")
     SealboxApp.main()
 }
 

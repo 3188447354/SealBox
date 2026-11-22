@@ -131,6 +131,10 @@ int main(int argc, char *argv[]) {
     //（0.2.36 真机启动时异常弹窗）。须在 SwiftUI 启动前装好。
     [SBGuestBootstrap installHostDelegateWindowGetter];
 
+    // 0.2.40：0.2.38 启动崩（窗口补丁行后断）无 .ips、未证实；“窗口补丁行→
+    // 读已装应用”这段原来没有任何日志行，以后崩了无法定位。在 SBHostAppMain()
+    // 调用前与 App 入口内各记一行，夹住这段。
+    SBDiagLogLine(@"宿主启动：窗口补丁已装，进 SBHostAppMain");
     SBHostAppMain();
     return 0;
 }
