@@ -776,6 +776,23 @@ public enum SBInstaller {
     /// - 注入件先修分支已删：launchApp 在门通过后仍调 ensureHooksDylibSigned，
     ///   门里不再抢修一次。
     /// - 0.2.26 A 不变：任一成功返回前清掉 lastLaunchResult 并落盘。
+    /// 0.2.26 A：修后清标记——任一成功返回前，清掉记录的
+    /// lastLaunchResult 并 upsert 落盘。0.2.25 的无限循环就是 hooks
+    /// 分支修好后直接 return record、不清标记、不落盘导致的：下次预检
+    /// 又见同一标记、再修复、再重启。repatch 路径已在返回的记录里清
+    /// （lastLaunchResult: nil），这里只补两条直接返回的路；记录里本就
+    /// 没有标记时是空操作，不多写一次盘。
+    /// （0.2.39 补回：B 重写本函数时误删了该 helper 定义，首轮 CI 报
+    /// cannot find 'clearedSignatureFailure' in scope，run 44967429305。）
+    private static func clearedSignatureFailure(_ record: SBInstalledApp) -> SBInstalledApp {
+        guard record.lastLaunchResult != nil else { return record }
+        var updated = record
+        updated.lastLaunchResult = nil
+        SBStore.shared.upsertApp(updated)
+        SBDiagLog.log("签名修复门：\(record.bundleID) 修后清除上次签名失败标记")
+        return updated
+    }
+
     static func ensureLaunchableSignature(_ record: SBInstalledApp) async throws -> SBInstalledApp {
         let executablePath = record.executableURL.path
         let gateDetail = SBCodesignCheck.signatureDetail(atPath: executablePath)
