@@ -34,9 +34,14 @@ func findDelegate(in value: Any, depth: Int, path: String) -> UIApplicationDeleg
 }
 
 /// 按 adaptor 泛型名建 delegate 实例：UIApplicationDelegateAdaptor<HuskAppDelegate>
-/// ＋ App 类型 Husk.HuskApp → 先试 NSClassFromString("Husk.HuskAppDelegate")，
+/// ＋ App 类型 Husk.HuskApp → 先试读表找 "Husk.HuskAppDelegate"，
 /// 再试 "HuskAppDelegate"。建不出返回 nil（调用方不挡窗口）。
-func buildDelegateFromAdaptorTypeName(_ adaptorTypeName: String, appType: Any.Type) -> UIApplicationDelegate? {
+/// 0.2.42：取类走 Mach-O 读表（SBGuestMachOClassNamedInGuest），不走
+/// NSClassFromString——点开流程里运行时取类已全换成读表（见
+/// SBGuestSessionManager.m 的 SBGuestClassNamedInGuest）；读表失败只干净
+/// 失败、不回落运行时。读表本身是纯内存读，class-resolve 2s 阈值绰绰有余。
+func buildDelegateFromAdaptorTypeName(_ adaptorTypeName: String, appType: Any.Type,
+                                      guestExecPath: String, guestAppPath: String) -> UIApplicationDelegate? {
     guard let lt = adaptorTypeName.firstIndex(of: "<"),
           let gt = adaptorTypeName.firstIndex(of: ">"), lt < gt else { return nil }
     let delegateName = String(adaptorTypeName[adaptorTypeName.index(after: lt)..<gt])
@@ -46,8 +51,25 @@ func buildDelegateFromAdaptorTypeName(_ adaptorTypeName: String, appType: Any.Ty
     if !moduleName.isEmpty {
         candidates.insert("\(moduleName).\(delegateName)", at: 0)
     }
+    SBDiagLogWatchdogStepBegin("class-resolve", 2.0)
+    defer { SBDiagLogWatchdogStepEnd("class-resolve") }
     for name in candidates {
-        guard let cls = NSClassFromString(name) as? NSObject.Type else { continue }
+        var reason: UnsafePointer<CChar>? = nil
+        let ptr = name.withCString { cName in
+            guestExecPath.withCString { cExec in
+                guestAppPath.withCString { cApp in
+                    SBGuestMachOClassNamedInGuest(cName, cExec, cApp, &reason)
+                }
+            }
+        }
+        guard let ptr else {
+            let why = reason.map { String(cString: $0) } ?? "查无此类"
+            SBDiagLog.log("SwiftUI 嵌客：adaptor delegate 读表未找到 \(name)（\(why)）")
+            continue
+        }
+        // 读表给的类指针可能尚未实现化（bits 直指 ro）：首次发消息时
+        // runtime 按正常路径实现化，与枚举给的已实现化类同效。
+        guard let cls = unsafeBitCast(ptr, to: AnyClass.self) as? NSObject.Type else { continue }
         if let delegate = cls.init() as? UIApplicationDelegate {
             return delegate
         }
@@ -128,9 +150,10 @@ public func SBSwiftUIEmbedApp(_ metadata: UnsafeRawPointer,
     // 0.2.33：0.2.32 真机 Husk 四回都是“adaptor delegate 未找到”——单层
     // Mirror 扫不到：delegate 可能包在 Optional 里、装在引用型盒子里、或根本
     // 还没创建（SwiftUI 在 runApp 时才建）。修法：递归钻取（解 Optional、进
-    // 盒子，深度 ≤3）；找不到再按 adaptor 泛型名用 NSClassFromString 建一个
-    //（先 "模块.Delegate" 再 "Delegate"）。仍找不到也不挡窗口：delegate 只
-    // 影响客 AppDelegate 方法跑不跑，不影响开窗。
+    // 盒子，深度 ≤3）；找不到再按 adaptor 泛型名读表建一个（先
+    // "模块.Delegate" 再 "Delegate"，0.2.42 由 NSClassFromString 换成
+    // Mach-O 读表）。仍找不到也不挡窗口：delegate 只影响客 AppDelegate
+    // 方法跑不跑，不影响开窗。
     var appDelegate: UIApplicationDelegate?
     for child in Mirror(reflecting: app).children {
         let typeName = String(describing: type(of: child.value))
@@ -139,7 +162,9 @@ public func SBSwiftUIEmbedApp(_ metadata: UnsafeRawPointer,
         if let found = findDelegate(in: child.value, depth: 0, path: "adaptor") {
             appDelegate = found
             SBDiagLog.log("SwiftUI 嵌客：adaptor delegate 已找到（\(String(describing: type(of: found)))）")
-        } else if let built = buildDelegateFromAdaptorTypeName(typeName, appType: appType) {
+        } else if let built = buildDelegateFromAdaptorTypeName(typeName, appType: appType,
+                                                               guestExecPath: context.guestExecPath,
+                                                               guestAppPath: context.guestAppPath) {
             appDelegate = built
             SBDiagLog.log("SwiftUI 嵌客：adaptor delegate 未找到，按类名新建（\(String(describing: type(of: built)))）")
         } else {

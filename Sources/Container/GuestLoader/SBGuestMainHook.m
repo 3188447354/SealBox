@@ -102,6 +102,11 @@ int SBHookedUIApplicationMain(int argc, char * _Nullable * _Nullable argv,
                                                           principalClassName:principalClassName
                                                            delegateClassName:delegateClassName
                                                                        error:&error];
+    if (!ok) {
+        // 0.2.42：同步激活失败即点开流程结束——解除看门狗（ok 时不解除：
+        // scene 驱动可能还在后头，completeActivation／failActivation 会解除）。
+        SBDiagLogWatchdogDisarmForGuest([g_hookContext.bundleID UTF8String]);
+    }
     if (ok) {
         g_hookDidActivate = YES;
         // 0.2.32：这里只表示“拦截完成、scene 驱动已安排”，不是“客窗已出现”——

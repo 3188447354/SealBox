@@ -14,6 +14,7 @@
 #import "SBGuestBootstrap.h"
 #import "SBGuestLoader.h"
 #import "SBDiagLog.h"
+#import "SBGuestMachOClassList.h"
 #import "SealBox-Swift.h"
 
 NSString * const SBGuestReturnToHostRequestedNotification = @"SBGuestReturnToHostRequested";
@@ -31,89 +32,99 @@ static NSString * const SBKeySelectedGuestContainer = @"SBSelectedGuestContainer
 // scene 驱动：系统路先试，0.4 秒后无窗则手动 willConnect。
 static const NSTimeInterval SBGuestSceneSystemPathWaitSeconds = 0.4;
 
-// 0.2.41（本轮，根因 A＋B）：按客镜像取类——0.2.40 的 NSClassFromString＋
-// 路径比对仍有两处必错：
-//  (A) class_getImageName 返回 dyld 规范化路径（/private/var/…），而
-//      guestExecPath/guestAppPath 是存量路径（/var/mobile/…，见
-//      SBGuestBootstrap.m:588 Documents 下拼接），直接 isEqualToString /
-//      hasPrefix 必失败——Guoguo 自己的类被当成别客的类拒掉（12:06:10 日志）；
-//  (B) NSClassFromString 只返回进程全局第一个注册的同名类——Guoguo 先加载，
-//      它的 AppDelegate 占了裸名，Picsew/彩云自己的同名类按裸名永远查不到。
-// 修法：比对前两边都规范化（stringByResolvingSymlinksInPath；/var 是到
-// /private/var 的符号链接）；取类改成枚举 ObjC 类表（objc_getClassList，
-// 公开运行时 API）后按类名＋镜像归属过滤。选枚举不用直接读 Mach-O
-// __objc_classlist：后者要自己算 slide/段偏移、认 dyld 镜像，与运行时已
-// 维护的注册表重复；guest dlopen 后类必已注册，枚举即全集。
-// 全局 NSClassFromString 只用于诊断行（说明“找到的是谁家的类”），绝不再
-// 作为取类依据；客镜像内没有该名类即 Nil，调用方按“探测不到”干净失败。
-static NSString *SBGuestNormalizedPath(NSString *path) {
-    if (path.length == 0) {
-        return path;
+// 0.2.42（本轮，根因再定）：0.2.41 的 objc_getClassList 枚举在真实
+// 调用链里不可能自死锁（调查报告：objc4-906 源码核对，+load／+initialize
+// 均不持 runtimeLock，hook 调用点在 dlopen 返回之后），但它每次点图标
+// 都在主线程跑 realizeAllClasses 全量实现化，且 0.2.41 拆掉干净失败门
+// 后放行的 post-gate 代码（delegate init → didFinishLaunching →
+// storyboard 建窗 → 手动 willConnect）卡死了手机——枚举是否参与卡死，
+// 离线钉不死（无 0.2.41 设备日志），须靠本版看门狗在真机上钉。
+// 修法 (a)：直接读客 Mach-O 的 __objc_classlist 找类，不走运行时——
+// 见 SBGuestMachOClassList.c（dyld 查询＋内存读＋ro 名比对，
+// 归属按“只读客镜像自己的类表”判定，/var vs /private/var 路径比对
+// 问题随之消失）。0.2.41 的两处必错（根因 A 路径前缀、根因 B 全局首个）
+// 在此修法下都不存在：读表只认客镜像自己的类表，同名类分属不同镜像
+// 时各取各的；宿主同名类根本不在扫描范围里。
+// 点开流程里取类只走读表：objc_getClassList／NSClassFromString 不得
+// 作为取类依据；NSClassFromString 全文件只剩 1 处，仅用于诊断行
+// （说明“全局查到的是谁家的类”），绝不回落全局查找。
+// 读表失败（客镜像未加载／无 __objc_classlist 段／类名未安装等）只许
+// 干净失败写明原因（见 SBGuestLastClassTableFailure），不许回落运行时枚举。
+static NSString *SBGuestExecFingerprint(NSString *guestExecPath) {
+    NSDictionary *attrs = nil;
+    if (guestExecPath.length > 0) {
+        attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:guestExecPath error:nil];
     }
-    return [path stringByResolvingSymlinksInPath];
+    NSNumber *size = attrs[NSFileSize];
+    NSDate *mtime = attrs[NSFileModificationDate];
+    return [NSString stringWithFormat:@"%@|%lld|%.0f",
+            guestExecPath.lastPathComponent ?: @"?",
+            size ? (long long)size.longLongValue : -1,
+            mtime ? mtime.timeIntervalSince1970 : -1];
 }
 
-static BOOL SBGuestImagePathIsInGuest(NSString *imagePath, NSString *guestAppPath, NSString *guestExecPath) {
-    NSString *normImage = SBGuestNormalizedPath(imagePath);
-    NSString *normExec = SBGuestNormalizedPath(guestExecPath);
-    if (normImage.length > 0 && normExec.length > 0 && [normImage isEqualToString:normExec]) {
-        return YES;
-    }
-    NSString *normApp = SBGuestNormalizedPath(guestAppPath);
-    if (normImage.length > 0 && normApp.length > 0) {
-        NSString *appPrefix = [normApp stringByAppendingString:@"/"];
-        if ([normImage hasPrefix:appPrefix]) {
-            return YES;
-        }
-    }
-    return NO;
+/// 0.2.42：上次读表结构性失败的原因（SBGuestMachOClassList 的
+/// failureReasonOut 原样转存；单纯查无此类时为 nil）。调用方在最终
+/// 干净失败时把它写进错误文案，日志里才有“为什么找不到类”。
+/// 只在主线程读写（激活流程只在主线程跑）。
+static NSString *SBGuestLastClassTableFailure = nil;
+
+/// (a) 读表结果缓存：bundleID＋客可执行指纹＋类名 → 类指针（或 NSNull
+/// 表“查无此类”）。只作加速，不作正确性依赖——指纹变（重装／重导换了
+/// 二进制）即失效重读；同进程多客依次加载时各客指纹不同，互不污染。
+/// 镜像永不 dlclose，进程内类指针终身有效；查无此类的结论对同一指纹
+/// 的同一镜像也是终身的（类表是静态结构），故 miss 也缓存。
+static NSMutableDictionary<NSString *, id> *SBGuestClassCache(void) {
+    static NSMutableDictionary<NSString *, id> *cache = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        cache = [NSMutableDictionary dictionary];
+    });
+    return cache;
 }
 
-/// 枚举 ObjC 类表，找名字是 className 且定义在客 .app 包内（可执行本身，
-/// 或包内 framework）的类；没有即 Nil。激活时才调（非热路径），类表规模
-/// 数千，一次枚举可接受；不缓存——同进程多客依次加载时类表会变。
+/// 直接读客 Mach-O 的 __objc_classlist，找名字是 className 且定义在客
+/// .app 包内（可执行本身，或包内 framework）的类；没有即 Nil。
+/// 结构性失败时 SBGuestLastClassTableFailure 置原因串（调用方干净失败用）。
 static Class SBGuestClassNamedInGuestImage(NSString *className, NSString *guestAppPath, NSString *guestExecPath) {
-    int count = objc_getClassList(NULL, 0);
-    if (count <= 0) {
-        return Nil;
+    const char *failureReason = NULL;
+    Class found = (Class)SBGuestMachOClassNamedInGuest([className UTF8String],
+                                                       [guestExecPath UTF8String],
+                                                       [guestAppPath UTF8String],
+                                                       &failureReason);
+    if (!found && failureReason) {
+        SBGuestLastClassTableFailure = [NSString stringWithUTF8String:failureReason];
+        SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：读客 Mach-O 类表失败（%@）：%@",
+                        className, SBGuestLastClassTableFailure] UTF8String]);
     }
-    // ARC 下 void * 到 __unsafe_unretained Class * 不许隐式转换，必须显式 cast
-    //（0.2.41 首轮 CI：SBGuestSessionManager.m:80 报 implicit conversion error）。
-    Class *classes = (Class *)malloc(sizeof(Class) * (size_t)count);
-    if (!classes) {
-        return Nil;
-    }
-    int fetched = objc_getClassList(classes, count);
-    Class found = Nil;
-    const char *wantedName = [className UTF8String];
-    for (int i = 0; i < fetched; i++) {
-        Class cls = classes[i];
-        const char *name = class_getName(cls);
-        if (!name || !wantedName || strcmp(name, wantedName) != 0) {
-            continue;
-        }
-        const char *imageName = class_getImageName(cls);
-        if (!imageName) {
-            continue;
-        }
-        NSString *imagePath = [NSString stringWithUTF8String:imageName];
-        if (SBGuestImagePathIsInGuest(imagePath, guestAppPath, guestExecPath)) {
-            found = cls;
-            break;
-        }
-    }
-    free(classes);
     return found;
 }
 
 static Class SBGuestClassNamedInGuest(NSString *className, NSString *bundleID,
                                       NSString *guestAppPath, NSString *guestExecPath) {
-    Class cls = SBGuestClassNamedInGuestImage(className, guestAppPath, guestExecPath);
+    // 看门狗“类解析”步：每次取类（显式名／探测一／探测二／最终解析／
+    // scene delegate）都是一步，阈值 2s——读表应为毫秒级，2s 即异常。
+    SBDiagLogWatchdogStepBegin("class-resolve", 2.0);
+    NSString *fingerprint = SBGuestExecFingerprint(guestExecPath);
+    NSString *cacheKey = [NSString stringWithFormat:@"%@|%@|%@", bundleID, fingerprint, className];
+    NSMutableDictionary<NSString *, id> *cache = SBGuestClassCache();
+    id cached = cache[cacheKey];
+    Class cls = Nil;
+    if (cached) {
+        cls = (cached == (id)[NSNull null]) ? Nil : (Class)[(NSValue *)cached pointerValue];
+        SBDiagLogWatchdogStepEnd("class-resolve");
+        return cls;
+    }
+    cls = SBGuestClassNamedInGuestImage(className, guestAppPath, guestExecPath);
     if (cls) {
+        cache[cacheKey] = [NSValue valueWithPointer:(__bridge void *)cls];
+        SBDiagLogWatchdogStepEnd("class-resolve");
         return cls;
     }
     // 客镜像内没有该名类：只记诊断行（全局查到的是谁家的类），不回落全局查找——
-    // 回落会把先加载的另一客的同名类误认成本客的类（根因 B）。
+    // 回落会把先加载的另一客的同名类误认成本客的类（0.2.40 根因 B）。
+    // NSClassFromString 在此仅作诊断，绝不作为取类依据（0.2.42 点开流程
+    // 取类只走 Mach-O 读表；全文件仅剩这一处 NSClassFromString）。
     Class global = NSClassFromString(className);
     if (global) {
         const char *imageName = class_getImageName(global);
@@ -121,12 +132,14 @@ static Class SBGuestClassNamedInGuest(NSString *className, NSString *bundleID,
         SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 按名找到的 %@ 在另一镜像（%@），不是本客的类，不用",
                         bundleID, className, imagePath] UTF8String]);
     }
+    cache[cacheKey] = (id)[NSNull null];
+    SBDiagLogWatchdogStepEnd("class-resolve");
     return Nil;
 }
 
 // 0.2.40（并轨）：核心按路径参数取类；context 与 session 是两个不同类型、
 // 同名字段（bundleID/guestAppPath/guestExecPath），各由一个薄包装器传参，
-// 定点取类逻辑只此一份，不另写查找。0.2.41：同一 helper，枚举取类＋路径规范化。
+// 定点取类逻辑只此一份，不另写查找。0.2.42：同一 helper，Mach-O 读表取类。
 static Class SBGuestClassNamed(NSString *className, SBGuestMainHookContext *context) {
     return SBGuestClassNamedInGuest(className, context.bundleID, context.guestAppPath, context.guestExecPath);
 }
@@ -291,6 +304,10 @@ static Class SBGuestClassNamedForSession(NSString *className, SBGuestSession *se
     if (session.guestWindow) {
         return; // 已完成过（0.4 秒补查与手动路可能重复触发）。
     }
+    // 0.2.42：激活完成即点开流程结束——解除看门狗（全流程耗时进日志），
+    // 并清掉该客的卡死熔断记录（能开即证明熔断已过时）。
+    SBDiagLogWatchdogDisarmForGuest([session.bundleID UTF8String]);
+    SBDiagLogClearStuckGuestForGuest([session.bundleID UTF8String]);
     UIWindow *guestWindow = [self findGuestWindowForSession:session];
     if (!guestWindow) {
         return;
@@ -321,6 +338,9 @@ static Class SBGuestClassNamedForSession(NSString *className, SBGuestSession *se
 - (void)failActivationForSession:(SBGuestSession *)session message:(NSString *)message {
     SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 激活失败（%@），恢复宿主界面",
                     session.bundleID, message] UTF8String]);
+    // 0.2.42：激活失败即点开流程结束——解除看门狗（熔断记录不清：
+    // 失败不等于卡死，只有看门狗超时才写熔断）。
+    SBDiagLogWatchdogDisarmForGuest([session.bundleID UTF8String]);
     // 0.2.36：先藏起激活期间客新建的窗口（再恢复宿主界面）——0.2.35 真机 Flutter
     // 干净失败后日志写“恢复宿主界面”，MJ 看到的却是黑屏：restoreHostUI 只把宿主窗
     // 变 key/可见，不藏客窗；客在 willConnect 里建了窗（哪怕没成 key、非 Normal 层级、
@@ -392,7 +412,7 @@ static Class SBGuestClassNamedForSession(NSString *className, SBGuestSession *se
     // 0.2.40（并轨，洞 1 同根因）：plist 的 scene delegate 类名也走按镜像
     // 定点取类——NSClassFromString 是进程全局查找，另一客先加载过的同名类
     // 会污染；不在本客包内即 Nil，调用方按“无 scene 配置”干净失败。
-    // 0.2.41：同一 helper，枚举取类＋路径规范化。
+    // 0.2.42：同一 helper，Mach-O 读表取类。
     Class delegateClass = SBGuestClassNamedForSession(delegateClassName, session);
     if (!delegateClass) {
         return nil;
@@ -415,16 +435,9 @@ static Class SBGuestClassNamedForSession(NSString *className, SBGuestSession *se
 /// 0.2.37：willConnect 熔断用的客可执行指纹——文件名＋大小＋修改时间。
 /// 重装/重导换了二进制即变指纹，拦截记录自动失效、重试一次。
 - (NSString *)willConnectFingerprintForSession:(SBGuestSession *)session {
-    NSDictionary *attrs = nil;
-    if (session.guestExecPath.length > 0) {
-        attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:session.guestExecPath error:nil];
-    }
-    NSNumber *size = attrs[NSFileSize];
-    NSDate *mtime = attrs[NSFileModificationDate];
-    return [NSString stringWithFormat:@"%@|%lld|%.0f",
-            session.guestExecPath.lastPathComponent ?: @"?",
-            size ? (long long)size.longLongValue : -1,
-            mtime ? mtime.timeIntervalSince1970 : -1];
+    // 指纹格式与 SBGuestExecFingerprint 同款（文件名＋大小＋修改时间）；
+    // willConnect 熔断与看门狗熔断是两套记录，不互通，只共用格式。
+    return SBGuestExecFingerprint(session.guestExecPath);
 }
 
 /// 0.2.37：宿主版本（MARKETING_VERSION＋build）——宿主升级后拦截记录自动失效、重试一次。
@@ -441,6 +454,10 @@ static Class SBGuestClassNamedForSession(NSString *className, SBGuestSession *se
     if (session.guestWindow) {
         return;
     }
+    // 0.2.42 看门狗“手动 willConnect”步，阈值 5s（沿用 0.2.37 熔断语义：
+    // 超时即写拦截记录，下次跳过调用——超时由看门狗线程判定并熔断 exit，
+    // 这里只标步；提前失败出口一律走 failActivationForSession→解除看门狗）。
+    SBDiagLogWatchdogStepBegin("willConnect", 5.0);
     // 0.2.37：willConnect 熔断（通用规则，不按应用名）——Swift trap 抓不住，
     // 死过一次 willConnect 的客再调一次还是死。两档：
     //  (1) 上次启动死在该客 willConnect 里（BeginRun 残留标记）：写拦截记录，干净失败；
@@ -603,12 +620,14 @@ static Class SBGuestClassNamedForSession(NSString *className, SBGuestSession *se
         }
     } @catch (NSException *exception) {
         SBDiagLogClearWillConnectEntry();
+        SBDiagLogWatchdogStepEnd("willConnect");
         SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ scene willConnect 抛异常（%@）",
                         session.bundleID, exception.reason] UTF8String]);
         [self failActivationForSession:session
                                message:[NSString stringWithFormat:@"客 App 创建窗口失败（%@）", exception.reason ?: @"未知原因"]];
         return;
     }
+    SBDiagLogWatchdogStepEnd("willConnect");
     SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 手动 willConnect：willConnect 结束，开始找客窗",
                     session.bundleID] UTF8String]);
     UIWindow *guestWindow = [self findGuestWindowForSession:session];
@@ -621,6 +640,9 @@ static Class SBGuestClassNamedForSession(NSString *className, SBGuestSession *se
 
 /// 系统路 0.4 秒后补查：有窗即完成，无窗走手动路。
 - (void)checkSceneSystemPathForSession:(SBGuestSession *)session {
+    // 0.2.42：补查跑到这里即“scene-check”步结束（0.4s＋余量，阈值 2s，
+    // 步在 activateGuest 的 requestSceneSessionActivation 之后开始）。
+    SBDiagLogWatchdogStepEnd("scene-check");
     // 会话已被清掉（失败/切换）则不再动。
     if (self.sessions[session.bundleID] != session) {
         // 0.2.33：之前这里静默返回，下份日志会误读成“死在替身返回到补查之间”；记一行区分。
@@ -768,8 +790,11 @@ static Class SBGuestClassNamedForSession(NSString *className, SBGuestSession *se
                         context.bundleID, principalClassName] UTF8String]);
     }
     NSString *resolvedDelegateClassName = delegateClassName;
+    // 0.2.42：清掉上次取类的结构性失败原因（别让上一客的读表原因
+    // 漏进本客的失败文案）；本次取类若再结构性失败，helper 会重写它。
+    SBGuestLastClassTableFailure = nil;
     if (resolvedDelegateClassName.length > 0) {
-        // 0.2.41（根因 B 补充）：main 传来的显式 delegate 名先在客镜像内验；
+        // 0.2.41（根因 B 补充；0.2.42 取类改 Mach-O 读表）：main 传来的显式 delegate 名先在客镜像内验；
         // 验不过不直接干净失败——main 传的可能是裸名（彩云传 AppDelegate，
         // 类实际注册为 <模块>.AppDelegate），回落到下面通用探测再找一遍；
         // 回落对所有客通用，不写应用特判。仍找不到才干净失败。
@@ -789,7 +814,7 @@ static Class SBGuestClassNamedForSession(NSString *className, SBGuestSession *se
         // 头号嫌疑）。探测不到时不再回退到 scene delegate 类（见下一块），宁可干净失败。
         // 0.2.40：Swift 模块名里 '-' 写成 '_'（可执行名含 '-' 时探测一否则必 miss）；
         // 探测走 SBGuestClassNamed 按镜像定点取类，不走全局名查找（见文件头 helper）。
-        // 0.2.41：SBGuestClassNamed 改成枚举客镜像类表＋路径规范化（同上）。
+        // 0.2.42：SBGuestClassNamed 改成 Mach-O 读表取类（同上）。
         NSString *moduleName = [[context.guestExecPath lastPathComponent]
             stringByReplacingOccurrencesOfString:@"-" withString:@"_"];
         NSString *appDelegateName = [NSString stringWithFormat:@"%@.AppDelegate", moduleName];
@@ -809,7 +834,7 @@ static Class SBGuestClassNamedForSession(NSString *className, SBGuestSession *se
         // nil。装错 delegate 只会静默死或黑屏，不如干净失败写明原因。
         // 0.2.40：探测二同样走 SBGuestClassNamed——裸名跨客污染时（另一客的
         // AppDelegate 已注册）返回 Nil，不装别人的类。
-        // 0.2.41：枚举客镜像类表，客自己的同名类（后注册）也能找到，不再只认全局第一个。
+        // 0.2.42：Mach-O 读表，客自己的同名类（后注册）也能找到，不再只认全局第一个。
         if (SBGuestClassNamed(@"AppDelegate", context)) {
             resolvedDelegateClassName = @"AppDelegate";
             SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ main 未传 delegate 类，按名探测到裸 AppDelegate 类",
@@ -823,23 +848,27 @@ static Class SBGuestClassNamedForSession(NSString *className, SBGuestSession *se
     }
     // 0.2.40：最终解析也按镜像定点取类——main 传来的显式类名同样可能撞上
     // 另一客先注册的同名类；SBGuestClassNamed 验不过即 Nil，走干净失败。
-    // 0.2.41：显式名验不过时上面已回落探测过一次，到这里仍是 Nil 才是真找不到。
+    // 0.2.42：取类改 Mach-O 读表；显式名验不过时上面已回落探测过一次，到这里仍是 Nil 才是真找不到。
     Class delegateClass = resolvedDelegateClassName.length > 0
         ? SBGuestClassNamed(resolvedDelegateClassName, context) : Nil;
     if (!delegateClass) {
         if (error) {
             *error = SBGuestLoaderErrorMake(SBGuestLoaderErrorGuestLoadFailed, @"加载客 App",
-                                            [NSString stringWithFormat:@"找不到客 AppDelegate 类（%@）", resolvedDelegateClassName ?: @"未指定"],
+                                            [NSString stringWithFormat:@"找不到客 AppDelegate 类（%@%@）", resolvedDelegateClassName ?: @"未指定",
+                                             SBGuestLastClassTableFailure ? [NSString stringWithFormat:@"；类表原因：%@", SBGuestLastClassTableFailure] : @""],
                                             @"该客 App 可能与当前系统版本不兼容");
         }
         return NO;
     }
     // 0.2.40（洞 2）：init 包进 @try——某客 AppDelegate 的 init 抛异常时
     // 干净失败，不让异常直穿崩进程（didFinishLaunching 有 @try，init 原来没有）。
+    // 0.2.42 看门狗“delegate-init”步，阈值 3s（客 init 应为轻量）。
     id guestDelegate = nil;
+    SBDiagLogWatchdogStepBegin("delegate-init", 3.0);
     @try {
         guestDelegate = [[delegateClass alloc] init];
     } @catch (NSException *exception) {
+        SBDiagLogWatchdogStepEnd("delegate-init");
         SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 客 AppDelegate init 抛异常（%@），干净失败",
                         context.bundleID, exception.reason] UTF8String]);
         if (error) {
@@ -849,6 +878,7 @@ static Class SBGuestClassNamedForSession(NSString *className, SBGuestSession *se
         }
         return NO;
     }
+    SBDiagLogWatchdogStepEnd("delegate-init");
     if (!guestDelegate) {
         if (error) {
             *error = SBGuestLoaderErrorMake(SBGuestLoaderErrorGuestLoadFailed, @"加载客 App",
@@ -879,10 +909,13 @@ static Class SBGuestClassNamedForSession(NSString *className, SBGuestSession *se
     SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 拦截 UIApplicationMain，换上客 delegate %@（宿主 delegate 已保存）",
                     context.bundleID, resolvedDelegateClassName] UTF8String]);
     app.delegate = guestDelegate;
+    // 0.2.42 看门狗“didFinishLaunching”步，阈值 5s（Flutter 引擎启动可达数秒，放宽）。
+    SBDiagLogWatchdogStepBegin("didFinishLaunching", 5.0);
     if ([guestDelegate respondsToSelector:@selector(application:didFinishLaunchingWithOptions:)]) {
         @try {
             [guestDelegate application:app didFinishLaunchingWithOptions:nil];
         } @catch (NSException *exception) {
+            SBDiagLogWatchdogStepEnd("didFinishLaunching");
             SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ didFinishLaunching 抛异常（%@），恢复宿主",
                             context.bundleID, exception.reason] UTF8String]);
             [self.sessions removeObjectForKey:context.bundleID];
@@ -903,10 +936,14 @@ static Class SBGuestClassNamedForSession(NSString *className, SBGuestSession *se
         SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ delegate（%@）未实现 didFinishLaunching，跳过",
                         context.bundleID, resolvedDelegateClassName] UTF8String]);
     }
+    SBDiagLogWatchdogStepEnd("didFinishLaunching");
     // 0.2.36：Flutter 客建窗（#3/#4）——didFinishLaunching 只做插件注册，
     // 不建窗；窗是 UIKit 加载 storyboard 建的。尚无窗且客有 storyboard 时
     // 在这里同步建好，随后的 findGuestWindow 即命中，直接完成激活。
+    // 0.2.42 看门狗“storyboard”步，阈值 3s。
+    SBDiagLogWatchdogStepBegin("storyboard", 3.0);
     [self buildGuestWindowFromStoryboardForSession:session];
+    SBDiagLogWatchdogStepEnd("storyboard");
     // pre-scene 客／storyboard 客：didFinishLaunching 或 storyboard 里已建窗，同步完成。
     if ([self findGuestWindowForSession:session]) {
         [self completeActivationForSession:session];
@@ -922,6 +959,9 @@ static Class SBGuestClassNamedForSession(NSString *className, SBGuestSession *se
         SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 请求 scene session 失败（%@），等 0.4 秒补查走手动路",
                         context.bundleID, requestError.localizedDescription] UTF8String]);
     }];
+    // 0.2.42 看门狗“scene-check”步，阈值 2s（0.4s＋余量）；步在
+    // checkSceneSystemPathForSession 入口结束（或会话已释放分支）。
+    SBDiagLogWatchdogStepBegin("scene-check", 2.0);
     __weak SBGuestSession *weakSession = session;
     NSString *checkBundleID = session.bundleID;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
@@ -933,6 +973,8 @@ static Class SBGuestClassNamedForSession(NSString *className, SBGuestSession *se
         } else {
             // 0.2.33：会话在 0.4 秒内被释放——之前这里静默无操作，下份日志会
             // 误读成“死在替身返回到补查之间”；记一行区分。
+            // 0.2.42：补查没跑到，scene-check 步在这里结束（会话已清即流程已结束）。
+            SBDiagLogWatchdogStepEnd("scene-check");
             SBDiagLogLine([[NSString stringWithFormat:@"进程内进客：%@ 0.4 秒补查：会话已释放，不补查",
                             checkBundleID] UTF8String]);
         }
@@ -968,6 +1010,8 @@ static Class SBGuestClassNamedForSession(NSString *className, SBGuestSession *se
                                             @"SwiftUI 嵌客未建出 UIHostingController",
                                             @"请重试，或重新导入该应用");
         }
+        // 0.2.42：SwiftUI 嵌客激活是同步的，任一出口即流程结束——解除看门狗。
+        SBDiagLogWatchdogDisarmForGuest([context.bundleID UTF8String]);
         return NO;
     }
     if (self.sessions[context.bundleID]) {
@@ -977,6 +1021,7 @@ static Class SBGuestClassNamedForSession(NSString *className, SBGuestSession *se
                                             @"该应用已在后台，请从桌面恢复进入",
                                             @"请重试");
         }
+        SBDiagLogWatchdogDisarmForGuest([context.bundleID UTF8String]);
         return NO;
     }
     // 另一客在前台：先让它回后台（藏窗、换出 delegate），再上新客。
@@ -1015,10 +1060,13 @@ static Class SBGuestClassNamedForSession(NSString *className, SBGuestSession *se
         SBDiagLogLine([[NSString stringWithFormat:@"进程内进客（SwiftUI）：%@ 有 @UIApplicationDelegateAdaptor，换上客 delegate %@",
                         context.bundleID, NSStringFromClass([appDelegate class])] UTF8String]);
         app.delegate = appDelegate;
+        // 0.2.42 看门狗“didFinishLaunching”步，阈值 5s（与 UIKit 客同款）。
+        SBDiagLogWatchdogStepBegin("didFinishLaunching", 5.0);
         if ([appDelegate respondsToSelector:@selector(application:didFinishLaunchingWithOptions:)]) {
             @try {
                 [appDelegate application:app didFinishLaunchingWithOptions:nil];
             } @catch (NSException *exception) {
+                SBDiagLogWatchdogStepEnd("didFinishLaunching");
                 SBDiagLogLine([[NSString stringWithFormat:@"进程内进客（SwiftUI）：%@ didFinishLaunching 抛异常（%@），恢复宿主",
                                 context.bundleID, exception.reason] UTF8String]);
                 [self.sessions removeObjectForKey:context.bundleID];
@@ -1030,9 +1078,11 @@ static Class SBGuestClassNamedForSession(NSString *className, SBGuestSession *se
                                                     [NSString stringWithFormat:@"客 App 启动失败（%@）", exception.reason ?: @"未知原因"],
                                                     @"请重试，或重新导入该应用");
                 }
+                SBDiagLogWatchdogDisarmForGuest([context.bundleID UTF8String]);
                 return NO;
             }
         }
+        SBDiagLogWatchdogStepEnd("didFinishLaunching");
     } else {
         SBDiagLogLine([[NSString stringWithFormat:@"进程内进客（SwiftUI）：%@ 无 @UIApplicationDelegateAdaptor，不换 app.delegate",
                         context.bundleID] UTF8String]);
@@ -1050,6 +1100,7 @@ static Class SBGuestClassNamedForSession(NSString *className, SBGuestSession *se
                                             @"找不到宿主 scene，无法为客 App 创建窗口",
                                             @"请重试");
         }
+        SBDiagLogWatchdogDisarmForGuest([context.bundleID UTF8String]);
         return NO;
     }
     UIWindow *guestWindow = [[UIWindow alloc] initWithWindowScene:scene];
@@ -1068,6 +1119,9 @@ static Class SBGuestClassNamedForSession(NSString *className, SBGuestSession *se
                                                   diskDirectoryName:session.diskDirectoryName];
     [[NSNotificationCenter defaultCenter] postNotificationName:SBGuestDidEnterForegroundNotification
                                                         object:nil];
+    // 0.2.42：SwiftUI 嵌客同步激活完成——解除看门狗，清掉卡死熔断记录。
+    SBDiagLogWatchdogDisarmForGuest([session.bundleID UTF8String]);
+    SBDiagLogClearStuckGuestForGuest([session.bundleID UTF8String]);
     return YES;
 }
 

@@ -28,9 +28,11 @@
 #if defined(__APPLE__)
 #include <objc/message.h>
 #include <objc/runtime.h>
+#include <dispatch/dispatch.h>
 #endif
 #include <pthread.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -47,6 +49,14 @@
 #define SB_DIAG_WILLCONNECT_MARKER_NAME "SBStartupLog-willconnect-marker.txt"
 #define SB_DIAG_WILLCONNECT_BLOCK_PREFIX "willconnect-blocked-"
 #define SB_DIAG_WILLCONNECT_BLOCK_SUFFIX ".txt"
+#define SB_DIAG_STUCK_PREFIX "stuck-"
+#define SB_DIAG_STUCK_SUFFIX ".txt"
+/// 0.2.42 看门狗节律（调查报告 §5.3）：主线程心跳 250ms、看门狗检查
+/// 500ms、心跳停摆 >5s 熔断、全流程 20s。
+#define SB_DIAG_WD_HEARTBEAT_MS 250
+#define SB_DIAG_WD_CHECK_MS 500
+#define SB_DIAG_WD_STALL_LIMIT_MS 5000
+#define SB_DIAG_WD_TOTAL_LIMIT_MS 20000
 #define SB_DIAG_MAX_FILES 20
 #define SB_DIAG_MAX_TOTAL_BYTES (2 * 1024 * 1024)
 
@@ -67,6 +77,31 @@ static char g_willConnectMarkerPath[PATH_MAX + 64];
 /// 0.2.37：BeginRun 从残留 willConnect 标记读出的客 bundle ID（进程内静态区，
 /// 供本次启动的 driveSceneManually 熔断用；无残留标记时为空串）。
 static char g_staleWillConnectGuest[256];
+/// 0.2.42：BeginRun 从卡死熔断目录读出的上次卡死客与步名（进程内静态区，
+/// 供本次启动报“上次卡在某步”；熔断文件本身不删，留到下次点该客时消费）。
+static char g_staleStuckGuest[256];
+static char g_staleStuckStep[128];
+
+/// 0.2.42 看门狗状态（g_wdLock 串行化；与日志 g_lock 是两把锁，
+// 任何路径都不以 g_lock 在手时再取 g_wdLock——看门狗线程读状态时
+// 从不持 g_lock，超时写行时用 trylock，绝不让看门狗自己卡在锁上）。
+static pthread_mutex_t g_wdLock = PTHREAD_MUTEX_INITIALIZER;
+static int g_wdArmed = 0;
+static unsigned long g_wdGeneration = 0;
+static char g_wdBundleID[256];
+static char g_wdFingerprint[512];
+static char g_wdHostVersion[128];
+static char g_wdStep[64];
+static uint64_t g_wdStepTimeoutMs = 0;
+static uint64_t g_wdStepStartMs = 0;
+static uint64_t g_wdFlowStartMs = 0;
+static volatile uint64_t g_wdLastHeartbeatMs = 0;
+static int g_wdTimedOut = 0;
+/// 超时写熔断时用的熔断目录快照（武装时从 g_fuseDir 拷；BeginRun 后即稳定）。
+static char g_wdFuseDir[PATH_MAX + 64];
+#if defined(__APPLE__)
+static dispatch_source_t g_wdHeartbeatTimer = NULL;
+#endif
 
 /// 读整个文件（上限 SB_DIAG_READ_CAP），NUL 结尾；失败返回 NULL。
 static char *SBDiagReadFile(const char *path, size_t *lenOut) {
@@ -704,6 +739,78 @@ void SBDiagLogBeginRun(void) {
         free(marker);
         (void)unlink(g_willConnectMarkerPath);
     }
+    // 0.2.42：卡死熔断还在 = 上次启动死在点开某步里（看门狗写下熔断后
+    // exit）。熔断文件不删（须留到下次点该客时由 Is 检查消费或由成功
+    // 激活清掉），故每次启动都再报一次——一行诊断，不拦启动。
+    // 只读第一份（readdir 顺序），多份时计数写进同一行。
+    char staleStuckGuest[256] = {0};
+    char staleStuckStep[128] = {0};
+    double staleStuckElapsed = 0;
+    int staleStuckCount = 0;
+    int hasStaleStuck = 0;
+    if (g_fuseDir[0] != '\0') {
+        DIR *fuseDir = opendir(g_fuseDir);
+        if (fuseDir) {
+            struct dirent *ent;
+            while ((ent = readdir(fuseDir)) != NULL) {
+                const char *name = ent->d_name;
+                size_t nlen = strlen(name);
+                size_t preLen = strlen(SB_DIAG_STUCK_PREFIX);
+                size_t sufLen = strlen(SB_DIAG_STUCK_SUFFIX);
+                if (strncmp(name, SB_DIAG_STUCK_PREFIX, preLen) != 0) {
+                    continue;
+                }
+                if (nlen < preLen + sufLen ||
+                    strcmp(name + nlen - sufLen, SB_DIAG_STUCK_SUFFIX) != 0) {
+                    continue;
+                }
+                staleStuckCount++;
+                if (hasStaleStuck) {
+                    continue; // 只读第一份
+                }
+                // bundleID = 文件名去前后缀（写时已做安全字符转换，不再还原）。
+                size_t bidLen = nlen - preLen - sufLen;
+                if (bidLen >= sizeof(staleStuckGuest)) {
+                    bidLen = sizeof(staleStuckGuest) - 1;
+                }
+                memcpy(staleStuckGuest, name + preLen, bidLen);
+                staleStuckGuest[bidLen] = '\0';
+                char fusePath[PATH_MAX + 64];
+                if (snprintf(fusePath, sizeof(fusePath), "%s/%s", g_fuseDir, name) >= (int)sizeof(fusePath)) {
+                    continue;
+                }
+                size_t contentLen = 0;
+                char *content = SBDiagReadFile(fusePath, &contentLen);
+                if (content && contentLen > 0) {
+                    // 四行：步名、耗时秒、指纹、宿主版本——只取前两行。
+                    char *nl1 = strchr(content, '\n');
+                    if (nl1) {
+                        *nl1 = '\0';
+                    }
+                    (void)snprintf(staleStuckStep, sizeof(staleStuckStep), "%s", content);
+                    if (nl1) {
+                        char *line2 = nl1 + 1;
+                        char *nl2 = strchr(line2, '\n');
+                        if (nl2) {
+                            *nl2 = '\0';
+                        }
+                        staleStuckElapsed = atof(line2);
+                    }
+                    hasStaleStuck = 1;
+                    size_t gl = strlen(staleStuckGuest);
+                    if (gl < sizeof(g_staleStuckGuest)) {
+                        memcpy(g_staleStuckGuest, staleStuckGuest, gl + 1);
+                    }
+                    size_t sl = strlen(staleStuckStep);
+                    if (sl < sizeof(g_staleStuckStep)) {
+                        memcpy(g_staleStuckStep, staleStuckStep, sl + 1);
+                    }
+                }
+                free(content);
+            }
+            closedir(fuseDir);
+        }
+    }
     pthread_mutex_unlock(&g_lock);
     SBDiagLogLine("进程启动");
     {
@@ -748,6 +855,18 @@ void SBDiagLogBeginRun(void) {
         int n = snprintf(line, sizeof(line),
                          "上次启动死在客 scene delegate willConnect 里（标记文件仍在，客=%s）",
                          staleWillConnectGuest[0] != '\0' ? staleWillConnectGuest : "（未知）");
+        if (n > 0) {
+            SBDiagLogLine(line);
+        }
+    }
+    if (hasStaleStuck) {
+        char line[512];
+        int n = snprintf(line, sizeof(line),
+                         "上次启动卡在 %s 里（客=%s，步耗时约 %.1f 秒，看门狗已熔断该客，下次点开将干净失败%s）",
+                         staleStuckStep[0] != '\0' ? staleStuckStep : "未知步骤",
+                         staleStuckGuest[0] != '\0' ? staleStuckGuest : "（未知）",
+                         staleStuckElapsed,
+                         staleStuckCount > 1 ? "，另有卡死熔断在位" : "");
         if (n > 0) {
             SBDiagLogLine(line);
         }
@@ -1046,6 +1165,531 @@ void SBDiagLogClearWillConnectBlockForGuest(const char *guestBundleID) {
         int ln = snprintf(line, sizeof(line), "熔断记录已清：%s（%s）",
                           guestBundleID, isShared ? "共享区" : "Logs");
         if (ln > 0) {
+            SBDiagLogLine(line);
+        }
+    }
+}
+
+#pragma mark - 0.2.42 卡死熔断记录（看门狗超时写下）
+
+/// 0.2.42：卡死熔断记录路径（<熔断目录>/stuck-<bundleID>.txt）。
+/// 与 SBDiagWillConnectBlockPath 同款（目录同一把锁下取、bundle ID
+/// 只留 [A-Za-z0-9.-]）；目录为空（BeginRun 未跑）时返回 0。
+static int SBDiagStuckPath(const char *guestBundleID, char *out, size_t outLen, int *outIsShared) {
+    if (!guestBundleID || guestBundleID[0] == '\0' || !out || outLen == 0) {
+        return 0;
+    }
+    pthread_mutex_lock(&g_lock);
+    if (!g_begun) {
+        pthread_mutex_unlock(&g_lock);
+        return 0;
+    }
+    const char *fuseDir = g_fuseDir[0] != '\0' ? g_fuseDir : g_dir;
+    if (fuseDir[0] == '\0') {
+        pthread_mutex_unlock(&g_lock);
+        return 0;
+    }
+    char dir[PATH_MAX + 64];
+    size_t dirLen = strlen(fuseDir);
+    if (dirLen >= sizeof(dir)) {
+        pthread_mutex_unlock(&g_lock);
+        return 0;
+    }
+    memcpy(dir, fuseDir, dirLen + 1);
+    int isShared = g_fuseDirIsShared;
+    pthread_mutex_unlock(&g_lock);
+    if (outIsShared) {
+        *outIsShared = isShared;
+    }
+    char safe[256];
+    size_t i = 0;
+    for (; guestBundleID[i] != '\0' && i < sizeof(safe) - 1; i++) {
+        char c = guestBundleID[i];
+        safe[i] = ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                   (c >= '0' && c <= '9') || c == '.' || c == '-' || c == '_')
+                      ? c : '_';
+    }
+    safe[i] = '\0';
+    if (i == 0) {
+        return 0;
+    }
+    int rc = snprintf(out, outLen, "%s/%s%s%s", dir,
+                      SB_DIAG_STUCK_PREFIX, safe,
+                      SB_DIAG_STUCK_SUFFIX);
+    return rc > 0 && (size_t)rc < outLen;
+}
+
+/// 超时路径用的熔断路径（不拿锁：调用方传武装时快照的熔断目录）。
+static int SBDiagStuckPathFromDir(const char *dir, const char *guestBundleID,
+                                  char *out, size_t outLen) {
+    if (!dir || dir[0] == '\0' || !guestBundleID || guestBundleID[0] == '\0' ||
+        !out || outLen == 0) {
+        return 0;
+    }
+    char safe[256];
+    size_t i = 0;
+    for (; guestBundleID[i] != '\0' && i < sizeof(safe) - 1; i++) {
+        char c = guestBundleID[i];
+        safe[i] = ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                   (c >= '0' && c <= '9') || c == '.' || c == '-' || c == '_')
+                      ? c : '_';
+    }
+    safe[i] = '\0';
+    if (i == 0) {
+        return 0;
+    }
+    int rc = snprintf(out, outLen, "%s/%s%s%s", dir,
+                      SB_DIAG_STUCK_PREFIX, safe,
+                      SB_DIAG_STUCK_SUFFIX);
+    return rc > 0 && (size_t)rc < outLen;
+}
+
+/// 熔断文件内容（四行：步名、步耗时秒、客指纹、宿主版本）。
+static int SBDiagStuckContent(const char *step, double elapsedSeconds,
+                              const char *fingerprint, const char *hostVersion,
+                              char *out, size_t outLen) {
+    int n = snprintf(out, outLen, "%s\n%.1f\n%s\n%s\n",
+                     (step && step[0] != '\0') ? step : "未知步骤",
+                     elapsedSeconds,
+                     (fingerprint && fingerprint[0] != '\0') ? fingerprint : "?",
+                     (hostVersion && hostVersion[0] != '\0') ? hostVersion : "?");
+    return n > 0 && (size_t)n < outLen;
+}
+
+void SBDiagLogMarkStuckGuest(const char *guestBundleID, const char *step, double elapsedSeconds, const char *fingerprint, const char *hostVersion) {
+    char path[PATH_MAX + 64];
+    int isShared = 0;
+    if (!SBDiagStuckPath(guestBundleID, path, sizeof(path), &isShared)) {
+        return;
+    }
+    char content[1024];
+    if (!SBDiagStuckContent(step, elapsedSeconds, fingerprint, hostVersion,
+                            content, sizeof(content))) {
+        return;
+    }
+    SBDiagWriteFile(path, content, strlen(content));
+    {
+        char line[512];
+        int ln = snprintf(line, sizeof(line), "卡死熔断记录已写%s：%s（%s）",
+                          isShared ? "共享区" : "Logs", guestBundleID,
+                          (step && step[0] != '\0') ? step : "未知步骤");
+        if (ln > 0) {
+            SBDiagLogLine(line);
+        }
+    }
+}
+
+int SBDiagLogIsGuestStuckForGuest(const char *guestBundleID, const char *fingerprint, const char *hostVersion, char *stepOut, size_t stepOutSize) {
+    if (stepOut && stepOutSize > 0) {
+        stepOut[0] = '\0';
+    }
+    char path[PATH_MAX + 64];
+    int isShared = 0;
+    if (!SBDiagStuckPath(guestBundleID, path, sizeof(path), &isShared)) {
+        return 0;
+    }
+    size_t len = 0;
+    char *content = SBDiagReadFile(path, &len);
+    int stuck = 0;
+    const char *why = "无记录";
+    if (content && len > 0) {
+        // 四行：步名、耗时秒、指纹、宿主版本——后两行都对上才熔断；
+        // 任一不符（重装/升级）即失效、自动重试。
+        char *nl1 = strchr(content, '\n');
+        if (!nl1) {
+            why = "记录损坏（不是四行）";
+        } else {
+            *nl1 = '\0';
+            char *line2 = nl1 + 1;
+            char *nl2 = strchr(line2, '\n');
+            if (!nl2) {
+                why = "记录损坏（不是四行）";
+            } else {
+                *nl2 = '\0';
+                char *line3 = nl2 + 1;
+                char *nl3 = strchr(line3, '\n');
+                if (!nl3) {
+                    why = "记录损坏（不是四行）";
+                } else {
+                    *nl3 = '\0';
+                    char *line4 = nl3 + 1;
+                    char *nl4 = strchr(line4, '\n');
+                    if (nl4) {
+                        *nl4 = '\0';
+                    }
+                    stuck = (fingerprint && strcmp(line3, fingerprint) == 0 &&
+                             hostVersion && strcmp(line4, hostVersion) == 0);
+                    why = stuck ? "指纹与宿主版本均对上" : "记录不符（指纹/版本已变）";
+                    if (stuck && stepOut && stepOutSize > 0) {
+                        (void)snprintf(stepOut, stepOutSize, "%s", content);
+                    }
+                }
+            }
+        }
+    }
+    free(content);
+    {
+        char line[512];
+        int ln = snprintf(line, sizeof(line), "卡死熔断检查：%s 熔断=%s（%s，%s）",
+                          guestBundleID, stuck ? "是" : "否",
+                          isShared ? "共享区" : "Logs", why);
+        if (ln > 0) {
+            SBDiagLogLine(line);
+        }
+    }
+    return stuck;
+}
+
+void SBDiagLogClearStuckGuestForGuest(const char *guestBundleID) {
+    char path[PATH_MAX + 64];
+    int isShared = 0;
+    if (!SBDiagStuckPath(guestBundleID, path, sizeof(path), &isShared)) {
+        return;
+    }
+    // 只在真删掉记录文件时记一行（文件本就不存在时不记，免得把
+    // “无记录”说成“已清”）。
+    if (unlink(path) == 0) {
+        char line[512];
+        int ln = snprintf(line, sizeof(line), "卡死熔断记录已清：%s（%s）",
+                          guestBundleID, isShared ? "共享区" : "Logs");
+        if (ln > 0) {
+            SBDiagLogLine(line);
+        }
+    }
+}
+
+const char *SBDiagLogStaleStuckGuest(void) {
+    return g_staleStuckGuest;
+}
+
+const char *SBDiagLogStaleStuckStep(void) {
+    return g_staleStuckStep;
+}
+
+#pragma mark - 0.2.42 点开流程分步看门狗
+
+/// 单调时钟毫秒（CLOCK_MONOTONIC，进程启动起算，不受系统时间改动影响）。
+static uint64_t SBDiagMonotonicMs(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return 0;
+    }
+    return (uint64_t)ts.tv_sec * 1000U + (uint64_t)(ts.tv_nsec / 1000000);
+}
+
+/// 心跳打点：主线程每 250ms 调一次。
+/// iOS 上由主队列 dispatch timer 调；非 Apple 构建无 dispatch，
+/// 测试驱动直接调本函数模拟主线程心跳（见本文件末尾说明）。
+/// 注意：非 static——Linux 原型用它驱动同一份看门狗代码；iOS 上
+/// 只由主队列 timer 调，绝不在别的线程调（否则心跳失去意义）。
+void SBDiagWatchdogHeartbeatTick(void) {
+    g_wdLastHeartbeatMs = SBDiagMonotonicMs();
+}
+
+#if defined(__APPLE__)
+static void SBDiagWatchdogHeartbeatTickF(void *context) {
+    (void)context;
+    SBDiagWatchdogHeartbeatTick();
+}
+#endif
+
+/// 超时行的时间戳（与 SBDiagLogLine 同格式 "[MM-DD HH:MM:SS.mmm]"，
+/// 超时路径不走 SBDiagLogLine，故这里单抄一份，不依赖正常写盘路）。
+static void SBDiagTimeoutTimestamp(char *out, size_t outSize) {
+    struct timeval tv;
+    struct tm tmv;
+    if (gettimeofday(&tv, NULL) == 0 && localtime_r(&tv.tv_sec, &tmv) != NULL) {
+        char datePart[24];
+        if (strftime(datePart, sizeof(datePart), "%m-%d %H:%M:%S", &tmv) == 0) {
+            datePart[0] = '\0';
+        }
+        (void)snprintf(out, outSize, "%s.%03d", datePart, (int)(tv.tv_usec / 1000));
+    } else {
+        (void)snprintf(out, outSize, "??.?? ??:??:??.???");
+    }
+}
+
+/// 超时落点（只在看门狗线程跑）：写 WATCHDOG TIMEOUT 行＋熔断标记，
+// 然后主动 exit(0) 把手机还给用户。正常情况下不返回。
+// 写行先 trylock 拿 g_lock 走正常写盘路；拿不到（主线程正卡在写日志
+// 里）也不等——直接对 g_fd 写＋fsync，行内容可能与别的行交错，
+// 但死点信息一定落盘。熔断标记用裸 open/write/fsync，不拿任何锁、
+// 不调 ObjC、不碰 UIKit——超时路径上绝不引入新的阻塞点。
+static void SBDiagWatchdogTimeout(const char *step, const char *why,
+                                  uint64_t stepMs, uint64_t flowMs,
+                                  const char *bundleID,
+                                  const char *fingerprint,
+                                  const char *hostVersion,
+                                  const char *fuseDir) {
+    char ts[32];
+    SBDiagTimeoutTimestamp(ts, sizeof(ts));
+    char line[1024];
+    int n = snprintf(line, sizeof(line),
+                     "[%s] WATCHDOG TIMEOUT at %s（%s，步耗时 %llums，全流程 %llums）\n",
+                     ts, (step && step[0] != '\0') ? step : "未知步骤", why,
+                     (unsigned long long)stepMs, (unsigned long long)flowMs);
+    if (n > 0) {
+        if (pthread_mutex_trylock(&g_lock) == 0) {
+            if (g_begun && g_fd >= 0) {
+                SBDiagWriteAll(g_fd, line, (size_t)n);
+            }
+            pthread_mutex_unlock(&g_lock);
+        } else {
+            int fd = g_fd; // BeginRun 后即稳定；未 BeginRun 时为 -1，不写
+            if (fd >= 0) {
+                SBDiagWriteAll(fd, line, (size_t)n);
+            }
+        }
+    }
+    // 熔断标记（超时路径不经过 SBDiagLogMarkStuckGuest——后者会记日志行
+    // 取 g_lock；这里只写文件）。
+    if (fuseDir && fuseDir[0] != '\0' && bundleID && bundleID[0] != '\0') {
+        char path[PATH_MAX + 64];
+        if (SBDiagStuckPathFromDir(fuseDir, bundleID, path, sizeof(path))) {
+            char content[1024];
+            if (SBDiagStuckContent(step, (double)stepMs / 1000.0,
+                                   fingerprint, hostVersion,
+                                   content, sizeof(content))) {
+                SBDiagWriteFile(path, content, strlen(content));
+            }
+        }
+    }
+    // 看门狗解不开已死锁的主线程：冻住的进程留着只会让用户以为手机坏了；
+    // 退出后宿主下次启动读到熔断标记，弹“该应用上次打开时卡住了，已跳过”
+    // 并停在桌面。绝不静默重试、绝不无限等待。
+    exit(0);
+}
+
+/// 看门狗线程：每 500ms 检查一次。武装解除或 generation 变化即退出。
+/// 只做读时间戳＋（超时时）写文件＋exit，不调 ObjC、不碰 UIKit。
+static void *SBDiagWatchdogThread(void *arg) {
+    (void)arg;
+    unsigned long generation = 0;
+    pthread_mutex_lock(&g_wdLock);
+    generation = g_wdGeneration;
+    pthread_mutex_unlock(&g_wdLock);
+    for (;;) {
+        struct timespec ts = { 0, SB_DIAG_WD_CHECK_MS * 1000 * 1000 };
+        (void)nanosleep(&ts, NULL);
+        char step[64] = {0};
+        char bundleID[256] = {0};
+        char fingerprint[512] = {0};
+        char hostVersion[128] = {0};
+        char fuseDir[PATH_MAX + 64] = {0};
+        uint64_t stepStart = 0, stepTimeout = 0, flowStart = 0, lastBeat = 0;
+        pthread_mutex_lock(&g_wdLock);
+        if (!g_wdArmed || g_wdGeneration != generation) {
+            pthread_mutex_unlock(&g_wdLock);
+            return NULL;
+        }
+        (void)snprintf(step, sizeof(step), "%s", g_wdStep);
+        (void)snprintf(bundleID, sizeof(bundleID), "%s", g_wdBundleID);
+        (void)snprintf(fingerprint, sizeof(fingerprint), "%s", g_wdFingerprint);
+        (void)snprintf(hostVersion, sizeof(hostVersion), "%s", g_wdHostVersion);
+        (void)snprintf(fuseDir, sizeof(fuseDir), "%s", g_wdFuseDir);
+        stepStart = g_wdStepStartMs;
+        stepTimeout = g_wdStepTimeoutMs;
+        flowStart = g_wdFlowStartMs;
+        lastBeat = g_wdLastHeartbeatMs;
+        pthread_mutex_unlock(&g_wdLock);
+        uint64_t now = SBDiagMonotonicMs();
+        const char *why = NULL;
+        uint64_t stepMs = (now >= stepStart) ? (now - stepStart) : 0;
+        uint64_t flowMs = (now >= flowStart) ? (now - flowStart) : 0;
+        uint64_t stallMs = (now >= lastBeat) ? (now - lastBeat) : 0;
+        if (stallMs > SB_DIAG_WD_STALL_LIMIT_MS) {
+            why = "主线程心跳停摆";
+        } else if (stepTimeout > 0 && step[0] != '\0' && stepMs > stepTimeout) {
+            why = "步超时";
+        } else if (flowMs > SB_DIAG_WD_TOTAL_LIMIT_MS) {
+            why = "全流程超时";
+        }
+        if (!why) {
+            continue;
+        }
+        // 只触发一次：超时后进程立即 exit，合作式取消实际上走不到
+        // （StepBegin 里的 timedOut 检查只是防御，见 build log）。
+        pthread_mutex_lock(&g_wdLock);
+        if (g_wdTimedOut) {
+            pthread_mutex_unlock(&g_wdLock);
+            return NULL;
+        }
+        g_wdTimedOut = 1;
+        pthread_mutex_unlock(&g_wdLock);
+        SBDiagWatchdogTimeout(step, why, stepMs, flowMs, bundleID,
+                              fingerprint, hostVersion, fuseDir);
+        return NULL; // Timeout 正常情况下不返回（exit）；防御性退出
+    }
+}
+
+void SBDiagLogWatchdogArm(const char *guestBundleID) {
+    if (!guestBundleID || guestBundleID[0] == '\0') {
+        return;
+    }
+    // 熔断目录快照（BeginRun 后即稳定；武装在 BeginRun 前时为空，
+    // 超时行照写、熔断标记跳过——诊断不丢，熔断缺一次）。
+    char fuseDir[PATH_MAX + 64] = {0};
+    pthread_mutex_lock(&g_lock);
+    if (g_fuseDir[0] != '\0') {
+        size_t dl = strlen(g_fuseDir);
+        if (dl < sizeof(fuseDir)) {
+            memcpy(fuseDir, g_fuseDir, dl + 1);
+        }
+    }
+    pthread_mutex_unlock(&g_lock);
+    uint64_t now = SBDiagMonotonicMs();
+    pthread_mutex_lock(&g_wdLock);
+    if (g_wdArmed) {
+        // 已武装（另一客流程未结束）时先解除旧的：generation++ 让旧线程
+        // 退出，旧心跳 timer 一并取消；新流程接管。
+        g_wdGeneration++;
+#if defined(__APPLE__)
+        if (g_wdHeartbeatTimer) {
+            dispatch_source_cancel(g_wdHeartbeatTimer);
+            g_wdHeartbeatTimer = NULL;
+        }
+#endif
+    }
+    g_wdArmed = 1;
+    g_wdGeneration++;
+    g_wdTimedOut = 0;
+    (void)snprintf(g_wdBundleID, sizeof(g_wdBundleID), "%s", guestBundleID);
+    g_wdFingerprint[0] = '\0';
+    g_wdHostVersion[0] = '\0';
+    (void)snprintf(g_wdStep, sizeof(g_wdStep), "%s", "armed");
+    g_wdStepTimeoutMs = 0;
+    g_wdStepStartMs = now;
+    g_wdFlowStartMs = now;
+    g_wdLastHeartbeatMs = now;
+    (void)snprintf(g_wdFuseDir, sizeof(g_wdFuseDir), "%s", fuseDir);
+    pthread_mutex_unlock(&g_wdLock);
+#if defined(__APPLE__)
+    // 主队列心跳 timer：每 250ms 打点（只写一个 volatile 时间戳，
+    // 不记日志、不碰锁、不调 ObjC）。主线程卡住时 timer 不跑，
+    // 心跳停摆即被看门狗线程看到。
+    dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER,
+                                                     0, 0, dispatch_get_main_queue());
+    if (timer) {
+        dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, 0),
+                                  SB_DIAG_WD_HEARTBEAT_MS * NSEC_PER_MSEC,
+                                  50 * NSEC_PER_MSEC);
+        dispatch_source_set_event_handler_f(timer, SBDiagWatchdogHeartbeatTickF);
+        dispatch_resume(timer);
+        pthread_mutex_lock(&g_wdLock);
+        if (g_wdArmed) {
+            g_wdHeartbeatTimer = timer;
+        } else {
+            dispatch_source_cancel(timer);
+        }
+        pthread_mutex_unlock(&g_wdLock);
+    }
+#endif
+    // 看门狗线程（detached；解除武装或 generation 变化即退出）。
+    pthread_t th;
+    if (pthread_create(&th, NULL, SBDiagWatchdogThread, NULL) == 0) {
+        (void)pthread_detach(th);
+    }
+    {
+        char line[512];
+        int n = snprintf(line, sizeof(line),
+                         "看门狗已武装：%s（心跳 250ms／检查 500ms／停摆 >5s 熔断 exit／全流程 20s）",
+                         guestBundleID);
+        if (n > 0) {
+            SBDiagLogLine(line);
+        }
+    }
+}
+
+void SBDiagLogWatchdogDisarmForGuest(const char *guestBundleID) {
+    if (!guestBundleID || guestBundleID[0] == '\0') {
+        return;
+    }
+    int wasArmed = 0;
+    uint64_t flowMs = 0;
+    pthread_mutex_lock(&g_wdLock);
+    if (g_wdArmed && strcmp(g_wdBundleID, guestBundleID) == 0) {
+        wasArmed = 1;
+        uint64_t now = SBDiagMonotonicMs();
+        flowMs = (now >= g_wdFlowStartMs) ? (now - g_wdFlowStartMs) : 0;
+        g_wdArmed = 0;
+        g_wdGeneration++;
+#if defined(__APPLE__)
+        if (g_wdHeartbeatTimer) {
+            dispatch_source_cancel(g_wdHeartbeatTimer);
+            g_wdHeartbeatTimer = NULL;
+        }
+#endif
+    }
+    pthread_mutex_unlock(&g_wdLock);
+    if (wasArmed) {
+        char line[512];
+        int n = snprintf(line, sizeof(line), "看门狗解除：%s（全流程耗时 %llums）",
+                         guestBundleID, (unsigned long long)flowMs);
+        if (n > 0) {
+            SBDiagLogLine(line);
+        }
+    }
+}
+
+void SBDiagLogWatchdogSetGuestFingerprint(const char *fingerprint, const char *hostVersion) {
+    pthread_mutex_lock(&g_wdLock);
+    if (g_wdArmed) {
+        (void)snprintf(g_wdFingerprint, sizeof(g_wdFingerprint), "%s",
+                       (fingerprint && fingerprint[0] != '\0') ? fingerprint : "?");
+        (void)snprintf(g_wdHostVersion, sizeof(g_wdHostVersion), "%s",
+                       (hostVersion && hostVersion[0] != '\0') ? hostVersion : "?");
+    }
+    pthread_mutex_unlock(&g_wdLock);
+}
+
+void SBDiagLogWatchdogStepBegin(const char *step, double timeoutSeconds) {
+    if (!step || step[0] == '\0') {
+        return;
+    }
+    uint64_t now = SBDiagMonotonicMs();
+    int armed = 0;
+    uint64_t flowMs = 0;
+    pthread_mutex_lock(&g_wdLock);
+    if (g_wdArmed && !g_wdTimedOut) {
+        armed = 1;
+        (void)snprintf(g_wdStep, sizeof(g_wdStep), "%s", step);
+        g_wdStepStartMs = now;
+        g_wdStepTimeoutMs = (timeoutSeconds > 0)
+            ? (uint64_t)(timeoutSeconds * 1000.0) : 0;
+        flowMs = (now >= g_wdFlowStartMs) ? (now - g_wdFlowStartMs) : 0;
+    }
+    pthread_mutex_unlock(&g_wdLock);
+    if (armed) {
+        char line[512];
+        int n = snprintf(line, sizeof(line),
+                         "看门狗：进入 %s（阈值 %.0fs，全流程已用 %llums）",
+                         step, timeoutSeconds, (unsigned long long)flowMs);
+        if (n > 0) {
+            SBDiagLogLine(line);
+        }
+    }
+}
+
+void SBDiagLogWatchdogStepEnd(const char *step) {
+    if (!step || step[0] == '\0') {
+        return;
+    }
+    uint64_t now = SBDiagMonotonicMs();
+    int armed = 0;
+    uint64_t stepMs = 0;
+    pthread_mutex_lock(&g_wdLock);
+    if (g_wdArmed && strcmp(g_wdStep, step) == 0) {
+        armed = 1;
+        stepMs = (now >= g_wdStepStartMs) ? (now - g_wdStepStartMs) : 0;
+        g_wdStep[0] = '\0';
+        g_wdStepTimeoutMs = 0;
+    }
+    pthread_mutex_unlock(&g_wdLock);
+    if (armed) {
+        char line[512];
+        int n = snprintf(line, sizeof(line), "看门狗：退出 %s（耗时 %llums）",
+                         step, (unsigned long long)stepMs);
+        if (n > 0) {
             SBDiagLogLine(line);
         }
     }

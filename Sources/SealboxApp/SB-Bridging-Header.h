@@ -10,6 +10,7 @@
 #import "SBSwiftClosureCall.h"
 #import "SBGuestSessionManager.h"
 #import "SBGuestUIClassifier.h"
+#import "SBGuestMachOClassList.h"
 #import "SBSigner.h"
 #import "SBCodesignCheck.h"
 #import "SBLCPatcher.h"

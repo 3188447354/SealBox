@@ -9,6 +9,10 @@
 #ifndef SB_DIAG_LOG_H
 #define SB_DIAG_LOG_H
 
+// 0.2.42：size_t 由本头直接提供（SBDiagLogIsGuestStuckForGuest 的签名用它；
+// 此前靠其他头转带，在严格模式编译下会报 unknown type name）。
+#include <stddef.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -69,6 +73,54 @@ const char *SBDiagLogStaleWillConnectGuest(void);
 void SBDiagLogBlockWillConnectForGuest(const char *guestBundleID, const char *fingerprint, const char *hostVersion);
 int SBDiagLogIsWillConnectBlockedForGuest(const char *guestBundleID, const char *fingerprint, const char *hostVersion);
 void SBDiagLogClearWillConnectBlockForGuest(const char *guestBundleID);
+
+/// 0.2.42：点开流程分步看门狗（调查报告 §5）。
+/// 诚实边界：看门狗解不开已死锁的主线程——主线程卡在非抢占锁／客代码里时
+/// 任何主线程 UI 都跑不起来。它能做的是三件事：(1) 死点定位（日志最后
+/// 一行即死点步的 entry 行，下次启动报“上次卡在某步”）；(2) 步超时判定
+/// （每步有阈值，见 SBDiagLogWatchdogStepBegin）；(3) 兜底重启（主线程
+/// 心跳停摆超 5 秒或任一步／全流程超时时，写 WATCHDOG TIMEOUT 行＋
+/// 卡死熔断标记后主动 exit(0)，把手机还给用户，绝不静默重试、绝不无限等）。
+/// 实现：主线程心跳由主队列 dispatch timer 每 250ms 打点（只写一个
+/// volatile 时间戳，不记日志、不碰锁）；看门狗线程每 500ms 检查。
+/// 看门狗线程本身只做读时间戳＋写文件＋exit，不调任何 ObjC 运行时 API、
+/// 不拿 g_lock 之外的锁、不碰 UIKit——避免看门狗自己成为死锁参与方。
+/// 武装／解除：点开流程开始前武装（SBGuestBootstrap 包装器），成功
+/// （completeActivation）或失败（failActivation／同步激活失败）时解除；
+/// 解除只对同一 bundleID 生效（多客交错点开时不互相解除）。
+/// 未武装时 StepBegin／StepEnd／Disarm 均为无操作，不写日志。
+void SBDiagLogWatchdogArm(const char *guestBundleID);
+void SBDiagLogWatchdogDisarmForGuest(const char *guestBundleID);
+/// 看门狗熔断用的客指纹＋宿主版本（武装后、dlopen 前由 bootstrap 补填；
+/// 超时写熔断标记时用。指纹格式与 willConnect 指纹同款
+/// “可执行文件名|大小|mtime”，但属看门狗熔断记录，两套记录不互通）。
+void SBDiagLogWatchdogSetGuestFingerprint(const char *fingerprint, const char *hostVersion);
+/// 分步标记：step 为步名（"dlopen"／"hook-install"／"class-resolve"／
+/// "delegate-init"／"didFinishLaunching"／"storyboard"／"scene-check"／
+/// "willConnect"），timeoutSeconds 为该步阈值（dlopen 10s／类解析 2s／
+/// delegate init 3s／didFinishLaunching 5s／storyboard 3s／scene 补查 2s／
+/// willConnect 5s；全流程 20s 由武装时起算，不用每步传）。
+/// entry/exit 各写一行（带单调时钟毫秒耗时），死在哪步日志即断在哪步。
+void SBDiagLogWatchdogStepBegin(const char *step, double timeoutSeconds);
+void SBDiagLogWatchdogStepEnd(const char *step);
+
+/// 0.2.42：看门狗卡死熔断记录（内容四行：步名、步耗时秒、客指纹、宿主版本）。
+/// 超时时写进熔断目录（与 willConnect 拦截记录同目录，App Group 共享区；
+/// 共享区不可用时回落 Logs）。下次点该客前先查：指纹与宿主版本均未变 →
+/// 干净失败、不再重进（SBGuestBootstrap 入口处查）；重装／升级（指纹或
+/// 版本已变）→ 记录失效、自动重试一次；成功激活一次即清掉记录。
+/// 文件名只留 [A-Za-z0-9.-]，其余字符变 '_'，永不含 '/'。
+void SBDiagLogMarkStuckGuest(const char *guestBundleID, const char *step, double elapsedSeconds, const char *fingerprint, const char *hostVersion);
+/// 该客是否在卡死熔断中（记录在位且指纹与宿主版本均对上）。stepOut 非空时
+/// 写进熔断的步名（供干净失败文案用）。查不到／不符返回 0。
+int SBDiagLogIsGuestStuckForGuest(const char *guestBundleID, const char *fingerprint, const char *hostVersion, char *stepOut, size_t stepOutSize);
+void SBDiagLogClearStuckGuestForGuest(const char *guestBundleID);
+/// 上次启动读到的卡死熔断（BeginRun 从熔断目录扫 stuck-*.txt 读出、
+/// 记在进程内静态区；没有时返回 ""）。熔断文件本身不删（须留到下次
+/// 点该客时由 Is 检查消费或由成功激活清掉），故 BeginRun 每次启动都
+/// 会再报一次——一行诊断，不拦启动。
+const char *SBDiagLogStaleStuckGuest(void);
+const char *SBDiagLogStaleStuckStep(void);
 
 /// 最近一次启动日志全文：最新崩过的那份（-crashed）优先，其次最新一份；
 /// 都没有返回 NULL。返回的是 malloc 出来的 UTF-8 字符串，调用方用完 free。

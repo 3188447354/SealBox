@@ -24,6 +24,24 @@ extern char **environ;
 // CoreFoundation 的进程名全局量（与 _CFGetProcessPath 同款做法，见 SBExecPathHook.m）。
 extern char **_CFGetProgname(void);
 
+// 0.2.42：看门狗包装器用的内层方法声明（实现在文件后部；包装器在前）。
+// 包装器本身也一并声明——此前两处公开入口调 inProcess 版时编译器
+// 只能看到头文件（无此方法），靠隐式声明通过；本次顺手消掉该警告。
+@interface SBGuestBootstrap (SBGuestWatchdogPrivate)
++ (BOOL)loadGuestWithBundleID:(NSString *)bundleID
+                containerUUID:(NSString *)containerUUID
+            diskDirectoryName:(NSString *)diskDirectoryName
+                keychainGroup:(NSInteger)passedKeychainGroup
+                    inProcess:(BOOL)inProcess
+                        error:(NSError **)error;
++ (BOOL)loadGuestWithBundleIDInner:(NSString *)bundleID
+                     containerUUID:(NSString *)containerUUID
+                 diskDirectoryName:(NSString *)diskDirectoryName
+                     keychainGroup:(NSInteger)passedKeychainGroup
+                         inProcess:(BOOL)inProcess
+                             error:(NSError **)error;
+@end
+
 // 钥匙串组名前缀（与契约 SBConstants 一致：com.mjorb.sealbox.shared[.N]）。
 static NSString * const SBKeychainGroupPrefix = @"com.mjorb.sealbox.shared";
 // 钥匙串组总数（与契约 keychainGroupCount 一致）。
@@ -581,6 +599,56 @@ static void SBDiagLogGuestFail(SBGuestLoaderErrorCode code, NSString *bundleID, 
                 keychainGroup:(NSInteger)passedKeychainGroup
                     inProcess:(BOOL)inProcess
                         error:(NSError **)error {
+    // 0.2.42 看门狗包装器：点开流程（inProcess）开始前武装，成功后由
+    // 会话侧解除（completeActivation／failActivation／SwiftUI 激活出口），
+    // 同步失败（内层返回 NO）在这里解除——内层十余处 return NO 全被
+    // 这一处兜住，不用逐个加解除。成功且仍在进程内（YES＋inProcess）时
+    // 不解除：scene 驱动（0.4 秒补查→手动 willConnect）还在后头，
+    // 看门狗须守到激活完成或失败。新鲜进程（!inProcess）不武装。
+    if (inProcess) {
+        SBDiagLogWatchdogArm([bundleID UTF8String]);
+    }
+    BOOL loaded = [self loadGuestWithBundleIDInner:bundleID
+                                     containerUUID:containerUUID
+                                 diskDirectoryName:diskDirectoryName
+                                     keychainGroup:passedKeychainGroup
+                                         inProcess:inProcess
+                                             error:error];
+    if (!loaded || !inProcess) {
+        SBDiagLogWatchdogDisarmForGuest([bundleID UTF8String]);
+    }
+    return loaded;
+}
+
+/// 0.2.42：看门狗熔断用的客可执行指纹（文件名＋大小＋修改时间）与宿主版本。
+/// 格式与 willConnect 指纹同款，但属看门狗熔断记录，两套记录不互通。
+/// 只在点开流程内用（武装后补填指纹、卡死熔断检查），不作他用。
+static NSString *SBGuestWatchdogFingerprintForExecPath(NSString *guestExecPath) {
+    NSDictionary *attrs = nil;
+    if (guestExecPath.length > 0) {
+        attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:guestExecPath error:nil];
+    }
+    NSNumber *size = attrs[NSFileSize];
+    NSDate *mtime = attrs[NSFileModificationDate];
+    return [NSString stringWithFormat:@"%@|%lld|%.0f",
+            guestExecPath.lastPathComponent ?: @"?",
+            size ? (long long)size.longLongValue : -1,
+            mtime ? mtime.timeIntervalSince1970 : -1];
+}
+
+static NSString *SBGuestWatchdogHostVersion(void) {
+    NSBundle *bundle = [NSBundle mainBundle];
+    NSString *marketing = [bundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"];
+    NSString *build = [bundle objectForInfoDictionaryKey:@"CFBundleVersion"];
+    return [NSString stringWithFormat:@"%@(%@)", marketing ?: @"?", build ?: @"?"];
+}
+
++ (BOOL)loadGuestWithBundleIDInner:(NSString *)bundleID
+                     containerUUID:(NSString *)containerUUID
+                 diskDirectoryName:(NSString *)diskDirectoryName
+                     keychainGroup:(NSInteger)passedKeychainGroup
+                         inProcess:(BOOL)inProcess
+                             error:(NSError **)error {
     NSString *documents = [self documentsDirectory];
     NSString *dirName = diskDirectoryName.length > 0
         ? diskDirectoryName
@@ -623,6 +691,28 @@ static void SBDiagLogGuestFail(SBGuestLoaderErrorCode code, NSString *bundleID, 
                               code:SBGuestLoaderErrorUnsupportedBinary
                            message:@"该应用是 32 位应用，需要 JIT 才能运行"
                           recovery:@"请用 Seal 开启 JIT 后重试，或换用 64 位版本"];
+    }
+    // 0.2.42：看门狗熔断检查——上次点开卡死过的客（指纹与宿主版本均未变）
+    // 不再重进，干净失败；重装／升级（指纹或版本已变）即自动重试。
+    // 指纹先补填给看门狗（超时写熔断标记时用）；检查在搭客上下文之前，
+    // 熔断的客连环境都不搭。
+    NSString *watchdogFingerprint = SBGuestWatchdogFingerprintForExecPath(guestExecPath);
+    NSString *watchdogHostVersion = SBGuestWatchdogHostVersion();
+    SBDiagLogWatchdogSetGuestFingerprint([watchdogFingerprint UTF8String],
+                                        [watchdogHostVersion UTF8String]);
+    char stuckStep[128] = {0};
+    if (SBDiagLogIsGuestStuckForGuest([bundleID UTF8String],
+                                     [watchdogFingerprint UTF8String],
+                                     [watchdogHostVersion UTF8String],
+                                     stuckStep, sizeof(stuckStep))) {
+        NSString *stuckReason = [NSString stringWithFormat:
+            @"该应用上次打开时卡住了（%@），已跳过；重新导入或等后续版本可再试",
+            stuckStep[0] != '\0' ? [NSString stringWithUTF8String:stuckStep] : @"未知步骤"];
+        SBDiagLogGuestFail(SBGuestLoaderErrorGuestLoadFailed, bundleID, guestExecPath, stuckReason);
+        return [self failWithError:error
+                              code:SBGuestLoaderErrorGuestLoadFailed
+                           message:stuckReason
+                          recovery:@"请重新导入该应用，或等后续版本"];
     }
     // 最低系统版本检查（设计 §3.6 新增，0.1.0 未做）：读客 Info.plist 的
     // MinimumOSVersion，与宿主当前系统版本比对；客要求高于宿主时拒绝启动，
@@ -727,10 +817,14 @@ static void SBDiagLogGuestFail(SBGuestLoaderErrorCode code, NSString *bundleID, 
     // dlopen 一返回立刻清掉。进程若死在 dlopen 里（0.2.23 闪退），标记留
     // 下来，下次启动 SBDiagLogBeginRun 会认出来并记“上次启动死在 dlopen 里”。
     SBDiagLogLine([[NSString stringWithFormat:@"客加载：进入 dlopen：%@", guestExecPath] UTF8String]);
+    // 0.2.42 看门狗“dlopen”步，阈值 10s（0.2.40 实测 dlopen 约 150ms；
+    // 大客＋冷盘放宽到 10s）。
+    SBDiagLogWatchdogStepBegin("dlopen", 10.0);
     SBDiagLogMarkDlopenEntry([bundleID UTF8String]);
     NSError *dlopenError = nil;
     void *guestHandle = dlopenGuest(guestExecPath, &dlopenError);
     SBDiagLogClearDlopenEntry();
+    SBDiagLogWatchdogStepEnd("dlopen");
     if (!guestHandle) {
         SBDiagLogGuestFail(SBGuestLoaderErrorGuestLoadFailed, bundleID, guestExecPath,
                            [NSString stringWithFormat:@"dlopen 失败：%@", dlopenError.localizedDescription ?: @"未知错误"]);
@@ -766,6 +860,8 @@ static void SBDiagLogGuestFail(SBGuestLoaderErrorCode code, NSString *bundleID, 
     // 主镜像不成再扫 Frameworks；装不上同样干净失败，不跳 main——0.2.29 前
     // 这里忽略安装返回值直接跳 main，第二遍 UIApplicationMain 断言崩）。
     BOOL isSwiftUIGuest = NO;
+    // 0.2.42 看门狗“hook-install”步，阈值 2s（纯内存重绑，毫秒级）。
+    SBDiagLogWatchdogStepBegin("hook-install", 2.0);
     if (inProcess) {
         SBGuestMainHookContext *hookContext = [[SBGuestMainHookContext alloc] init];
         hookContext.bundleID = bundleID;
@@ -812,6 +908,7 @@ static void SBDiagLogGuestFail(SBGuestLoaderErrorCode code, NSString *bundleID, 
             }
         }
     }
+    SBDiagLogWatchdogStepEnd("hook-install");
 
     // 0.2.33：exit 截获（SBGuestMainHook.h）——Flutter Runner 生成的 main 在
     // 覆盖层返回后无条件调 exit，不截获则替身一返回进程就退出（原型 0233，
