@@ -48,10 +48,12 @@ enum SBAppDeletion {
         let suites = [bundleID, "\(bundleID).\(containerUUID)"]
         for suite in suites {
             UserDefaults.standard.removePersistentDomain(forName: suite)
-            let plist = FileManager.default
-                .homeDirectoryForCurrentUser
-                .appendingPathComponent("Library/Preferences/\(suite).plist")
-            try? FileManager.default.removeItem(at: plist)
+            // homeDirectoryForCurrentUser 是 macOS 专属，iOS 上不可用——
+            // 用 Library 目录 URL 拼 Preferences/<suite>.plist。
+            if let plist = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask).first?
+                .appendingPathComponent("Preferences/\(suite).plist") {
+                try? FileManager.default.removeItem(at: plist)
+            }
         }
     }
 

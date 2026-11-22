@@ -138,7 +138,7 @@ struct GuestSwitcherView: View {
     }
 
     private func refresh() {
-        let raw = SBGuestSessionManager.shared().activeSessions() as? [[AnyHashable: Any]] ?? []
+        let raw = SBGuestSessionManager.shared().activeSessions() as [[AnyHashable: Any]]
         sessions = raw.compactMap { dict in
             guard let bundleID = dict["bundleID"] as? String,
                   let containerUUID = dict["containerUUID"] as? String else { return nil }
