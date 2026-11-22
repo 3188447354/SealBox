@@ -77,7 +77,9 @@ static Class SBGuestClassNamedInGuestImage(NSString *className, NSString *guestA
     if (count <= 0) {
         return Nil;
     }
-    Class *classes = malloc(sizeof(Class) * (size_t)count);
+    // ARC 下 void * 到 __unsafe_unretained Class * 不许隐式转换，必须显式 cast
+    //（0.2.41 首轮 CI：SBGuestSessionManager.m:80 报 implicit conversion error）。
+    Class *classes = (Class *)malloc(sizeof(Class) * (size_t)count);
     if (!classes) {
         return Nil;
     }
