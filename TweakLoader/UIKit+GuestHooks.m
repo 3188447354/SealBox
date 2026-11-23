@@ -9,6 +9,110 @@ UIInterfaceOrientation LCOrientationLock = UIInterfaceOrientationUnknown;
 NSMutableArray<NSString*>* LCSupportedUrlSchemes = nil;
 BOOL launchURLProcessed = NO;
 
+// MARK: - Floating Home button (guest side)
+// The host-side dock / Home button live in the host's window and cannot
+// reach a fullscreen guest: in classic mode the host is dead, in native
+// window mode the guest is a different scene. So the return-home control
+// lives in the guest process itself: a plain UIButton on the guest's key
+// window, always visible while the guest runs. Tap calls LCSharedUtils
+// launchToGuestAppWithURL directly with livecontainer-launch
+// ?bundle-name=ui (the same call the switch-confirm dialog's OK button
+// makes, so there is no extra confirmation tap): plain relaunch to the
+// host list in classic, forward to the host scheme in multitask. Only
+// attaches to normal-level windows, so alert/keyboard windows never
+// steal it.
+@interface LCHomeButtonTarget : NSObject
++ (instancetype)shared;
+- (void)homeButtonTapped:(UIButton *)sender;
+@end
+
+@implementation LCHomeButtonTarget
++ (instancetype)shared {
+    static LCHomeButtonTarget *instance = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{ instance = [[self alloc] init]; });
+    return instance;
+}
+- (void)homeButtonTapped:(UIButton *)sender {
+    UIImpactFeedbackGenerator *feedback = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
+    [feedback impactOccurred];
+    NSString *urlStr = [NSString stringWithFormat:@"%@://livecontainer-launch?bundle-name=ui", NSUserDefaults.lcAppUrlScheme];
+    NSURL *url = [NSURL URLWithString:urlStr];
+    // One tap, no confirmation dialog: opening this URL would route through
+    // LCHandleControlAppURL -> LCShowSwitchAppConfirmation, i.e. an extra
+    // "OK" tap after the Home tap. The Home tap itself is the confirmation,
+    // so call exactly what that dialog's OK button calls. Classic mode:
+    // writes selected=ui and relaunches to the host app list. LiveProcess:
+    // forwards to the host scheme (the existing multitask path).
+    [NSClassFromString(@"LCSharedUtils") launchToGuestAppWithURL:url];
+}
+@end
+
+static UIButton *LCHomeButton = nil;
+
+static CGRect LCHomeButtonFrame(UIWindow *window) {
+    CGFloat size = 56.0;
+    CGFloat margin = 16.0;
+    CGRect bounds = window.bounds;
+    CGFloat bottomInset = 0;
+    if (@available(iOS 11.0, *)) {
+        bottomInset = window.safeAreaInsets.bottom;
+    }
+    return CGRectMake(margin, bounds.size.height - bottomInset - margin - size, size, size);
+}
+
+static void LCInstallHomeButton(void) {
+    UIWindow *keyWindow = UIApplication.sharedApplication.keyWindow;
+    if (!keyWindow || keyWindow.windowLevel != UIWindowLevelNormal) return;
+    if (!LCHomeButton) {
+        UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
+        [button setImage:[UIImage systemImageNamed:@"house.fill"] forState:UIControlStateNormal];
+        button.tintColor = [UIColor whiteColor];
+        button.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.6];
+        button.layer.cornerRadius = 28.0;
+        button.layer.borderWidth = 1;
+        button.layer.borderColor = [[UIColor whiteColor] colorWithAlphaComponent:0.3].CGColor;
+        button.layer.shadowColor = [UIColor blackColor].CGColor;
+        button.layer.shadowOpacity = 0.3;
+        button.layer.shadowRadius = 4;
+        button.layer.shadowOffset = CGSizeMake(0, 2);
+        button.autoresizingMask = UIViewAutoresizingFlexibleTopMargin | UIViewAutoresizingFlexibleRightMargin;
+        button.accessibilityLabel = @"Home";
+        [button addTarget:[LCHomeButtonTarget shared] action:@selector(homeButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
+        LCHomeButton = button;
+    }
+    LCHomeButton.frame = LCHomeButtonFrame(keyWindow);
+    if (LCHomeButton.superview != keyWindow) {
+        [LCHomeButton removeFromSuperview];
+        [keyWindow addSubview:LCHomeButton];
+    } else {
+        [keyWindow bringSubviewToFront:LCHomeButton];
+    }
+    LCHomeButton.hidden = NO;
+}
+
+static void LCObserveHomeButton(void) {
+    NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
+    NSOperationQueue *mainQueue = [NSOperationQueue mainQueue];
+    [center addObserverForName:UIWindowDidBecomeKeyNotification object:nil queue:mainQueue usingBlock:^(NSNotification *note) {
+        LCInstallHomeButton();
+    }];
+    [center addObserverForName:UIWindowDidBecomeVisibleNotification object:nil queue:mainQueue usingBlock:^(NSNotification *note) {
+        LCInstallHomeButton();
+    }];
+    [center addObserverForName:UIDeviceOrientationDidChangeNotification object:nil queue:mainQueue usingBlock:^(NSNotification *note) {
+        if (LCHomeButton && !LCHomeButton.hidden) {
+            UIWindow *keyWindow = UIApplication.sharedApplication.keyWindow;
+            if (keyWindow) LCHomeButton.frame = LCHomeButtonFrame(keyWindow);
+        }
+    }];
+    // Backstop in case the window is already key before we observe
+    // (constructor runs early, so this rarely fires first).
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        LCInstallHomeButton();
+    });
+}
+
 __attribute__((constructor))
 static void UIKitGuestHooksInit() {
     if(!NSUserDefaults.lcGuestAppId) return;
@@ -19,6 +123,7 @@ static void UIKitGuestHooksInit() {
     swizzle(UIApplication.class, @selector(setDelegate:), @selector(hook_setDelegate:));
     swizzle(UIScene.class, @selector(scene:didReceiveActions:fromTransitionContext:), @selector(hook_scene:didReceiveActions:fromTransitionContext:));
     swizzle(UIScene.class, @selector(openURL:options:completionHandler:), @selector(hook_openURL:options:completionHandler:));
+    LCObserveHomeButton();
     NSInteger LCOrientationLockDirection = [NSUserDefaults.guestAppInfo[@"LCOrientationLock"] integerValue];
     if(LCOrientationLockDirection != 0 && [UIDevice.currentDevice userInterfaceIdiom] == UIUserInterfaceIdiomPhone) {
         switch (LCOrientationLockDirection) {
