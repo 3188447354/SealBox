@@ -184,6 +184,9 @@ class AppInfoProvider {
             }
         }
         static let edgeSwipeThreshold: CGFloat = 30.0
+        // Side-return needs a longer deliberate swipe than the dock-reveal
+        // threshold: a short edge touch must not send the user home.
+        static let sideReturnSwipeThreshold: CGFloat = 60.0
         
         static let standardAnimationDuration: TimeInterval = 0.3
         static let longAnimationDuration: TimeInterval = 0.4
@@ -834,18 +837,14 @@ class AppInfoProvider {
         guard gesture.state == .ended else { return }
         guard !apps.isEmpty else { return }
 
-        let location = gesture.location(in: gesture.view)
         let translation = gesture.translation(in: gesture.view)
-        // Right-edge swipe moves left: translation.x is negative.
-        guard translation.x < -Constants.edgeSwipeThreshold else { return }
-
-        // Don't steal a swipe that started on the dock itself (e.g. dragging
-        // the dock when it sits on the right edge). Reconstruct the start
-        // point: current location minus translation.
-        let startLocation = CGPoint(x: location.x - translation.x, y: location.y - translation.y)
-        if let dockFrame = hostingController?.view.frame, dockFrame.contains(startLocation) {
-            return
-        }
+        // Right-edge swipe moves left: translation.x is negative. Deliberate
+        // 60pt swipe; the dock sits at the right edge by default, so a swipe
+        // starting on the dock must still count as a return (the earlier
+        // dock-frame exclusion made the most natural swipe location dead).
+        // If the dock also treats it as a move-drag, it just slides aside;
+        // returning home is the action that matters.
+        guard translation.x < -Constants.sideReturnSwipeThreshold else { return }
 
         let impactFeedback = UIImpactFeedbackGenerator(style: .medium)
         impactFeedback.impactOccurred()
