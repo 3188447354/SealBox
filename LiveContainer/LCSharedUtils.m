@@ -211,7 +211,14 @@ NSString* FBSOpenApplicationOptionKeyPayloadURL = @"__PayloadURL";
         
         // Attempt to restart LiveContainer with the selected guest app
         [lcUserDefaults setObject:launchBundleId forKey:@"selected"];
-        [lcUserDefaults setObject:containerFolderName forKey:@"selectedContainer"];
+        // containerFolderName is nil for bundle-name=ui (returning to the
+        // host list has no container); setObject:forKey: throws on nil,
+        // so clear the key instead of crashing the guest process.
+        if (containerFolderName) {
+            [lcUserDefaults setObject:containerFolderName forKey:@"selectedContainer"];
+        } else {
+            [lcUserDefaults removeObjectForKey:@"selectedContainer"];
+        }
         bool isSharedApp = false;
         NSBundle *appBundle = [self findBundleWithBundleId:launchBundleId isSharedAppOut:&isSharedApp];
         NSDictionary *appInfo = [NSDictionary dictionaryWithContentsOfFile:
