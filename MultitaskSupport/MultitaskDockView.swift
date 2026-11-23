@@ -139,6 +139,10 @@ class AppInfoProvider {
     @objc public var windowHostingView = VirtualWindowsHostView()
     internal var hostingController: UIHostingController<AnyView>?
 
+    // Floating Home button (plain UIKit, independent of the dock's SwiftUI
+    // gestures): returns to the host app list while a guest runs.
+    private var homeButton: UIButton?
+
     public struct Constants {
         // MARK: - Layout & Sizing
         static let defaultDockWidth: CGFloat = 90.0
@@ -155,6 +159,10 @@ class AppInfoProvider {
         static let dockVerticalMargin: CGFloat = 30.0
         static let dockContentSpacing: CGFloat = 8.0
         static let dockVerticalPadding: CGFloat = 30.0
+
+        // MARK: - Floating Home Button
+        static let homeButtonSize: CGFloat = 56.0
+        static let homeButtonMargin: CGFloat = 16.0
         // Extra padding is derived from dockVerticalPadding to match the SwiftUI layout exactly
         
         // MARK: - Ratios & Factors
@@ -315,6 +323,9 @@ class AppInfoProvider {
             if self.isVisible {
                 self.updateDockFrame()
             }
+            if let button = self.homeButton, !button.isHidden, let frame = self.homeButtonFrame() {
+                button.frame = frame
+            }
         }
     }
     
@@ -443,6 +454,7 @@ class AppInfoProvider {
             
             if self.apps.isEmpty {
                 self.hideDock()
+                self.hideHomeButton()
             } else if self.isVisible {
                 self.updateDockFrame()
             }
@@ -519,6 +531,68 @@ class AppInfoProvider {
                 hostingController.view.transform = .identity
             }
         }
+    }
+
+    // MARK: - Floating Home Button
+    // A plain UIKit button, deliberately NOT part of the SwiftUI dock: the
+    // dock's taps are unreliable on-device, so the return-home control must
+    // not depend on the dock's gesture system. Added straight to the key
+    // window (above every guest view), bottom-left, shown while any guest
+    // runs; hidden when the last guest closes. Tapping it calls the same
+    // minimizeAllWindows() as the dock's minimize button and the
+    // right-edge side-return swipe.
+    private func homeButtonFrame() -> CGRect? {
+        guard let keyWindow = keyWindow else { return nil }
+        let bounds = keyWindow.bounds
+        let size = Constants.homeButtonSize
+        let margin = Constants.homeButtonMargin
+        return CGRect(
+            x: margin,
+            y: bounds.height - keyWindow.safeAreaInsets.bottom - margin - size,
+            width: size,
+            height: size
+        )
+    }
+
+    @objc private func showHomeButton() {
+        guard isDockEnabled() else { return }
+        DispatchQueue.main.async {
+            guard let keyWindow = self.keyWindow, let frame = self.homeButtonFrame() else { return }
+            if self.homeButton == nil {
+                let button = UIButton(type: .system)
+                button.setImage(UIImage(systemName: "house.fill"), for: .normal)
+                button.tintColor = .white
+                button.backgroundColor = UIColor.black.withAlphaComponent(0.6)
+                button.layer.cornerRadius = Constants.homeButtonSize / 2
+                button.layer.borderWidth = 1
+                button.layer.borderColor = UIColor.white.withAlphaComponent(0.3).cgColor
+                button.layer.shadowColor = UIColor.black.cgColor
+                button.layer.shadowOpacity = 0.3
+                button.layer.shadowRadius = 4
+                button.layer.shadowOffset = CGSize(width: 0, height: 2)
+                button.addTarget(self, action: #selector(self.homeButtonTapped), for: .touchUpInside)
+                button.accessibilityLabel = "Home"
+                self.homeButton = button
+            }
+            guard let button = self.homeButton else { return }
+            button.frame = frame
+            if button.superview == nil {
+                keyWindow.addSubview(button)
+            }
+            button.isHidden = false
+        }
+    }
+
+    @objc private func hideHomeButton() {
+        DispatchQueue.main.async {
+            self.homeButton?.isHidden = true
+        }
+    }
+
+    @objc private func homeButtonTapped() {
+        let impactFeedback = UIImpactFeedbackGenerator(style: .medium)
+        impactFeedback.impactOccurred()
+        minimizeAllWindows()
     }
 
     @objc public func animateFrame(to finalFrame: CGRect) {
@@ -713,6 +787,7 @@ class AppInfoProvider {
             
             if self.apps.count == 1 {
                 self.showDock()
+                self.showHomeButton()
             } else if self.isVisible {
                 self.updateDockFrame()
             }
