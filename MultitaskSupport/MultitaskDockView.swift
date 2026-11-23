@@ -809,11 +809,47 @@ class AppInfoProvider {
             let leftEdgeGesture = UIScreenEdgePanGestureRecognizer(target: self, action: #selector(handleEdgeSwipe(_:)))
             leftEdgeGesture.edges = .left
             keyWindow.addGestureRecognizer(leftEdgeGesture)
-            
+
             let rightEdgeGesture = UIScreenEdgePanGestureRecognizer(target: self, action: #selector(handleEdgeSwipe(_:)))
             rightEdgeGesture.edges = .right
             keyWindow.addGestureRecognizer(rightEdgeGesture)
         }
+
+        // Side-return: while a guest is running and the dock is shown, a
+        // swipe inward from the RIGHT edge returns to the host app list
+        // (minimizeAllWindows). Left edge is deliberately untouched: guests
+        // use it for their own back navigation, and stealing it would break
+        // in-app navigation. Only installed while the dock is shown, so it
+        // never competes with the dock-reveal edge gestures above; the
+        // removeAll at the top of this function clears the previous one,
+        // so repeated calls cannot stack duplicates.
+        if !isDockHidden, isDockEnabled(), !apps.isEmpty {
+            let sideReturnGesture = UIScreenEdgePanGestureRecognizer(target: self, action: #selector(handleSideReturnSwipe(_:)))
+            sideReturnGesture.edges = .right
+            keyWindow.addGestureRecognizer(sideReturnGesture)
+        }
+    }
+
+    @objc private func handleSideReturnSwipe(_ gesture: UIScreenEdgePanGestureRecognizer) {
+        guard gesture.state == .ended else { return }
+        guard !apps.isEmpty else { return }
+
+        let location = gesture.location(in: gesture.view)
+        let translation = gesture.translation(in: gesture.view)
+        // Right-edge swipe moves left: translation.x is negative.
+        guard translation.x < -Constants.edgeSwipeThreshold else { return }
+
+        // Don't steal a swipe that started on the dock itself (e.g. dragging
+        // the dock when it sits on the right edge). Reconstruct the start
+        // point: current location minus translation.
+        let startLocation = CGPoint(x: location.x - translation.x, y: location.y - translation.y)
+        if let dockFrame = hostingController?.view.frame, dockFrame.contains(startLocation) {
+            return
+        }
+
+        let impactFeedback = UIImpactFeedbackGenerator(style: .medium)
+        impactFeedback.impactOccurred()
+        minimizeAllWindows()
     }
     
     @objc private func handleEdgeSwipe(_ gesture: UIScreenEdgePanGestureRecognizer) {
