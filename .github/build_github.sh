@@ -10,11 +10,15 @@
 # MJ re-signs the IPA with his own certificate (3432ZHJUF9) via Seal
 # afterwards; this CI signature only has to be a real CMS signature.
 #
-# TeamIdentifier: codesign takes it from the signing certificate's OU
-# field. The certificate below is created with OU=LIVE2026CI, and every
-# entitlements file is expanded with that same value, so
-# application-identifier, team-identifier and keychain-access-groups all
-# match the real signing team (no AAAAA11111 placeholder survives).
+# TeamIdentifier: a self-signed certificate carries no usable team, and
+# codesign leaves the signature's TeamIdentifier "not set" (verified in
+# CI run 45050541462: Authority=LiveContainer CI, TeamIdentifier=not set;
+# SealBox 0.2.45's shipped binary has no team either). The OU on the
+# certificate below therefore does NOT become the TeamIdentifier. The
+# LIVE2026CI value lives one level down, in the entitlements:
+# application-identifier, team-identifier and keychain-access-groups are
+# all expanded with it, consistently, so no AAAAA11111 placeholder
+# survives in the entitlements (that is what sign_app asserts below).
 # App Groups are the upstream Release values from xcconfigs/Global.xcconfig
 # (DEVELOPMENT_TEAM_SUFFIX is empty in Release):
 #   group.com.SideStore.SideStore, group.com.rileytestut.AltStore
@@ -147,10 +151,18 @@ sign_app() {
     echo "--- $(basename "$S_TARGET") ---"
     /usr/bin/codesign -dvvv "$S_TARGET" 2>&1 | grep -E "Identifier=|TeamIdentifier=|Signature size=|Authority=" || true
   done
-  # The signature's TeamIdentifier must be the real CI team, and the
-  # embedded entitlements must carry it as the application-identifier
-  # prefix (not the AAAAA11111 placeholder).
-  /usr/bin/codesign -dvvv "$S_APP" 2>&1 | grep -q "TeamIdentifier=$CI_TEAM" || { echo "ERROR: TeamIdentifier is not $CI_TEAM"; exit 1; }
+  # The signature's TeamIdentifier is "not set" for a self-signed CI
+  # certificate (codesign does not derive it from the cert OU); accept
+  # that, or the CI team if a runner ever reports it. Anything else
+  # (e.g. a stale placeholder) fails the run. The entitlements must
+  # still carry the CI team as the application-identifier prefix, never
+  # the AAAAA11111 placeholder.
+  S_TEAM=$(/usr/bin/codesign -dvvv "$S_APP" 2>&1 | sed -n 's/^TeamIdentifier=//p')
+  echo "TeamIdentifier=$S_TEAM"
+  case "$S_TEAM" in
+    "not set"|"$CI_TEAM") ;;
+    *) echo "ERROR: unexpected TeamIdentifier $S_TEAM"; exit 1 ;;
+  esac
   /usr/bin/codesign -d --entitlements :- "$S_APP" 2>/dev/null | grep -q "$CI_TEAM.$S_BID" || { echo "ERROR: application-identifier prefix is not $CI_TEAM"; exit 1; }
 }
 
